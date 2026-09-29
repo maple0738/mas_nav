@@ -54,7 +54,7 @@ terrain msgpack → map_server: /cost_map + /terrain_label_map
 
 - `prepare_s = enter_s - prepare_distance`：开始将 MPC 的速度、加速度约束向区域目标值过渡。
 - `active_s = enter_s - activation_distance`：开始持续发送该区域的 mode。
-- `commit_s = enter_s - commit_distance`：到这里约束必须达到区域目标值；当前实现没有底盘回执，因此它是路径阶段标记，不能证明底盘已切换。
+- `commit_s = enter_s - commit_distance`：到这里较低的区域上限会被钳到目标值；坡道上限高于普通路段时仍按混合速率逐步提升。当前实现没有底盘回执，因此它是路径阶段标记，不能证明底盘已切换。
 - `enter_s` / `exit_s`：轨迹进入、离开区域本体的位置。
 - `release_s = exit_s + release_distance`：越过后才恢复普通 mode，给车体离开区域留余量。
 
@@ -69,9 +69,9 @@ terrain msgpack → map_server: /cost_map + /terrain_label_map
 | 阶段 | 进度范围 | 输出与约束 |
 |---|---|---|
 | `NORMAL` | 未进入准备窗 | 普通 mode，普通速度参数 |
-| `PREPARING` | `prepare_s ≤ s < active_s` | 普通 mode；速度和加速度上限逐周期向区域值过渡 |
+| `PREPARING` | `prepare_s ≤ s < active_s` | 普通 mode；较低的区域上限开始过渡，较高的坡道上限暂受普通 mode 约束 |
 | `ARMED` | `active_s ≤ s < commit_s` | 请求区域 mode，继续过渡速度参数 |
-| `COMMITTED` | `commit_s ≤ s < enter_s` | 保持区域 mode；上限钳到区域目标值 |
+| `COMMITTED` | `commit_s ≤ s < enter_s` | 保持区域 mode；较低上限钳到目标值，较高上限继续平滑提升 |
 | `INSIDE` | `enter_s ≤ s < exit_s` | 保持区域 mode 和区域速度参数 |
 | `RELEASING` | `exit_s ≤ s < release_s` | 继续保持区域 mode；释放后恢复普通模式 |
 
@@ -90,13 +90,14 @@ terrain msgpack → map_server: /cost_map + /terrain_label_map
 | `mode` | 下位机识别的底盘模式编号，必须与下位机协议一致 |
 | `max_speed` | 区域平移合速度上限，m/s |
 | `max_acceleration` | 区域平移加速度上限，m/s² |
+| `normal_max_speed`、`normal_max_acceleration` | 普通路段的平移速度、加速度上限 |
 | `prepare_distance`、`activation_distance`、`commit_distance`、`release_distance` | 上述路径阶段的距离，m |
 | `speed_blend_rate` | 最大速度上限每秒允许变化的量 |
 | `acceleration_blend_rate` | 加速度上限每秒允许变化的量 |
 
-MINCO 在稀疏路径上读取原始区域标签，将区域影响窗内的分段速度上限下调，再做速度传播和轨迹优化。最终轨迹进入执行器后，`PathExecutor` 还会按当前区域 profile 更新 MPC 的 `vx/vy`、`ax/ay` 约束，并对最终平移合速度做上限校验。速度参数从 `PREPARING` 阶段开始过渡，到 `COMMITTED` 阶段必须达到区域目标值。`omega` 的下发和区域控制不耦合，当前 `ros2_comm` 不转发它。
+MINCO 在稀疏路径上读取原始区域标签，为坡道影响窗提供更高的分段速度上限，并对隧道、起伏路按各自上限约束，再做速度传播和轨迹优化。最终轨迹进入执行器后，`PathExecutor` 还会按当前区域 profile 更新 MPC 的 `vx/vy`、`ax/ay` 约束，并对最终平移合速度做上限校验。进入坡道时，上限在请求坡道 mode 后按 `speed_blend_rate`、`acceleration_blend_rate` 逐步提高；坡道外立即受普通路段上限约束。`omega` 的下发和区域控制不耦合，当前 `ros2_comm` 不转发它。
 
-当前映射为普通路段 `mode=4`、上坡 `label=mode=5`、隧道 `label=mode=6`、起伏路 `label=mode=7`，均为 `uint8`；特殊区域若配置了与标签不同的 mode，导航节点会拒绝启动。平地机器人当前把三种区域的速度和加速度上限分别设为 `3.0 m/s`、`4.0 m/s²`，与普通路段的 MINCO/MPC 配置一致，因此区域模式切换不额外降速。实际速度仍由轨迹、障碍净空和控制器决定；阶段距离仍是待标定初值。
+当前映射为普通路段 `mode=4`、上坡 `label=mode=5`、隧道 `label=mode=6`、起伏路 `label=mode=7`，均为 `uint8`；特殊区域若配置了与标签不同的 mode，导航节点会拒绝启动。普通路段上限为 `3.0 m/s`、`4.0 m/s²`；坡道上限为 `4.0 m/s`、`5.0 m/s²`，隧道及起伏路仍为普通路段上限。MINCO 和 MPC 的总上限允许坡道值，普通路段由 `normal_max_speed`、`normal_max_acceleration` 约束；MINCO 按静态标签使用坡道速度窗口，执行器还可按在线标签切换 mode 和约束。坡道准备、请求 mode、提交距离分别为 0.3/0.2/0.1 m；较高上限仅在请求坡道 mode 后逐步生效。实际速度仍由轨迹曲率、障碍净空、控制器与底盘能力决定；阶段距离仍需实车标定。
 
 ## 6. `ros2_comm` 与 `mas_vision` 的协议边界
 

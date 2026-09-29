@@ -93,6 +93,14 @@ public:
     if (normal_mode < 0 || normal_mode > 255) {
       throw std::invalid_argument("region_control.normal_mode must be in [0,255]");
     }
+    const double normal_max_speed = declare_parameter<double>(
+      "region_control.normal_max_speed", 3.0);
+    const double normal_max_acceleration = declare_parameter<double>(
+      "region_control.normal_max_acceleration", 4.0);
+    if (!std::isfinite(normal_max_speed) || normal_max_speed <= 0.0 ||
+      !std::isfinite(normal_max_acceleration) || normal_max_acceleration <= 0.0) {
+      throw std::invalid_argument("region_control normal motion limits must be finite and positive");
+    }
     const double speed_blend_rate = declare_parameter<double>(
       "region_control.speed_blend_rate", 2.0);
     const double acceleration_blend_rate = declare_parameter<double>(
@@ -192,8 +200,7 @@ public:
 
     // ── 区域执行层：普通能力作为基线；特殊区域命中后平滑切换 mode 和运动限制。
     region_controller_ = std::make_unique<RegionController>(
-      static_cast<uint8_t>(normal_mode), std::max(config.vx_max, config.vy_max),
-      std::max(config.ax_max, config.ay_max),
+      static_cast<uint8_t>(normal_mode), normal_max_speed, normal_max_acceleration,
       speed_blend_rate, acceleration_blend_rate);
 
     if (control_rate_hz_ <= 0.0 || planner_frequency_ <= 0.0 || config.dt <= 0.0 ||

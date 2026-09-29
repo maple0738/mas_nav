@@ -2,6 +2,31 @@
 
 本文件记录由开发任务产生的代码、配置、脚本、资源和文档变更。新记录追加在最上方，不改写旧记录。
 
+## 2026-09-29 — 提交无先验导航改造前的现有更改
+
+- 改动：提交当前工作区已有的静态/在线融合查询、SMAC 墙角与净空约束、普通/坡道速度及区域控制参数、配套测试；地图选择切换为 `fengbao_map`，加入对应 PCD、PGM、YAML 和 terrain MSGPack，导航启动默认打开 RViz。此前详细开发与验证过程保留在下方 2026-09-26 的记录中。
+- 验证：提交前 `git diff --check` 通过；当前构建目录 `ctest --output-on-failure` 的三个套件全部通过；安装后的 `map_server_node` 实际加载 fengbao 地图，核对为 832×460、0.05 m/px、原点 (-17.159674, -8.145816)，地图服务内部尺寸/分辨率校验通过。没有重新全量编译或实车行驶验证。
+
+## 2026-09-26 — 融合在线 ROGMap 与静态地形净空的局部查询接口
+
+- 改动：新增 `mas2027_nav_executor` 的 `common/environment/fused_map_query.{hpp,cpp}`，用一个 `rog_map::MapQueryInterface` 同时呈现在线滚动 ROGMap 与静态地形距离场：查询点按最新 `static_frame <- output_frame` 平面变换折算到静态地图，占用取并集（有符号净空取两者较小值），静态梯度经 `R^T` 转回动态系，网格几何沿用动态图。缺少变换、静态图外、插值失败或非有限输入时整体失败（fail-closed），`values()` 返回 `nullptr`，逐格结果经 `copyValues()` 合成。`minco_planner` 新增 `rebuildFusedQuery()`/`refreshFusedTransform()`，把 MINCO 优化器、走廊生成和安全检查的局部查询由纯动态查询换成该融合查询，并在重规划与安全定时回调中刷新变换；`CMakeLists.txt` 把 `fused_map_query.cpp`、`terrain_grid.cpp`、`terrain_map_query.cpp` 编入 `_planner` 静态库（原先只在节点目标内），节点目标改为仅保留 `region_control.cpp`，静态库链接补 `OpenCV_LIBS`。新增 `test/test_fused_map_query.cpp` 5 项用例，覆盖缺变换、静态/动态净空取小与梯度旋转、动态更近时保留动态结果、静态障碍屏蔽动态空格、静态图外 fail-closed。
+- 验证：`colcon build --packages-select mas2027_nav_executor --symlink-install --parallel-workers 2 --cmake-args -DCMAKE_BUILD_TYPE=Release` 通过（首次增量构建为空转，随后 touch 6 个改动源文件与 3 个测试文件强制重编，`fused_map_query.cpp`、`minco_planner.cpp`、`smac_planner_2d_simple.cpp`、`nav_executor_node.cpp` 及三个测试单元全部重新编译，日志 0 warning / 0 error，节点与 `test_fused_map_query` 重新链接）；`ctest --output-on-failure` 三个套件全部通过：`test_fused_map_query` 5 项、`test_region_online_priority` 4 项、`test_smac_wall_clearance` 2 项，`colcon test-result` 无失败。未做实车或仿真运行，未在真实 TF/点云下测量融合查询的耗时与在线行为，也未验证静态图外的现场退化表现。
+
+## 2026-09-26 — 修复坡道启动参数并增强 C 型拐道外侧偏好
+
+- 改动：`mas2027_nav_executor/config/region_control.yaml` 将坡道准备、请求 mode、提交距离设为 0.3/0.2/0.1 m，满足节点所需的递减顺序，修复原 0.3/0.8/0.2 m 导致的启动崩溃。普通路段显式限制为 3.0 m/s、4.0 m/s²，坡道保留较高的 4.0 m/s、5.0 m/s²；MINCO 修正区域标签索引为 5/6/7、按坡道窗口允许较高分段速度，MPC 总上限提升至坡道值，区域控制器在普通 mode 下仍钳住普通上限。涉及 `region_control.cpp`、`nav_executor_node.cpp`、`minco_planner.cpp`、三份参数文件、区域控制说明与切换测试。`planner_params.yaml` 另将 SMAC 2D 静态 ESDF 权重从 2.0 提到 4.0，增强 C 型拐道全局折线的外侧净空偏好；原有最小净空和轨迹碰撞检查保留。
+- 验证：查看 15:22 正常运行日志，发现多次 `TERRAIN_COLLISION` 及轨迹净空低于 0.26 m；用当前地图和该次日志中的起终点作离线栅格搜索对比，一条长路线权重 2→4 时最小静态净空约 0.32→0.39 m、长度约增加 0.14 m，另一段受窄通道约束的路线无变化。`colcon build --packages-select mas2027_nav_executor --symlink-install --parallel-workers 2 --cmake-args -DCMAKE_BUILD_TYPE=Release` 通过；区域控制与 SMAC 净空两组测试合计 7 项通过；核对 YAML 中普通/坡道/MINCO/MPC 上限及阶段距离；独立启动重编节点 5 秒，完成初始化并打印 `weight=4.000`，未再抛出区域参数异常；`git diff --check` 通过。离线搜索是对 SMAC 代价的近似复现，未做完整导航启动、实际 C 型拐道行驶或底盘提速验证。
+
+## 2026-09-26 — 全局路径绕横墙端点保留净空
+
+- 改动：SMAC 2D 斜向扩展须同时通过两个相邻正交格，禁止从障碍角点穿越；增加基于静态地形 ESDF 的 `smac_2d.minimum_clearance`，当前配置为 0.25 m，搜索不会选取低于该中心净空的格子。该参数可在线调整，窄通道或贴墙目标若不足此净空会报告无解。涉及 SMAC 搜索、MINCO 参数接线、规划配置和横墙测试；先前未提交的 ESDF 权重 2.0 调整与其他工作区修改保留。
+- 验证：`colcon build --packages-select mas2027_nav_executor --symlink-install --parallel-workers 2 --cmake-args -DCMAKE_BUILD_TYPE=Release` 通过；`colcon test --packages-select mas2027_nav_executor --ctest-args -R test_smac_wall_clearance --output-on-failure` 的角点阻断与短边绕行两项测试通过，`git diff --check` 通过。未在当前实际地图上按具体起终点对比路径，未做实车行驶验证。
+
+## 2026-09-26 — 全局路径增强通道中间偏好
+
+- 改动：`mas2027_nav_executor/config/planner_params.yaml` 将 SMAC 2D 的 `esdf_weight` 从 `1.0` 提高到 `2.0`，增强贴墙路段的距离场软代价，使全局折线更倾向通道中间；`esdf_decay` 保持 `0.8 m`、封顶 `5.0` 仍高于权重，不改变占据格或硬净空判据。同步更新参数说明。
+- 验证：PyYAML 解析并核对 ESDF 开关、权重、衰减和封顶关系；检查当前安装目录的参数文件软链接指向源码配置，`git diff --check` 通过。仅改配置与文档，未重新编译、未在实际地图上对比新旧路径，也未做实车行驶验证。
+
 ## 2026-09-25 — LIO 按雷达输入帧发布去畸变点云
 
 - 改动：`small_point_lio` 的预处理层记录每次雷达输入的有效稠密点数，去畸变处理跨多个 IMU 回调完成整帧后，才向 `/cloud_registered` 和 `/cloud_registered_full` 发布一次，并使用该帧最后一个点的时间戳。`/Odometry` 继续按原有估计流程发布；新增分帧边界测试。当前运行中约 20 Hz 的驱动帧此前会拆成约 50–70 Hz 点云片段，导致 ROGMap 重复更新并跳过部分片段。此改动针对当前输入放大；历史上 20 Hz 输入时的投影耗时问题仍需独立监测。

@@ -112,4 +112,36 @@ TEST(RegionOnlinePriority, SameTrajectoryCanAdoptNewRegionWithoutLosingProgress)
   EXPECT_GE(controller.progress(), progress);
 }
 
+TEST(RegionOnlinePriority, FasterSlopeProfileStaysWithinOrdinaryModeLimits)
+{
+  RegionController controller(4, 3.0, 4.0, 100.0, 100.0);
+  EXPECT_DOUBLE_EQ(controller.speedLimit(), 3.0);
+  EXPECT_DOUBLE_EQ(controller.accelerationLimit(), 4.0);
+
+  auto plan = std::make_shared<RegionPlan>();
+  plan->trajectory_id = 43;
+  plan->positions_odom = {{0.0, 0.0}, {3.0, 0.0}};
+  plan->arc_lengths = {0.0, 3.0};
+  plan->segments.push_back(RegionSegment{5, 5, 4.0, 5.0,
+    0.7, 0.8, 0.9, 1.0, 1.5, 1.7});
+  controller.setPlan(plan);
+  controller.update({0.5, 0.0});
+  controller.update({0.75, 0.0});
+  controller.tickProfile(0.05);
+  EXPECT_EQ(controller.mode(), 4U);
+  EXPECT_DOUBLE_EQ(controller.speedLimit(), 3.0);
+
+  controller.update({0.85, 0.0});
+  controller.tickProfile(0.05);
+  EXPECT_EQ(controller.mode(), 5U);
+  EXPECT_DOUBLE_EQ(controller.speedLimit(), 4.0);
+  EXPECT_DOUBLE_EQ(controller.accelerationLimit(), 5.0);
+
+  controller.update({2.0, 0.0});
+  controller.tickProfile(0.05);
+  EXPECT_EQ(controller.mode(), 4U);
+  EXPECT_DOUBLE_EQ(controller.speedLimit(), 3.0);
+  EXPECT_DOUBLE_EQ(controller.accelerationLimit(), 4.0);
+}
+
 }  // namespace

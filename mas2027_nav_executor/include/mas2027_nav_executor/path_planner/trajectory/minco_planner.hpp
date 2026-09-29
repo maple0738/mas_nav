@@ -10,6 +10,11 @@
 #include <map>
 #include <string>
 
+namespace mas2027_nav_executor {
+class FusedMapQuery;
+class TerrainMapQuery;
+}  // namespace mas2027_nav_executor
+
 namespace minco_planner {
 
 class Visualizer;
@@ -133,6 +138,8 @@ private:
 
   bool ensureMapAvailable();
   void rebuildModeDependentQueries();
+  void rebuildFusedQuery();
+  bool refreshFusedTransform();
   void configureMincoPerfLogging(const rclcpp_lifecycle::LifecycleNode::SharedPtr & node, const std::string & prefix);
 
   void initPlannerMode(
@@ -162,6 +169,7 @@ private:
   double smac_esdf_weight_{1.0};
   double smac_esdf_decay_{0.8};
   double smac_esdf_max_cost_{0.5};
+  double smac_minimum_clearance_{0.0};
   bool use_yaw_opt_{true};
   bool exploration_unknown_as_occupied_{true};
   bool exploration_prefer_goal_direction_{true};
@@ -195,6 +203,9 @@ private:
   std::unique_ptr<PlannerModeContext> mode_context_;
   std::unique_ptr<GlobalPathSearcher> global_path_searcher_;
   std::shared_ptr<mas2027_nav_executor::TerrainGrid> terrain_;
+  std::shared_ptr<mas2027_nav_executor::TerrainMapQuery> terrain_query_;
+  std::shared_ptr<mas2027_nav_executor::FusedMapQuery> fused_query_;
+  double normal_speed_cap_{3.0};
   std::array<double, 9> region_speed_caps_{};
   std::array<double, 9> region_prepare_distances_{};
   std::array<double, 9> region_release_distances_{};

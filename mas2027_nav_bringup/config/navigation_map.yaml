@@ -3,6 +3,6 @@
 # 相对路径以 mas2027_nav_bringup 的 share 目录为基准；也可以填写绝对路径。
 # 三个文件必须来自同一次 mapping_web_ui 导出/编辑流程，并保持同一 map 坐标系。
 map_files:
-  localization_pcd: pcd/lab_map_20260921_211523.pcd
-  occupancy_yaml: map/lab_map_20260921_211523.yaml
-  terrain_msgpack: map/lab_map_20260921_211523_terrain.msgpack
+  localization_pcd: pcd/fengbao_map.pcd
+  occupancy_yaml: map/fengbao_map.yaml
+  terrain_msgpack: map/fengbao_map_terrain.msgpack

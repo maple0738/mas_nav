@@ -190,7 +190,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("use_sim_time", default_value="False"),
         # Headless/SSH 默认关；有显示器时用 use_rviz:=True。
-        DeclareLaunchArgument("use_rviz", default_value="False"),
+        DeclareLaunchArgument("use_rviz", default_value="true"),
         # 底盘转发桥默认开启，消费速度与模式组成的 /nav_executor/chassis_cmd。
         # 下行固定为 vx/vy/mode/nav_state 10 字节；需配套新版 mas_vision 与底盘协议。
         # 上机前确认底盘上电与急停状态；只想看导航不发车时用 use_ros2_comm:=False 关掉。

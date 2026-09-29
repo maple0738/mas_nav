@@ -208,7 +208,9 @@ RegionController::RegionController(uint8_t normal_mode, double normal_speed,
   double normal_acceleration, double speed_blend_rate, double acceleration_blend_rate)
 : normal_mode_(normal_mode), normal_speed_(normal_speed),
   normal_acceleration_(normal_acceleration), speed_blend_rate_(speed_blend_rate),
-  acceleration_blend_rate_(acceleration_blend_rate), mode_(normal_mode) {}
+  acceleration_blend_rate_(acceleration_blend_rate), mode_(normal_mode),
+  speed_limit_(normal_speed), acceleration_limit_(normal_acceleration),
+  target_speed_limit_(normal_speed), target_acceleration_limit_(normal_acceleration) {}
 
 void RegionController::setPlan(std::shared_ptr<const RegionPlan> plan)
 {
@@ -286,8 +288,8 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom)
     }
   }
   mode_ = normal_mode_;
-  target_speed_limit_ = std::numeric_limits<double>::infinity();
-  target_acceleration_limit_ = std::numeric_limits<double>::infinity();
+  target_speed_limit_ = normal_speed_;
+  target_acceleration_limit_ = normal_acceleration_;
   label_.reset();
   phase_ = RegionPhase::NORMAL;
   return mode_;
@@ -296,25 +298,17 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom)
 void RegionController::tickProfile(double dt)
 {
   if (!std::isfinite(dt) || dt <= 0.0) return;
-  const auto blend = [dt](double current, double target, double normal, double rate) {
-    if (!std::isfinite(current)) current = normal;
-    const double destination = std::isfinite(target) ? target : normal;
-    current += std::clamp(destination - current, -rate * dt, rate * dt);
-    if (!std::isfinite(target) && std::abs(current - normal) < 1e-6) {
-      return std::numeric_limits<double>::infinity();
-    }
-    return current;
+  const auto blend = [dt](double current, double target, double rate) {
+    return current + std::clamp(target - current, -rate * dt, rate * dt);
   };
-  if (!std::isfinite(target_speed_limit_) && !std::isfinite(speed_limit_)) {
-    // No region has requested a profile yet.
-  } else {
-    speed_limit_ = blend(speed_limit_, target_speed_limit_, normal_speed_, speed_blend_rate_);
-  }
-  if (!std::isfinite(target_acceleration_limit_) && !std::isfinite(acceleration_limit_)) {
-    // Keep the unconstrained normal profile.
-  } else {
-    acceleration_limit_ = blend(acceleration_limit_, target_acceleration_limit_,
-      normal_acceleration_, acceleration_blend_rate_);
+  speed_limit_ = blend(speed_limit_, target_speed_limit_, speed_blend_rate_);
+  acceleration_limit_ = blend(
+    acceleration_limit_, target_acceleration_limit_, acceleration_blend_rate_);
+  // A faster special-region profile must not raise the ordinary-mode limit before
+  // the special mode is requested, or remain raised after the release point.
+  if (mode_ == normal_mode_) {
+    speed_limit_ = std::min(speed_limit_, normal_speed_);
+    acceleration_limit_ = std::min(acceleration_limit_, normal_acceleration_);
   }
   if (phase_ == RegionPhase::COMMITTED || phase_ == RegionPhase::INSIDE ||
     phase_ == RegionPhase::RELEASING) {

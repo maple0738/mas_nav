@@ -17,17 +17,20 @@
       smac_2d:
         # 代价增量 = step * min(weight * exp(-dist/decay), max_cost)，dist 取自 TerrainMapQuery
         # 烘焙的二维有符号距离场（自由为正，上限 3.0 m），作用是让折线远离墙面、贴近走廊中线。
-        # 这四项可以在线调（现场标定 esdf_weight / esdf_decay 不必重启）。
+        # 下列势场与最小净空参数可以在线调（现场标定不必重启）。
         use_esdf_cost: true
-        esdf_weight: 1.0
+        # 增强近墙代价，让 C 型拐道的全局折线更倾向外侧净空；实地图路线离线对比
+        # 从 2.0 提至 4.0 后，绕行段最小静态净空约 0.32→0.39 m，长度约增加 0.14 m。
+        esdf_weight: 4.0
         esdf_decay: 0.8
-        # 势场封顶值 max_cost，取值必须 ≥ esdf_weight：否则 potential 在 d ≤ decay·ln2 内饱和、
-        # 梯度为 0，搜索分不出"贴墙 5 cm"与"离墙 50 cm"，走廊净宽 ≤ ~1.1 m 时整条走廊都在
-        # 饱和区，全局搜索只剩"最短路径"一个目标 → 贴内侧墙、切内角。
-        # 5.0 与 1.0 行为等价（封顶不生效），取 5.0 只为显式表达"不封顶"，并与
+        # 势场封顶值 max_cost 应 ≥ esdf_weight，避免近墙代价饱和后失去净空梯度。
+        # 5.0 高于当前权重 4.0（封顶不生效），并与
         # smac_planner_2d_simple.hpp 的代码默认值一致；本项只影响全局折线形状与 MINCO 参考线，
-        # 不改变任何净空判据。若现场仍偏贴墙，下一步再单变量调 esdf_weight（1.0 → 2.0）。
+        # 不改变任何净空判据。
         esdf_max_cost: 5.0
+        # 静态地形 ESDF 到不可通行格的最低中心净空；绕横墙端点时避免折线贴着墙角。
+        # 低于此值的格不参与搜索；窄通道或贴墙目标可能因此无解，可在线调回 0。
+        minimum_clearance: 0.25
       odom_topic: /Odometry
       tolerance: 0.3
       exploration:
@@ -98,8 +101,10 @@
         # 优化器软目标相对硬判据的余量（仅在 speed_aware_clearance 开启时生效）。
         clearance_optimizer_margin: 0.05
         safety_lookahead_time: 1.2
-        max_velocity: 3.0
-        max_acceleration: 4.0
+        # 轨迹总上限；普通路段由 region_control.normal_max_speed 限为 3.0，
+        # 坡道可按 region_control.slope.max_speed 提到 4.0。
+        max_velocity: 4.0
+        max_acceleration: 5.0
         turn_angle_deadzone: 0.1
         turn_angle_saturation: 1.0
         min_turn_vel: 0.8
@@ -183,7 +188,7 @@
           scan_z_max_abs: 2.75
           unknown_as_occupied: false
           min_observed_voxels: 1
-          surface_height_delta_max: 0.2
+          surface_height_delta_max: 0.08
           wall_height_delta_min: 0.80
           wall_occupancy_ratio_min: 0.90
           tunnel_height_delta_min: 0.25

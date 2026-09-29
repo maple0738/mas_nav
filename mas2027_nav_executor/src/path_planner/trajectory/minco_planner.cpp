@@ -1,5 +1,8 @@
 // Corresponding header
 #include "mas2027_nav_executor/path_planner/trajectory/minco_planner.hpp"
+
+#include "mas2027_nav_executor/common/environment/fused_map_query.hpp"
+#include "mas2027_nav_executor/common/environment/terrain_map_query.hpp"
 #include "mas2027_nav_executor/common/environment/clearance_gate.hpp"
 #include "mas2027_nav_executor/path_planner/trajectory/arc_length_speed_profile.hpp"
 
@@ -156,6 +159,8 @@ void MincoPlanner::rebuildModeDependentQueries()
     safety_checker_->setQuery(mode_context_->dynamicQuery());
   }
 
+  rebuildFusedQuery();
+
   RCLCPP_INFO(logger_, "[MincoPlanner] Rebuilt ROGMap queries.");
 }
 
@@ -267,7 +272,7 @@ void MincoPlanner::configure(const rclcpp_lifecycle::LifecycleNode::WeakPtr & pa
     use_smac_ ? "SMAC2D" : "Astar",
     "ROGMap");
 
-  // SMAC 的 ESDF 势场软代价，四项默认值对齐 mas_nav_2027 nav2_params.yaml 的 smac_2d 段；
+  // SMAC 的 ESDF 势场软代价和最小净空；势场默认值对齐 mas_nav_2027 nav2_params.yaml。
   // ESDF 取自 TerrainMapQuery 烘焙的二维距离场（上限 3.0 m），量纲与旧工程 ROGMap 一致。
   declareParameterIfMissing(
     node, prefix + "smac_2d.use_esdf_cost", rclcpp::ParameterValue(true));
@@ -277,10 +282,16 @@ void MincoPlanner::configure(const rclcpp_lifecycle::LifecycleNode::WeakPtr & pa
     node, prefix + "smac_2d.esdf_decay", rclcpp::ParameterValue(0.8));
   declareParameterIfMissing(
     node, prefix + "smac_2d.esdf_max_cost", rclcpp::ParameterValue(0.5));
+  declareParameterIfMissing(
+    node, prefix + "smac_2d.minimum_clearance", rclcpp::ParameterValue(0.0));
   node->get_parameter(prefix + "smac_2d.use_esdf_cost", smac_use_esdf_cost_);
   node->get_parameter(prefix + "smac_2d.esdf_weight", smac_esdf_weight_);
   node->get_parameter(prefix + "smac_2d.esdf_decay", smac_esdf_decay_);
   node->get_parameter(prefix + "smac_2d.esdf_max_cost", smac_esdf_max_cost_);
+  node->get_parameter(prefix + "smac_2d.minimum_clearance", smac_minimum_clearance_);
+  if (!std::isfinite(smac_minimum_clearance_) || smac_minimum_clearance_ < 0.0) {
+    throw std::invalid_argument("smac_2d.minimum_clearance must be finite and non-negative");
+  }
 
   declareParameterIfMissing(
     node, prefix + "lidar_offset_x", rclcpp::ParameterValue(0.0));
@@ -396,11 +407,17 @@ void MincoPlanner::configure(const rclcpp_lifecycle::LifecycleNode::WeakPtr & pa
   declareParameterIfMissing(
     node, prefix + "minco_optimizer.max_velocity", rclcpp::ParameterValue(2.0));
   node->get_parameter(prefix + "minco_optimizer.max_velocity", minco_config.max_vel);
+  declareParameterIfMissing(
+    node, "region_control.normal_max_speed", rclcpp::ParameterValue(3.0));
+  node->get_parameter("region_control.normal_max_speed", normal_speed_cap_);
+  if (!std::isfinite(normal_speed_cap_) || normal_speed_cap_ <= 0.0) {
+    throw std::invalid_argument("region_control.normal_max_speed must be finite and positive");
+  }
   region_speed_caps_.fill(std::numeric_limits<double>::infinity());
   region_prepare_distances_.fill(0.0);
   region_release_distances_.fill(0.0);
   for (const auto & entry : std::array<std::pair<const char *, size_t>, 3>{{
-      {"slope", 2}, {"tunnel", 7}, {"undulating", 8}}}) {
+      {"slope", 5}, {"tunnel", 6}, {"undulating", 7}}}) {
     const std::string key = std::string("region_control.") + entry.first + ".max_speed";
     declareParameterIfMissing(node, key, rclcpp::ParameterValue(1.0));
     node->get_parameter(key, region_speed_caps_[entry.second]);
@@ -559,15 +576,17 @@ void MincoPlanner::configure(const rclcpp_lifecycle::LifecycleNode::WeakPtr & pa
     smac_planner_->setParameters(allow_unknown_, 1000000, static_cast<float>(tolerance_));
     smac_planner_->setESDFParameters(
       smac_use_esdf_cost_, smac_esdf_weight_, smac_esdf_decay_, smac_esdf_max_cost_);
+    smac_planner_->setMinimumClearance(smac_minimum_clearance_);
     smac_planner_->setMap(global_query);
     smac_planner_->setESDFQuery(dynamic_query);
     RCLCPP_INFO(logger_,
       "[MincoPlanner] SMAC 2D global search enabled: use_esdf_cost=%s weight=%.3f decay=%.3f "
-      "max_cost=%.3f tolerance=%.3f",
+      "max_cost=%.3f min_clearance=%.3f tolerance=%.3f",
       smac_use_esdf_cost_ ? "true" : "false",
       smac_esdf_weight_,
       smac_esdf_decay_,
       smac_esdf_max_cost_,
+      smac_minimum_clearance_,
       tolerance_);
   } else {
     smac_planner_.reset();
@@ -674,6 +693,8 @@ void MincoPlanner::cleanup()
   mode_context_.reset();
   minco_optimizer_.reset();
   corridor_gen_.reset();
+  fused_query_.reset();
+  terrain_query_.reset();
   backup_opt_.reset();
   yaw_opt_.reset();
   opt_path_pub_.reset();
@@ -725,6 +746,7 @@ rcl_interfaces::msg::SetParametersResult MincoPlanner::onSetParameters(
   double next_smac_esdf_weight = smac_esdf_weight_;
   double next_smac_esdf_decay = smac_esdf_decay_;
   double next_smac_esdf_max_cost = smac_esdf_max_cost_;
+  double next_smac_minimum_clearance = smac_minimum_clearance_;
   bool smac_config_changed = false;
 
   for (const auto & param : parameters) {
@@ -803,11 +825,12 @@ rcl_interfaces::msg::SetParametersResult MincoPlanner::onSetParameters(
       continue;
     }
 
-    // ESDF 势场软代价可在线上调（现场标定不必重启）；use_smac 是结构开关，configure-time 已拒绝。
+    // ESDF 势场和最小净空可在线调；use_smac 是结构开关，configure-time 已拒绝。
     if (param_name == name_ + ".smac_2d.use_esdf_cost" ||
         param_name == name_ + ".smac_2d.esdf_weight" ||
         param_name == name_ + ".smac_2d.esdf_decay" ||
-        param_name == name_ + ".smac_2d.esdf_max_cost") {
+        param_name == name_ + ".smac_2d.esdf_max_cost" ||
+        param_name == name_ + ".smac_2d.minimum_clearance") {
       if (param_name == name_ + ".smac_2d.use_esdf_cost") {
         if (param.get_type() != rclcpp::ParameterType::PARAMETER_BOOL) {
           result.successful = false;
@@ -840,6 +863,8 @@ rcl_interfaces::msg::SetParametersResult MincoPlanner::onSetParameters(
           return result;
         } else if (param_name == name_ + ".smac_2d.esdf_weight") {
           next_smac_esdf_weight = candidate;
+        } else if (param_name == name_ + ".smac_2d.minimum_clearance") {
+          next_smac_minimum_clearance = candidate;
         } else {
           next_smac_esdf_max_cost = candidate;
         }
@@ -854,16 +879,20 @@ rcl_interfaces::msg::SetParametersResult MincoPlanner::onSetParameters(
     smac_esdf_weight_ = next_smac_esdf_weight;
     smac_esdf_decay_ = next_smac_esdf_decay;
     smac_esdf_max_cost_ = next_smac_esdf_max_cost;
+    smac_minimum_clearance_ = next_smac_minimum_clearance;
     if (smac_planner_) {
       smac_planner_->setESDFParameters(
         smac_use_esdf_cost_, smac_esdf_weight_, smac_esdf_decay_, smac_esdf_max_cost_);
+      smac_planner_->setMinimumClearance(smac_minimum_clearance_);
     }
     RCLCPP_INFO(logger_,
-      "[MincoPlanner] SMAC 2D ESDF bias updated: use_esdf_cost=%s weight=%.3f decay=%.3f max_cost=%.3f",
+      "[MincoPlanner] SMAC 2D ESDF updated: use_esdf_cost=%s weight=%.3f decay=%.3f "
+      "max_cost=%.3f min_clearance=%.3f",
       smac_use_esdf_cost_ ? "true" : "false",
       smac_esdf_weight_,
       smac_esdf_decay_,
-      smac_esdf_max_cost_);
+      smac_esdf_max_cost_,
+      smac_minimum_clearance_);
   }
 
   if (optimizer_config_changed) {
@@ -948,6 +977,53 @@ void MincoPlanner::setTerrainGrid(std::shared_ptr<mas2027_nav_executor::TerrainG
 {
   terrain_ = std::move(terrain);
   if (global_path_searcher_) global_path_searcher_->setTerrainGrid(terrain_);
+  rebuildFusedQuery();
+}
+
+void MincoPlanner::rebuildFusedQuery()
+{
+  const auto dynamic_query = mode_context_ ? mode_context_->dynamicQuery() : rog_query_raw_;
+  std::shared_ptr<rog_map::MapQueryInterface> local_query = dynamic_query;
+  if (terrain_ && dynamic_query) {
+    terrain_query_ = std::make_shared<mas2027_nav_executor::TerrainMapQuery>(terrain_);
+    fused_query_ = std::make_shared<mas2027_nav_executor::FusedMapQuery>(
+      dynamic_query, terrain_query_);
+    local_query = fused_query_;
+  } else {
+    fused_query_.reset();
+    terrain_query_.reset();
+  }
+  if (minco_optimizer_) minco_optimizer_->setMap(local_query);
+  if (corridor_gen_) corridor_gen_->setMap(local_query);
+  if (safety_checker_) safety_checker_->setQuery(local_query);
+}
+
+bool MincoPlanner::refreshFusedTransform()
+{
+  if (!fused_query_) {
+    return true;
+  }
+  if (!terrain_ || !tf_) {
+    fused_query_->clearStaticTransform();
+    return false;
+  }
+  const auto terrain = terrain_->snapshot();
+  if (!terrain) {
+    fused_query_->clearStaticTransform();
+    return false;
+  }
+  try {
+    const auto transform = tf_->lookupTransform(
+      terrain->cost.header.frame_id, output_frame_, tf2::TimePointZero);
+    fused_query_->setStaticTransform(
+      transform.transform.translation.x,
+      transform.transform.translation.y,
+      tf2::getYaw(transform.transform.rotation));
+    return true;
+  } catch (const tf2::TransformException &) {
+    fused_query_->clearStaticTransform();
+    return false;
+  }
 }
 
 bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_pose)
@@ -1046,6 +1122,9 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
       const double c = std::cos(yaw), s = std::sin(yaw);
       const double tx = transform.transform.translation.x;
       const double ty = transform.transform.translation.y;
+      if (fused_query_) {
+        fused_query_->setStaticTransform(tx, ty, yaw);
+      }
       terrain_segment_free = [terrain, c, s, tx, ty](
         const Eigen::Vector3d & a, const Eigen::Vector3d & b) {
         const auto to_map = [c, s, tx, ty](const Eigen::Vector3d & p) {
@@ -1439,6 +1518,9 @@ void MincoPlanner::PTAllocation(const std::vector<Eigen::Vector3d> & sparse_path
       minco_config.min_turn_vel,
       minco_config.decay_power);
   }
+  std::vector<bool> slope_window(static_cast<size_t>(N), false);
+  std::vector<double> other_region_cap(
+    static_cast<size_t>(N), std::numeric_limits<double>::infinity());
   if (terrain_ && tf_) {
     if (const auto terrain = terrain_->snapshot()) {
       try {
@@ -1472,8 +1554,12 @@ void MincoPlanner::PTAllocation(const std::vector<Eigen::Vector3d> & sparse_path
               for (int k = 0; k < N; ++k) {
                 if (node_s[static_cast<size_t>(k)] <= affected_end &&
                   node_s[static_cast<size_t>(k + 1)] >= affected_start) {
-                  local_vmax_vec[static_cast<size_t>(k)] = std::min(
-                    local_vmax_vec[static_cast<size_t>(k)], region_speed_caps_[*label]);
+                  if (*label == 5U) {
+                    slope_window[static_cast<size_t>(k)] = true;
+                  } else {
+                    other_region_cap[static_cast<size_t>(k)] = std::min(
+                      other_region_cap[static_cast<size_t>(k)], region_speed_caps_[*label]);
+                  }
                 }
               }
             }
@@ -1483,6 +1569,12 @@ void MincoPlanner::PTAllocation(const std::vector<Eigen::Vector3d> & sparse_path
         // The final trajectory safety check still rejects an unavailable terrain transform.
       }
     }
+  }
+  for (int i = 0; i < N; ++i) {
+    const size_t k = static_cast<size_t>(i);
+    const double region_cap = std::min(
+      slope_window[k] ? region_speed_caps_[5] : normal_speed_cap_, other_region_cap[k]);
+    local_vmax_vec[k] = std::min(local_vmax_vec[k], region_cap);
   }
   utils::VelPropogation(seg_len, amax, local_vmax_vec);
   for (int i = 0; i < N; ++i) {
@@ -1949,6 +2041,7 @@ bool MincoPlanner::checkCollision(const traj_opt::Trajectory & traj)
 
 void MincoPlanner::safetyTimerCallback()
 {
+  refreshFusedTransform();
   const bool safe = checkCollision();
   if (!safe) {
     is_traj_safe_.store(false);
@@ -1996,6 +2089,7 @@ void MincoPlanner::publishEmergencyStop(const geometry_msgs::msg::PoseStamped & 
   }
 
   const double current_yaw = getCurrentYawFromOdom();
+  refreshFusedTransform();
   traj_opt::Trajectory backup_traj = generateBackupTraj(start_state);
   backup_traj.start_WT = now_s;
   utils::publishBackupTrajectory(
