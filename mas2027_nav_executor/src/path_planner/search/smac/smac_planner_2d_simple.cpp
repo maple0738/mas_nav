@@ -129,7 +129,7 @@ void SmacPlanner2DSimple::logFailure(const std::string & reason,
 {
   RCLCPP_WARN(logger_,
     "[SMAC 2D] %s | start=(%u,%u) goal=(%u,%u) size=%ux%u origin=(%.3f,%.3f) res=%.3f "
-    "allow_unknown=%s tolerance=%.3f max_iterations=%d iterations=%d",
+    "allow_unknown=%s tolerance=%.3f minimum_clearance=%.3f max_iterations=%d iterations=%d",
     reason.c_str(),
     start_x,
     start_y,
@@ -142,6 +142,7 @@ void SmacPlanner2DSimple::logFailure(const std::string & reason,
     costmap_resolution_,
     allow_unknown_ ? "true" : "false",
     tolerance_,
+    minimum_clearance_,
     max_iterations_,
     iterations);
 }
@@ -296,7 +297,15 @@ bool SmacPlanner2DSimple::createPath(const unsigned int & start_x,
 
   if (!is_traversable(goal_index)) {
     const unsigned char goal_cost = charmap[static_cast<size_t>(goal_index)];
-    logFailure("goal cell is not traversable, cost=" + std::to_string(static_cast<unsigned int>(goal_cost)),
+    const bool cost_rejected = (goal_cost == UNKNOWN_COST && !allow_unknown_) ||
+      (goal_cost != UNKNOWN_COST && goal_cost >= INSCRIBED_COST);
+    const float distance = cost_rejected ? -std::numeric_limits<float>::infinity() :
+      getESDFDistance(goal_x, goal_y);
+    const std::string reason = cost_rejected ? "goal rejected by grid cost" :
+      (std::isfinite(distance) ? "goal rejected by ESDF clearance" :
+      "goal rejected: ESDF query unavailable or nonfinite");
+    logFailure(reason + ", cost=" + std::to_string(static_cast<unsigned int>(goal_cost)) +
+      ", clearance=" + (cost_rejected ? std::string("not_checked") : std::to_string(distance)),
       start_x,
       start_y,
       goal_x,

@@ -156,6 +156,7 @@ ros2 launch mas2027_nav_bringup nav_executor_launch.py
 设为 `prior` 时，先验地图文件统一在 `mas2027_nav_bringup/config/navigation_map.yaml` 中选择。
 设为 `online` 时使用无先验模式：不读取地图文件、不启动 GICP 定位器和静态地图服务，
 使用 `odom` 下的 LIO 与在线 ROGMap 分段推进；速度与加速度采用规划器、MPC 和区域控制 YAML，未知区域作为障碍。
+在线模式默认启用 B1 累计地图，在 `/nav_executor/online_global_map` 保留本次启动内的历史观测，并提供固定版本的全局查询接口；当前任务搜索仍使用 A 方案，后续 B2 接入累计地图路线。
 具体启动、目标坐标和能力范围见 [无先验地图导航](docs/online_navigation.md)。
 `use_ros2_comm` 默认 `True`——它消费 `/nav_executor/chassis_cmd`，不开会「指令一直有值但车不动」；
 只想看导航时置 `False` 并确认底盘与急停状态。RViz 的 2D Goal Pose 发到 `/goal_pose`。
@@ -165,7 +166,7 @@ ros2 launch mas2027_nav_bringup nav_executor_launch.py
 - `mas2027_nav_executor/config/node_params.yaml`：频率、话题、坐标系、`node.rog_map_clearance`
   与 `node.rog_map_timeout_s`。
 - `mas2027_nav_executor/config/planner_params.yaml`：全局搜索（`use_smac`、`smac_2d.*`、`tolerance`）、
-  MINCO 与恢复参数、`planner.rog_map.*`。
+  MINCO 与恢复参数、`planner.rog_map.*`、`planner.online_global_map.*`。
 - `mas2027_nav_executor/config/mpc_params.yaml`：MPC 约束与权重。
 - `mas2027_nav_bringup/config/small_point_lio_params.yaml`：雷达与 LIO（含双雷达降级超时）。
 - `mas2027_nav_bringup/config/navigation_map.yaml`：导航地图唯一选择入口（定位 PCD、二维地图

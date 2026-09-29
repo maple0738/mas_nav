@@ -17,6 +17,8 @@ namespace rog_map { class ROGMapROS; }
 
 namespace mas2027_nav_executor {
 
+class OnlineGlobalMap;
+
 class PathPlanner final
 {
 public:
@@ -30,6 +32,8 @@ public:
   }
   rclcpp_lifecycle::LifecycleNode::SharedPtr node() const { return node_; }
   std::shared_ptr<rog_map::MapQueryInterface> mapQuery() const;
+  // Pin one immutable global map version for a complete future global search.
+  std::shared_ptr<rog_map::MapQueryInterface> globalMapQuery() const;
   // 当前全局搜索输出的折线（odom 系），供 RViz 显示；无可用路径时返回 false。
   bool copyLatestGlobalPath(std::vector<geometry_msgs::msg::PoseStamped> & out) const;
 
@@ -41,6 +45,10 @@ private:
   minco_planner::MincoPlanner::Ptr planner_;
   std::unique_ptr<TaskManager> task_manager_;
   rclcpp::TimerBase::SharedPtr task_timer_;
+  std::unique_ptr<OnlineGlobalMap> online_global_map_;
+  rclcpp::TimerBase::SharedPtr global_map_timer_;
+  rclcpp::CallbackGroup::SharedPtr global_map_callback_group_;
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr global_map_pub_;
   std::shared_ptr<TerrainGrid> terrain_;
   double odom_timeout_s_;
   double rog_map_timeout_s_;

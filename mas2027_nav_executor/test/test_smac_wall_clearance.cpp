@@ -99,4 +99,21 @@ TEST(SmacWallClearance, ShortWallEndKeepsConfiguredClearance)
   EXPECT_TRUE(passed_short_end);
 }
 
+TEST(SmacWallClearance, FreeGoalStillRequiresValidDistanceFieldAndClearance)
+{
+  auto map = std::make_shared<GridQuery>(20U, 20U, 0.05);
+  map->block(10U, 10U);
+  mas2027_nav_executor::smac::SmacPlanner2DSimple planner;
+  planner.setMap(map);
+  planner.setMinimumClearance(0.27);
+  planner.setParameters(false, 10000, 0.0F);
+  mas2027_nav_executor::smac::SmacPlanner2DSimple::CoordinateVector path;
+  // Missing ESDF must fail closed even though every requested endpoint is free.
+  EXPECT_FALSE(planner.createPath(1U, 1U, 18U, 18U, path));
+  planner.setESDFQuery(map);
+  EXPECT_FALSE(planner.createPath(1U, 1U, 10U, 11U, path));
+  EXPECT_TRUE(path.empty());
+  EXPECT_TRUE(planner.createPath(1U, 1U, 18U, 18U, path));
+}
+
 }  // namespace

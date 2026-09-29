@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "mas2027_nav_executor/path_executor/monitoring/command_safety.hpp"
@@ -44,10 +45,12 @@ public:
     // The observed region ends before the rolling window edge. Its unknown
     // border contributes to the ESDF, just as in the online projection profile.
     distance = std::min(clearance, observed_end - p.x());
+    if (!cell_clearances.empty()) distance = std::min(distance, cell_clearances[y * sizeX() + x]);
     grad = {-1.0, 0.0, 0.0};
     return true;
   }
   std::vector<unsigned char> cells = std::vector<unsigned char>(1600, 0U);
+  std::vector<double> cell_clearances;
   double stamp{42.0};
   double clearance{1.0};
   double observed_end{4.0};
@@ -66,18 +69,21 @@ geometry_msgs::msg::PoseStamped pose(double x, double y = 2.05)
 
 struct Search
 {
-  explicit Search(const std::shared_ptr<OnlineQuery> & query) : astar(40, 40)
+  explicit Search(const std::shared_ptr<OnlineQuery> & query, bool use_smac = false) : astar(40, 40)
   {
     minco_planner::PlannerModeParams params;
     params.planner_mode = "EXPLORATION";
     params.rog_frame = "odom";
     params.exploration_unknown_as_occupied = true;
     context.configure(params, query, nullptr, rclcpp::get_logger("online_test"));
-    search.configure(nullptr, &astar, nullptr, false, false, 0.15,
+    smac.setParameters(false, 100000, 0.15F);
+    smac.setMinimumClearance(0.27);
+    search.configure(nullptr, &astar, use_smac ? &smac : nullptr, use_smac, false, 0.15,
       rclcpp::get_logger("online_test"));
     search.setQuery(query);
     search.setOnlineSubgoalClearance(0.33);
   }
+  mas2027_nav_executor::smac::SmacPlanner2DSimple smac;
   minco_planner::Astar astar;
   minco_planner::PlannerModeContext context;
   minco_planner::GlobalPathSearcher search;
@@ -141,6 +147,91 @@ TEST_F(OnlineNavigation, SubgoalRequiresValidDistanceFieldAndClearance)
   q->clearance = 1.0;
   q->field_valid = false;
   EXPECT_FALSE(s.search.plan(pose(0.55), pose(12.0), s.context, path));
+}
+
+TEST_F(OnlineNavigation, DisconnectedObservedGoalReportsFailureWithoutSmac)
+{
+  auto q = std::make_shared<OnlineQuery>();
+  q->cells.assign(1600, 254U);
+  q->cells[20 * 40 + 5] = 0U;
+  q->cells[20 * 40 + 25] = 0U;
+  Search s(q);
+  std::vector<geometry_msgs::msg::PoseStamped> path;
+  EXPECT_FALSE(s.search.plan(pose(0.55), pose(2.55), s.context, path));
+}
+
+TEST_F(OnlineNavigation, SubgoalRouteDetoursAroundLowClearanceFreeCells)
+{
+  auto q = std::make_shared<OnlineQuery>();
+  q->cell_clearances.assign(1600, 1.0);
+  // Grid costs are all free, but a low-clearance band crosses the straight route.
+  for (unsigned int y = 10; y < 30; ++y) q->cell_clearances[y * 40 + 8] = 0.1;
+  Search s(q, true);
+  std::vector<geometry_msgs::msg::PoseStamped> path;
+  ASSERT_TRUE(s.search.plan(pose(0.55), pose(12.0), s.context, path));
+  EXPECT_GT(path.back().pose.position.x, 1.5);
+  for (const auto & p : path) {
+    const auto field = q->query({p.pose.position.x, p.pose.position.y, 0.0});
+    ASSERT_TRUE(field.ok);
+    EXPECT_GE(field.distance, 0.27);
+  }
+}
+
+TEST_F(OnlineNavigation, SubgoalCannotCrossLowClearanceBarrierToReachSafeEndpoint)
+{
+  auto q = std::make_shared<OnlineQuery>();
+  q->cell_clearances.assign(1600, 1.0);
+  for (unsigned int y = 0; y < 40; ++y) q->cell_clearances[y * 40 + 6] = 0.1;
+  Search s(q, true);
+  std::vector<geometry_msgs::msg::PoseStamped> path;
+  EXPECT_FALSE(s.search.plan(pose(0.55), pose(12.0), s.context, path));
+}
+
+TEST_F(OnlineNavigation, SubgoalCannotCutDiagonalAcrossLowClearanceSideCells)
+{
+  auto q = std::make_shared<OnlineQuery>();
+  q->cell_clearances.assign(1600, 1.0);
+  for (const auto & cell : std::vector<std::pair<unsigned int, unsigned int>>{
+    {4, 20}, {6, 20}, {5, 19}, {5, 21}}) {
+    q->cell_clearances[cell.second * 40 + cell.first] = 0.1;
+  }
+  Search s(q, true);
+  std::vector<geometry_msgs::msg::PoseStamped> path;
+  EXPECT_FALSE(s.search.plan(pose(0.55), pose(12.0), s.context, path));
+}
+
+TEST_F(OnlineNavigation, ObservedLowClearanceGoalUsesSafeSubgoal)
+{
+  auto q = std::make_shared<OnlineQuery>();
+  q->cell_clearances.assign(1600, 1.0);
+  q->cell_clearances[20 * 40 + 25] = 0.1;
+  Search s(q, true);
+  std::vector<geometry_msgs::msg::PoseStamped> path;
+  ASSERT_TRUE(s.search.plan(pose(0.55), pose(2.55), s.context, path));
+  for (const auto & p : path) {
+    const auto field = q->query({p.pose.position.x, p.pose.position.y, 0.0});
+    ASSERT_TRUE(field.ok);
+    EXPECT_GE(field.distance, 0.27);
+  }
+}
+
+TEST_F(OnlineNavigation, SubgoalRouteRejectsInvalidFieldAndCanLeaveTightStart)
+{
+  auto q = std::make_shared<OnlineQuery>();
+  Search s(q, true);
+  std::vector<geometry_msgs::msg::PoseStamped> path;
+  q->field_valid = false;
+  EXPECT_FALSE(s.search.plan(pose(0.55), pose(12.0), s.context, path));
+  q->field_valid = true;
+  q->cell_clearances.assign(1600, 1.0);
+  q->cell_clearances[20 * 40 + 5] = 0.1;
+  ASSERT_TRUE(s.search.plan(pose(0.55), pose(12.0), s.context, path));
+  EXPECT_GT(path.back().pose.position.x, 1.5);
+  // Only the initial occupied position is exempt, as in the direct SMAC search.
+  for (size_t i = 1; i < path.size(); ++i) {
+    const auto & p = path[i].pose.position;
+    EXPECT_GE(q->query({p.x, p.y, 0.0}).distance, 0.27);
+  }
 }
 
 mas2027_nav_executor::ExecutorStatus command(

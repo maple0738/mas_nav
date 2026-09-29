@@ -266,6 +266,9 @@ public:
     load("projection.min_observed_voxels", min_observed_voxels);
     load("projection.unknown_as_occupied", unknown_as_occupied);
     load("projection.surface_height_delta_max", surface_height_delta_max);
+    load("projection.ground_filter.enable", ground_filter_en);
+    load("projection.ground_filter.max_span", ground_filter_max_span);
+    load("projection.ground_filter.plane_tolerance", ground_filter_plane_tolerance);
     load("projection.wall_height_delta_min", wall_height_delta_min);
     load("projection.wall_occupancy_ratio_min", wall_occupancy_ratio_min);
     load("projection.tunnel_height_delta_min", tunnel_height_delta_min);
@@ -313,6 +316,11 @@ public:
     if (!std::isfinite(surface_height_delta_max) || surface_height_delta_max < 0.0) {
       throw std::invalid_argument(
         "projection.surface_height_delta_max must be a non-negative vertical height difference.");
+    }
+    if (!std::isfinite(ground_filter_max_span) || ground_filter_max_span <= 0.0 ||
+        !std::isfinite(ground_filter_plane_tolerance) || ground_filter_plane_tolerance <= 0.0 ||
+        ground_filter_plane_tolerance > ground_filter_max_span) {
+      throw std::invalid_argument("invalid projection.ground_filter span or plane tolerance");
     }
     if (!std::isfinite(wall_height_delta_min) || wall_height_delta_min <= surface_height_delta_max) {
       throw std::invalid_argument(
@@ -526,6 +534,9 @@ public:
   int min_observed_voxels{2};
   bool unknown_as_occupied{true};
   double surface_height_delta_max{0.10};
+  bool ground_filter_en{false};
+  double ground_filter_max_span{0.15};
+  double ground_filter_plane_tolerance{0.075};
   double wall_height_delta_min{0.20};
   double wall_occupancy_ratio_min{0.80};
   double tunnel_height_delta_min{0.24};

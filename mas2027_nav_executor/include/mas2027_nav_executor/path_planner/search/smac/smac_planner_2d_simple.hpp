@@ -81,8 +81,9 @@ public:
    * @param max_cost Upper clamp of the potential, <=0 disables the clamp (smac_2d.esdf_max_cost)
    */
   void setESDFParameters(bool enable, double weight, double decay, double max_cost);
-  // Reject cells whose static-map distance to an obstacle is below this value.
+  // Reject cells whose search-map distance to an obstacle is below this value.
   void setMinimumClearance(double clearance);
+  double minimumClearance() const { return minimum_clearance_; }
 
   void setMap(const std::shared_ptr<rog_map::MapQueryInterface> & map);
   void setESDFQuery(const std::shared_ptr<rog_map::MapQueryInterface> & query);

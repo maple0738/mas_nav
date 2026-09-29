@@ -126,6 +126,21 @@ LocalPathSeed LocalPathProcessor::buildSeed(
   const double start_clearance =
       start_clearance_ok ? start_query.distance : 0.0;
 
+  if (start_clearance_ok && start_clearance < 0.0) {
+    unsigned int mx = 0, my = 0;
+    const bool inside = query->worldToMap(cur_pos.x(), cur_pos.y(), mx, my);
+    RCLCPP_WARN_THROTTLE(logger_, *rclcpp::Clock::make_shared(), 2000,
+      "[MincoPlanner] Negative start clearance: world=(%.3f,%.3f) clearance=%.3f "
+      "inside_map=%s cell=(%u,%u) cost=%u snapshot=%llu projection=%llu mask=%llu field=%llu "
+      "field_age_ms=%.1f; inspect live cloud and projection at this position",
+      cur_pos.x(), cur_pos.y(), start_clearance, inside ? "true" : "false", mx, my,
+      inside ? static_cast<unsigned int>(query->value(mx, my)) : 255U,
+      static_cast<unsigned long long>(start_query.snapshot_sequence),
+      static_cast<unsigned long long>(start_query.projection_sequence),
+      static_cast<unsigned long long>(start_query.mask_sequence),
+      static_cast<unsigned long long>(start_query.field_sequence), start_query.field_age_ms);
+  }
+
   // 安全检查必须包含机器人实测位置：折线起点取最近栅格顶点，不一定等于机器人当前位置。
   std::vector<Eigen::Vector3d> checked_path;
   checked_path.reserve(seed.dense_path.size() + 1U);

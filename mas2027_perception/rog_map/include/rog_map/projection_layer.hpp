@@ -58,6 +58,9 @@ struct ProjectionLayerConfig
   bool unknown_as_occupied{false};
   int min_observed_voxels{2};
   double surface_height_delta_max{0.10};
+  bool ground_filter_en{false};
+  double ground_filter_max_span{0.15};
+  double ground_filter_plane_tolerance{0.075};
   double wall_height_delta_min{0.20};
   double wall_occupancy_ratio_min{0.80};
   double tunnel_height_delta_min{0.24};
@@ -167,6 +170,7 @@ public:
   size_t storageCapacity() const { return cell_buffer_.size(); }
 
 private:
+  std::vector<int> filterGround(const ProjectionLayerConfig & config);
   static void applyValueAndMask(CellData & cell, const ProjectionLayerConfig & config);
   static void collectClassificationStats(
     const std::vector<CellData> & cells, ProjectionUpdateStats * stats);

@@ -388,6 +388,9 @@ void ROGMap::refreshLayers()
   layer_cfg.unknown_as_occupied = cfg_.unknown_as_occupied;
   layer_cfg.min_observed_voxels = cfg_.min_observed_voxels;
   layer_cfg.surface_height_delta_max = cfg_.surface_height_delta_max;
+  layer_cfg.ground_filter_en = cfg_.ground_filter_en;
+  layer_cfg.ground_filter_max_span = cfg_.ground_filter_max_span;
+  layer_cfg.ground_filter_plane_tolerance = cfg_.ground_filter_plane_tolerance;
   layer_cfg.wall_height_delta_min = cfg_.wall_height_delta_min;
   layer_cfg.wall_occupancy_ratio_min = cfg_.wall_occupancy_ratio_min;
   layer_cfg.tunnel_height_delta_min = cfg_.tunnel_height_delta_min;
@@ -866,10 +869,12 @@ void ROGMap::refreshQuery()
   runtime_stats_.query_copy_values_time = elapsedMs(values_start);
   const auto meta_start = std::chrono::steady_clock::now();
   snapshot->types.resize(layer_->cells().size(), 0U);
+  snapshot->raw_types.resize(layer_->cells().size(), 0U);
   snapshot->height_deltas.resize(layer_->cells().size(), 0.0f);
   snapshot->confidence.resize(layer_->cells().size(), 0.0f);
   for (size_t i = 0; i < layer_->cells().size(); ++i) {
     snapshot->types[i] = static_cast<uint8_t>(layer_->cells()[i].type);
+    snapshot->raw_types[i] = static_cast<uint8_t>(layer_->cells()[i].raw_type);
     snapshot->height_deltas[i] = layer_->cells()[i].height_delta;
     snapshot->confidence[i] = layer_->cells()[i].confidence;
   }

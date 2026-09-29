@@ -28,9 +28,10 @@
         # smac_planner_2d_simple.hpp 的代码默认值一致；本项只影响全局折线形状与 MINCO 参考线，
         # 不改变任何净空判据。
         esdf_max_cost: 5.0
-        # 静态地形 ESDF 到不可通行格的最低中心净空；绕横墙端点时避免折线贴着墙角。
-        # 低于此值的格不参与搜索；窄通道或贴墙目标可能因此无解，可在线调回 0。
-        minimum_clearance: 0.25
+        # 搜索地图 ESDF 到不可通行格的最低中心净空，直接搜索和在线子目标回退共用。
+        # 0.27 比当前轨迹有效硬阈值 0.26 m 高 1 cm，减少全局折线通过后轨迹被拒。
+        # 低于此值的格不参与搜索；此余量不保证平滑后的轨迹安全，仍须逐点校验。
+        minimum_clearance: 0.27
       odom_topic: /Odometry
       tolerance: 0.3
       exploration:
@@ -128,6 +129,20 @@
         enable: false
         print_enable: false
         odom_sub_debug_enable: false
+      # B1: session-wide odom map accumulated from observed ROGMap types.
+      # Local navigation still uses the live rolling map. Restart to change these settings.
+      online_global_map:
+        enabled: true
+        resolution: 0.1
+        update_rate_hz: 2.0
+        max_cells: 2000000
+        occupied_increment: 3
+        free_decrement: 1
+        evidence_limit: 5
+        # New persistent obstacles need consecutive source observations;
+        # pending cells are unknown/blocked. Live local safety stays immediate.
+        occupied_confirmations: 2
+        confirmation_max_gap_s: 1.5
       rog_map:
         frame_id: odom
         resolution: 0.05
@@ -189,6 +204,12 @@
           unknown_as_occupied: false
           min_observed_voxels: 1
           surface_height_delta_max: 0.08
+          # Correct only ambiguous low spans supported on all sides by a
+          # consistent neighboring ground plane; raised objects remain blocked.
+          ground_filter:
+            enable: true
+            max_span: 0.15
+            plane_tolerance: 0.075
           wall_height_delta_min: 0.80
           wall_occupancy_ratio_min: 0.90
           tunnel_height_delta_min: 0.25

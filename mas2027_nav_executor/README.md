@@ -115,4 +115,7 @@ RViz/Foxglove ── /goal_pose ────────────────
 该模式不创建静态 `TerrainGrid`，目标接收、局部搜索、MINCO 和 MPC 直接使用实时 ROGMap；
 在线图新鲜度、轨迹与指令净空检查继续生效。远目标通过已观测自由区中的子目标分段推进，
 约每秒刷新路径；原始任务目标始终保留。在线坡道/隧道标签可切换 mode，没有有效标签时采用普通 mode。
+默认启用 B1 累计地图：`planner.online_global_map.*` 控制分辨率、更新频率、证据和容量，
+`/nav_executor/online_global_map` 发布本次启动内的历史栅格，`PathPlanner::globalMapQuery()` 提供固定版本查询。
+当前任务仍采用局部窗口搜索；累计地图的任务路线接入属于后续 B2。
 将 YAML 中的 `node.map_source` 改为 `prior` 可切回先验模式，该模式要求完整静态地图并使用融合查询。详见 [无先验地图导航](../docs/online_navigation.md)。

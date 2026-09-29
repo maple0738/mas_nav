@@ -86,7 +86,8 @@ void logCellDiagnostics(const rclcpp::Logger & logger,
   const std::string & label,
   unsigned int mx,
   unsigned int my,
-  bool allow_unknown)
+  bool allow_unknown,
+  double minimum_clearance = 0.0)
 {
   if (!query || !query->isValid(mx, my)) {
     RCLCPP_WARN(logger,
@@ -104,12 +105,17 @@ void logCellDiagnostics(const rclcpp::Logger & logger,
   double wy = 0.0;
   query->mapToWorld(mx, my, wx, wy);
   const unsigned char cost = query->value(mx, my);
+  const auto field = query->query({wx, wy, 0.0});
+  const bool field_ok = field.ok && std::isfinite(field.distance);
+  const bool cost_traversable = smacTraversableCost(cost, allow_unknown);
+  const bool clearance_ok = minimum_clearance <= 0.0 ||
+    (field_ok && static_cast<float>(field.distance) >= static_cast<float>(minimum_clearance));
 
   int valid = 0;
   int unknown = 0;
   int free = 0;
   int blocked = 0;
-  int smac_traversable = 0;
+  int cost_traversable_count = 0;
   int invalid = 0;
   constexpr int kRadius = 2;
   for (int dy = -kRadius; dy <= kRadius; ++dy) {
@@ -133,15 +139,17 @@ void logCellDiagnostics(const rclcpp::Logger & logger,
         ++free;
       }
       if (smacTraversableCost(nb_cost, allow_unknown)) {
-        ++smac_traversable;
+        ++cost_traversable_count;
       }
     }
   }
 
   RCLCPP_WARN(logger,
     "[MincoPlanner] %s %s diag: cell=(%u,%u) world=(%.3f,%.3f) cost=%u(%s) query_free=%s "
-    "smac_traversable=%s allow_unknown=%s 5x5(valid=%d invalid=%d free=%d unknown=%d blocked=%d "
-    "smac_traversable=%d)",
+    "cost_traversable=%s smac_traversable=%s clearance=%.3f minimum_clearance=%.3f "
+    "field_status=%s snapshot=%llu projection=%llu mask=%llu field=%llu "
+    "allow_unknown=%s 5x5(valid=%d invalid=%d free=%d unknown=%d blocked=%d "
+    "cost_traversable=%d)",
     source.c_str(),
     label.c_str(),
     mx,
@@ -151,14 +159,22 @@ void logCellDiagnostics(const rclcpp::Logger & logger,
     static_cast<unsigned int>(cost),
     cellCostLabel(cost),
     query->isFree(mx, my) ? "true" : "false",
-    smacTraversableCost(cost, allow_unknown) ? "true" : "false",
+    cost_traversable ? "true" : "false",
+    cost_traversable && clearance_ok ? "true" : "false",
+    field.distance,
+    minimum_clearance,
+    rog_map::queryStatusName(field.status),
+    static_cast<unsigned long long>(field.snapshot_sequence),
+    static_cast<unsigned long long>(field.projection_sequence),
+    static_cast<unsigned long long>(field.mask_sequence),
+    static_cast<unsigned long long>(field.field_sequence),
     allow_unknown ? "true" : "false",
     valid,
     invalid,
     free,
     unknown,
     blocked,
-    smac_traversable);
+    cost_traversable_count);
 }
 
 }  // namespace
@@ -347,8 +363,8 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
       return true;
     }
     RCLCPP_WARN(logger_,
-      "[MincoPlanner] Exploration goal is inside ROGMap and traversable but unreachable; "
-      "fallback to a reachable observed subgoal.");
+      "[MincoPlanner] Exploration goal passes the grid-cost check but direct search failed; "
+      "see cost/ESDF diagnostics above; fallback to a reachable observed subgoal.");
   }
 
   const unsigned int nx = query->sizeX();
@@ -370,16 +386,27 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
   };
 
   const bool allow_unknown = !mode_context.explorationUnknownAsOccupied();
-  const auto traversable = [&costs, allow_unknown](size_t idx) {
-    const unsigned char cost = costs[idx];
-    if (cost == kUnknownCost) {
-      return allow_unknown;
+  // The fallback route must obey the same clearance gate as the direct SMAC search,
+  // rather than checking only its endpoint and leaving MINCO to reject a tight route.
+  const double route_clearance = use_smac_ && smac_ ? smac_->minimumClearance() : 0.0;
+  std::vector<int8_t> traversability(map_size, -1);
+  const auto traversable = [&](size_t idx) {
+    if (traversability[idx] >= 0) return traversability[idx] != 0;
+    bool allowed = smacTraversableCost(costs[idx], allow_unknown);
+    if (allowed && route_clearance > 0.0) {
+      double wx = 0.0, wy = 0.0;
+      query->mapToWorld(static_cast<unsigned int>(idx % nx),
+        static_cast<unsigned int>(idx / nx), wx, wy);
+      const auto field = query->query({wx, wy, 0.0});
+      allowed = field.ok && std::isfinite(field.distance) &&
+        static_cast<float>(field.distance) >= static_cast<float>(route_clearance);
     }
-    return cost < kInscribedCost;
+    traversability[idx] = allowed ? 1 : 0;
+    return allowed;
   };
 
   const size_t start_idx = index_of(sx, sy);
-  if (!traversable(start_idx)) {
+  if (!smacTraversableCost(costs[start_idx], allow_unknown)) {
     projectStartToFreeCell(query, sx, sy);
   }
 
@@ -398,7 +425,7 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
   std::priority_queue<QueueNode, std::vector<QueueNode>, std::greater<QueueNode>> open;
 
   const size_t updated_start_idx = index_of(sx, sy);
-  if (!traversable(updated_start_idx)) {
+  if (!smacTraversableCost(costs[updated_start_idx], allow_unknown)) {
     RCLCPP_ERROR(logger_, "[MincoPlanner] EXPLORATION start cell is not traversable in ROGMap.");
     return false;
   }
@@ -480,7 +507,8 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
   }
 
   if (best_idx >= map_size) {
-    RCLCPP_ERROR(logger_, "[MincoPlanner] Online search has no reachable observed subgoal with goal progress and clearance.");
+    RCLCPP_ERROR(logger_, "[MincoPlanner] Online search has no reachable observed subgoal with goal progress and clearance "
+      "(route_clearance=%.3f subgoal_clearance=%.3f).", route_clearance, online_subgoal_clearance_);
     return false;
   }
 
@@ -659,10 +687,13 @@ bool GlobalPathSearcher::makePlanOnQuery(const geometry_msgs::msg::Pose & start,
         smac_path.size());
       if (raw_mx_start != mx_start || raw_my_start != my_start) {
         logCellDiagnostics(
-          logger_, query, failure_source, "start(raw-before-projection)", raw_mx_start, raw_my_start, allow_unknown_);
+          logger_, query, failure_source, "start(raw-before-projection)", raw_mx_start,
+          raw_my_start, allow_unknown_, smac_->minimumClearance());
       }
-      logCellDiagnostics(logger_, query, failure_source, "start(used)", mx_start, my_start, allow_unknown_);
-      logCellDiagnostics(logger_, query, failure_source, "goal", mx_goal, my_goal, allow_unknown_);
+      logCellDiagnostics(logger_, query, failure_source, "start(used)", mx_start, my_start,
+        allow_unknown_, smac_->minimumClearance());
+      logCellDiagnostics(logger_, query, failure_source, "goal", mx_goal, my_goal,
+        allow_unknown_, smac_->minimumClearance());
       return false;
     }
 
@@ -728,10 +759,13 @@ bool GlobalPathSearcher::makePlanOnQuery(const geometry_msgs::msg::Pose & start,
       RCLCPP_ERROR(logger_, "%s Astar failed to find path. See endpoint diagnostics below.", failure_source.c_str());
       if (raw_mx_start != mx_start || raw_my_start != my_start) {
         logCellDiagnostics(
-          logger_, query, failure_source, "start(raw-before-projection)", raw_mx_start, raw_my_start, allow_unknown_);
+          logger_, query, failure_source, "start(raw-before-projection)", raw_mx_start,
+          raw_my_start, allow_unknown_);
       }
-      logCellDiagnostics(logger_, query, failure_source, "start(used)", mx_start, my_start, allow_unknown_);
-      logCellDiagnostics(logger_, query, failure_source, "goal", mx_goal, my_goal, allow_unknown_);
+      logCellDiagnostics(logger_, query, failure_source, "start(used)", mx_start, my_start,
+        allow_unknown_);
+      logCellDiagnostics(logger_, query, failure_source, "goal", mx_goal, my_goal,
+        allow_unknown_);
       return false;
     }
 

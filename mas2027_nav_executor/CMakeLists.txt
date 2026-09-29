@@ -61,6 +61,7 @@ add_library(${PROJECT_NAME}_planner STATIC
   src/path_planner/trajectory/minco_optimizer.cpp
   src/path_planner/trajectory/minco_planner.cpp
   src/path_planner/trajectory/trajectory_safety_checker.cpp
+  src/common/environment/online_global_map.cpp
   src/common/environment/fused_map_query.cpp
   src/common/environment/terrain_grid.cpp
   src/common/environment/terrain_map_query.cpp
@@ -111,6 +112,11 @@ install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_online_global_map test/test_online_global_map.cpp)
+  target_include_directories(test_online_global_map PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  ament_target_dependencies(test_online_global_map rclcpp rog_map nav_msgs)
+  target_link_libraries(test_online_global_map ${PROJECT_NAME}_planner Eigen3::Eigen)
   ament_add_gtest(test_online_navigation test/test_online_navigation.cpp
     src/path_executor/monitoring/command_safety.cpp)
   target_include_directories(test_online_navigation PRIVATE

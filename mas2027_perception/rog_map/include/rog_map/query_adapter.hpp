@@ -23,6 +23,9 @@ struct MapSnapshot
   double origin_y{0.0};
   std::vector<uint8_t> values;
   std::vector<uint8_t> types;
+  // Before hysteresis / morphology: persistent maps must distinguish sensor
+  // classifications from safety-only filled/held obstacles.
+  std::vector<uint8_t> raw_types;
   std::vector<double> distances;
   std::vector<float> height_deltas;
   std::vector<float> confidence;
