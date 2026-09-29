@@ -96,9 +96,9 @@ double projectProgress(const RegionPlan & plan, const Eigen::Vector2d & position
 
 }  // namespace
 
-std::optional<RegionPlan> annotateRegions(
+static std::optional<RegionPlan> annotateRegionsImpl(
   const interfaces::msg::MpcPositionCommand & trajectory,
-  const TerrainGrid::Snapshot & terrain,
+  const TerrainGrid::Snapshot * terrain,
   const tf2_ros::Buffer & tf_buffer,
   const std::array<RegionRule, 3> & rules,
   const std::string & odom_frame,
@@ -110,7 +110,7 @@ std::optional<RegionPlan> annotateRegions(
   Rigid2D to_map, to_odom;
   std::optional<Rigid2D> to_online;
   try {
-    to_map = lookupRigid(tf_buffer, terrain.cost.header.frame_id, source);
+    if (terrain) to_map = lookupRigid(tf_buffer, terrain->cost.header.frame_id, source);
     to_odom = lookupRigid(tf_buffer, odom_frame, source);
   } catch (const tf2::TransformException &) {
     return std::nullopt;
@@ -142,8 +142,9 @@ std::optional<RegionPlan> annotateRegions(
     plan.arc_lengths.push_back(arc);
   }
 
-  const double spacing = 0.5 * std::min<double>(terrain.cost.info.resolution,
-    to_online ? online_labels->info.resolution : terrain.cost.info.resolution);
+  const double static_resolution = terrain ? terrain->cost.info.resolution : 0.05;
+  const double spacing = 0.5 * std::min<double>(static_resolution,
+    to_online ? online_labels->info.resolution : static_resolution);
   if (!std::isfinite(spacing) || spacing <= 0.0) return std::nullopt;
   std::optional<RegionSegment> active;
   const auto finish = [&](double s) {
@@ -164,7 +165,8 @@ std::optional<RegionPlan> annotateRegions(
       const double u = static_cast<double>(j) / samples;
       const double s = plan.arc_lengths[i - 1] + u * length;
       const Eigen::Vector2d sample = a + u * (b - a);
-      const auto static_label = terrain.terrainLabelAt(to_map.apply(sample));
+      const auto static_label = terrain ? terrain->terrainLabelAt(to_map.apply(sample)) :
+        std::optional<uint8_t>(0U);
       if (!static_label) return std::nullopt;
       const auto observed_label = to_online ?
         onlineLabelAt(*online_labels, to_online->apply(sample)) : std::nullopt;
@@ -202,6 +204,27 @@ std::optional<RegionPlan> annotateRegions(
   }
   plan.segments = std::move(merged);
   return plan;
+}
+
+std::optional<RegionPlan> annotateRegions(
+  const interfaces::msg::MpcPositionCommand & trajectory,
+  const TerrainGrid::Snapshot & terrain,
+  const tf2_ros::Buffer & tf_buffer,
+  const std::array<RegionRule, 3> & rules,
+  const std::string & odom_frame,
+  const nav_msgs::msg::OccupancyGrid * online_labels)
+{
+  return annotateRegionsImpl(trajectory, &terrain, tf_buffer, rules, odom_frame, online_labels);
+}
+
+std::optional<RegionPlan> annotateOnlineRegions(
+  const interfaces::msg::MpcPositionCommand & trajectory,
+  const tf2_ros::Buffer & tf_buffer,
+  const std::array<RegionRule, 3> & rules,
+  const std::string & odom_frame,
+  const nav_msgs::msg::OccupancyGrid * online_labels)
+{
+  return annotateRegionsImpl(trajectory, nullptr, tf_buffer, rules, odom_frame, online_labels);
 }
 
 RegionController::RegionController(uint8_t normal_mode, double normal_speed,

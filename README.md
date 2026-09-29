@@ -151,8 +151,12 @@ source /home/mas/mas_nav_2027_native/install/setup.bash
 ros2 launch mas2027_nav_bringup nav_executor_launch.py
 ```
 
-常用参数：`use_rviz`、`use_odom_localizer`、`use_ros2_comm`、`output_topic`。地图不再通过
-launch 参数切换，统一在 `mas2027_nav_bringup/config/navigation_map.yaml` 中选择。
+常用启动参数：`use_rviz`、`use_odom_localizer`、`use_ros2_comm`、`output_topic`。
+启动模式仅由 `mas2027_nav_executor/config/node_params.yaml` 中的 `node.map_source` 选择，修改后重启生效。
+设为 `prior` 时，先验地图文件统一在 `mas2027_nav_bringup/config/navigation_map.yaml` 中选择。
+设为 `online` 时使用无先验模式：不读取地图文件、不启动 GICP 定位器和静态地图服务，
+使用 `odom` 下的 LIO 与在线 ROGMap 分段推进；速度与加速度采用规划器、MPC 和区域控制 YAML，未知区域作为障碍。
+具体启动、目标坐标和能力范围见 [无先验地图导航](docs/online_navigation.md)。
 `use_ros2_comm` 默认 `True`——它消费 `/nav_executor/chassis_cmd`，不开会「指令一直有值但车不动」；
 只想看导航时置 `False` 并确认底盘与急停状态。RViz 的 2D Goal Pose 发到 `/goal_pose`。
 
@@ -168,7 +172,7 @@ launch 参数切换，统一在 `mas2027_nav_bringup/config/navigation_map.yaml`
   YAML、terrain msgpack）。
 - `mas2027_perception/Localization/odom_localizer/config/params.yaml`：先验 PCD 定位。
 - `mas2027_nav_bringup/map/`、`pcd/`：`navigation_map.yaml` 所选的地图产物目录；当前选择
-  `lab_map_20260921_211523` 这一组。
+  `lab_map_20260921_211523` 这一组（先验模式）。
 
 源码：搜索与轨迹在 `src/path_planner/`，MPC 与安全监测在 `src/path_executor/`，
 第三方数值后端与 qpOASES 在 `vendor/`（均在 `mas2027_nav_executor` 内）。

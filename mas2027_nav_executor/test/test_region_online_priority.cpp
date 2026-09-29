@@ -144,4 +144,25 @@ TEST(RegionOnlinePriority, FasterSlopeProfileStaysWithinOrdinaryModeLimits)
   EXPECT_DOUBLE_EQ(controller.accelerationLimit(), 4.0);
 }
 
+TEST(RegionOnlinePriority, OnlineOnlyWorksWithoutStaticMapOrMapTF)
+{
+  tf2_ros::Buffer buffer(std::make_shared<rclcpp::Clock>(RCL_SYSTEM_TIME));
+  auto traj = trajectory();
+  traj.header.frame_id = "odom";
+  const auto ordinary = mas2027_nav_executor::annotateOnlineRegions(traj, buffer, rules(), "odom");
+  ASSERT_TRUE(ordinary);
+  EXPECT_TRUE(ordinary->segments.empty());
+  EXPECT_EQ(ordinary->trajectory_id, 42U);
+  auto online = onlineTerrain(5);
+  online.header.frame_id = "odom";
+  const auto slope = mas2027_nav_executor::annotateOnlineRegions(traj, buffer, rules(), "odom", &online);
+  ASSERT_TRUE(slope);
+  ASSERT_EQ(slope->segments.size(), 1U);
+  EXPECT_EQ(slope->segments.front().label, 5U);
+  online.data.assign(400, -1);
+  const auto unknown = mas2027_nav_executor::annotateOnlineRegions(traj, buffer, rules(), "odom", &online);
+  ASSERT_TRUE(unknown);
+  EXPECT_TRUE(unknown->segments.empty());
+}
+
 }  // namespace

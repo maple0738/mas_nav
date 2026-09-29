@@ -71,6 +71,7 @@ public:
     const geometry_msgs::msg::PoseStamped & current_pose,
     const geometry_msgs::msg::PoseStamped & goal) const;
   bool hasGlobalPath() const;
+  bool usesOnlineMapOnly() const { return !terrain_; }
   void invalidateGlobalPath();
   // 全局搜索折线快照供 RViz 显示：一次取出，避免调用方两次加锁看到不同快照；无路径返回 false。
   bool copyLatestGlobalPath(std::vector<geometry_msgs::msg::PoseStamped> & out) const;

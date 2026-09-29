@@ -106,3 +106,13 @@ RViz/Foxglove ── /goal_pose ────────────────
 | [`config/region_control.yaml`](config/region_control.yaml) | 三类区域的 mode、速度/加速度及路径阶段距离。 |
 
 整套导航的启动文件不在本包，而在 `mas2027_nav_bringup/launch/nav_executor_launch.py`。它加载本包 `config/*.yaml`，并启动地图、定位相关组件；默认也启动 `ros2_comm`。仅需观察导航而不向硬件桥发送时，使用 `use_ros2_comm:=False`。模式传输固定为新版独立字段，具体协议见区域控制说明。
+
+
+### 无先验地图模式
+
+在 `config/node_params.yaml` 中将 `node.map_source` 设为 `online`，然后使用
+`ros2 launch mas2027_nav_bringup nav_executor_launch.py`。整套启动模式仅由该 YAML 选择，切换需要重启。
+该模式不创建静态 `TerrainGrid`，目标接收、局部搜索、MINCO 和 MPC 直接使用实时 ROGMap；
+在线图新鲜度、轨迹与指令净空检查继续生效。远目标通过已观测自由区中的子目标分段推进，
+约每秒刷新路径；原始任务目标始终保留。在线坡道/隧道标签可切换 mode，没有有效标签时采用普通 mode。
+将 YAML 中的 `node.map_source` 改为 `prior` 可切回先验模式，该模式要求完整静态地图并使用融合查询。详见 [无先验地图导航](../docs/online_navigation.md)。

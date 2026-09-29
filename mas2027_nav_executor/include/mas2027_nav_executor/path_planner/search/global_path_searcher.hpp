@@ -20,6 +20,8 @@ public:
     double tolerance,
     rclcpp::Logger logger);
 
+  void setOnlineSubgoalClearance(double clearance) { online_subgoal_clearance_ = clearance; }
+
   void setQuery(const std::shared_ptr<rog_map::MapQueryInterface> & global_query);
   void setTerrainGrid(std::shared_ptr<mas2027_nav_executor::TerrainGrid> terrain)
   { terrain_ = std::move(terrain); }
@@ -68,6 +70,7 @@ private:
   std::shared_ptr<mas2027_nav_executor::TerrainGrid> terrain_;
   bool allow_unknown_{true};
   double tolerance_{0.5};
+  double online_subgoal_clearance_{0.33};
   rclcpp::Logger logger_{rclcpp::get_logger("GlobalPathSearcher")};
 };
 

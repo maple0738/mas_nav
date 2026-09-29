@@ -600,6 +600,7 @@ void MincoPlanner::configure(const rclcpp_lifecycle::LifecycleNode::WeakPtr & pa
     tf_, astar_planner_.get(), smac_planner_.get(), use_smac_,
     !exploration_unknown_as_occupied_, tolerance_, logger_);
   global_path_searcher_->setQuery(global_query);
+  global_path_searcher_->setOnlineSubgoalClearance(collision_dist_ + 0.05);
 
   local_path_processor_ = std::make_unique<LocalPathProcessor>();
   local_path_processor_->configure(

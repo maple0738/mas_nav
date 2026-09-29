@@ -58,6 +58,7 @@ void TaskManager::tick()
       std::hypot(incoming->pose.position.x - goal_->pose.position.x,
         incoming->pose.position.y - goal_->pose.position.y) <= 0.15;
     goal_ = std::move(incoming);
+    last_global_replan_s_ = -1.0;
     if (const auto recovery = planner_->recoveryServer()) {
       recovery->setMissionGoal(*goal_);
     }
@@ -127,6 +128,23 @@ void TaskManager::tick()
       RCLCPP_WARN(logger_, "Committed path became unsafe; braking and replanning");
       return;
     }
+    // A rolling map path ends at a temporary subgoal. Rebuild toward the
+    // original mission goal as the window advances; only the mission goal
+    // above can complete the task.
+    if (planner_->usesOnlineMapOnly() &&
+      (last_global_replan_s_ < 0.0 || now_s - last_global_replan_s_ >= 1.0 ||
+       planner_->checkGoalReached(pose))) {
+      last_global_replan_s_ = now_s;
+      if (!planner_->PlanGlobalPath(pose, *goal_)) {
+        allows_motion_.store(false);
+        planner_->publishEmergencyStop(pose);
+        planner_->invalidateGlobalPath();
+        state_ = State::PLANNING;
+        last_plan_attempt_s_ = now_s;
+        return;
+      }
+      last_local_replan_s_ = -1.0;
+    }
     const bool expired = planner_->isTrajectoryTimeExpired(now_s);
     const bool due = last_local_replan_s_ < 0.0 ||
       now_s - last_local_replan_s_ >= planner_->getForceReplanPeriod();
@@ -150,11 +168,13 @@ void TaskManager::tick()
   if (state_ != State::PLANNING) return;
   if (last_plan_attempt_s_ >= 0.0 && now_s - last_plan_attempt_s_ < 0.5) return;
   last_plan_attempt_s_ = now_s;
-  if (!planner_->hasGlobalPath() && !planner_->PlanGlobalPath(pose, *goal_)) {
+  if ((planner_->usesOnlineMapOnly() || !planner_->hasGlobalPath()) &&
+    !planner_->PlanGlobalPath(pose, *goal_)) {
     RCLCPP_WARN(logger_, "Global path search failed; retrying");
     handleFailure(pose, now_s);
     return;
   }
+  last_global_replan_s_ = now_s;
   const auto plan_started_ns = rclcpp::Clock().now().nanoseconds();
   if (!planner_->ReplanLocal(pose)) {
     RCLCPP_WARN(logger_, "MINCO path generation failed; retrying");

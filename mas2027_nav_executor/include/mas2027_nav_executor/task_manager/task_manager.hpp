@@ -46,6 +46,7 @@ private:
   Eigen::Vector2d escape_velocity_{Eigen::Vector2d::Zero()};
   State state_{State::IDLE};
   double last_plan_attempt_s_{-1.0};
+  double last_global_replan_s_{-1.0};
   double last_local_replan_s_{-1.0};
 };
 

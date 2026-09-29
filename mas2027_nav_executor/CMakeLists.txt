@@ -111,6 +111,12 @@ install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_online_navigation test/test_online_navigation.cpp
+    src/path_executor/monitoring/command_safety.cpp)
+  target_include_directories(test_online_navigation PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  ament_target_dependencies(test_online_navigation rclcpp rog_map tf2_ros tf2_geometry_msgs)
+  target_link_libraries(test_online_navigation ${PROJECT_NAME}_planner Eigen3::Eigen)
   ament_add_gtest(test_smac_wall_clearance test/test_smac_wall_clearance.cpp)
   target_include_directories(test_smac_wall_clearance PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)

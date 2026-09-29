@@ -33,7 +33,7 @@ ExecutorStatus checkCommandSafety(
     return status;
   };
   const auto terrain = grid ? grid->snapshot() : nullptr;
-  if (!terrain || !tf || !rog_query) {
+  if ((grid && (!terrain || !tf)) || !rog_query) {
     return reject(ExecutorStatus::TERRAIN_BLOCKED, "grid_or_frame_missing");
   }
   const double rog_stamp_s = rog_query->snapshotStampSeconds();
@@ -42,45 +42,52 @@ ExecutorStatus checkCommandSafety(
   if (!std::isfinite(rog_age_s) || rog_age_s > rog_map_timeout_s) {
     return reject(ExecutorStatus::DYNAMIC_BLOCKED, "rog_map_stale", rog_age_s, rog_map_timeout_s);
   }
-  try {
-    const auto transform = tf->lookupTransform(
-      terrain->cost.header.frame_id, odom_frame, tf2::TimePointZero);
-    const double map_yaw = tf2::getYaw(transform.transform.rotation);
-    const double mc = std::cos(map_yaw), ms = std::sin(map_yaw);
-    const Eigen::Vector2d position(
-      mc * current.x - ms * current.y + transform.transform.translation.x,
-      ms * current.x + mc * current.y + transform.transform.translation.y);
-    const Eigen::Vector2d velocity(
-      mc * control.vx - ms * control.vy,
-      ms * control.vx + mc * control.vy);
-    const double horizon = std::max(dt, 0.35);
-    if (!terrain->transition(position, position + horizon * velocity)) {
-      return reject(ExecutorStatus::TERRAIN_BLOCKED, "terrain_transition");
-    }
-    // 净空判据与规划侧发布/监视门一致：近场半径取车体安全半径 rog_map_clearance。
-    // 场内不比实测净空更差即可，出近场必须满足该阈值；否则贴墙停下会让指令在 t=0 被否决。
-    // 有效阈值须减掉 ESDF 抖动余量 kEsdfJitterTolerance，与发布门/监视门同值，避免指令卡在两门间。
-    const double effective_clearance = effectiveClearanceThreshold(rog_map_clearance);
-    const auto current_clearance =
-      rog_query->query(Eigen::Vector3d(current.x, current.y, 0.0));
-    const ClearanceRequirement clearance_gate = makeClearanceRequirement(
-      effective_clearance, rog_map_clearance, current_clearance.distance, current_clearance.ok);
-    const double travel_speed = velocity.norm();
-    const int command_steps = std::max(1, static_cast<int>(std::ceil(horizon / dt)));
-    for (int i = 0; i <= command_steps; ++i) {
-      const double t = horizon * i / command_steps;
-      const Eigen::Vector3d odom_point(current.x + t * control.vx,
-        current.y + t * control.vy, 0.0);
-      const auto clearance = rog_query->query(odom_point);
-      if (!clearance.ok || clearance.distance <= clearance_gate.requiredAt(t * travel_speed)) {
-        return reject(ExecutorStatus::DYNAMIC_BLOCKED,
-          clearance.ok ? "clearance" : "clearance_out_of_map",
-          clearance.distance,
-          clearance_gate.requiredAt(t * travel_speed));
+  if (!std::isfinite(dt) || dt <= 0.0 ||
+    !std::isfinite(current.x) || !std::isfinite(current.y) ||
+    !std::isfinite(control.vx) || !std::isfinite(control.vy)) {
+    return reject(ExecutorStatus::DYNAMIC_BLOCKED, "invalid_command");
+  }
+  const double horizon = std::max(dt, 0.35);
+  if (terrain) {
+    try {
+      const auto transform = tf->lookupTransform(
+        terrain->cost.header.frame_id, odom_frame, tf2::TimePointZero);
+      const double map_yaw = tf2::getYaw(transform.transform.rotation);
+      const double mc = std::cos(map_yaw), ms = std::sin(map_yaw);
+      const Eigen::Vector2d position(
+        mc * current.x - ms * current.y + transform.transform.translation.x,
+        ms * current.x + mc * current.y + transform.transform.translation.y);
+      const Eigen::Vector2d velocity(
+        mc * control.vx - ms * control.vy,
+        ms * control.vx + mc * control.vy);
+      if (!terrain->transition(position, position + horizon * velocity)) {
+        return reject(ExecutorStatus::TERRAIN_BLOCKED, "terrain_transition");
       }
+    } catch (const tf2::TransformException &) {
+      return reject(ExecutorStatus::TERRAIN_BLOCKED, "tf_unavailable");
     }
-  } catch (const tf2::TransformException &) {
-    return reject(ExecutorStatus::TERRAIN_BLOCKED, "tf_unavailable");
+  }
+  // 净空判据与规划侧发布/监视门一致：近场半径取车体安全半径 rog_map_clearance。
+  // 场内不比实测净空更差即可，出近场必须满足该阈值；否则贴墙停下会让指令在 t=0 被否决。
+  // 有效阈值须减掉 ESDF 抖动余量 kEsdfJitterTolerance，与发布门/监视门同值，避免指令卡在两门间。
+  const double effective_clearance = effectiveClearanceThreshold(rog_map_clearance);
+  const auto current_clearance =
+    rog_query->query(Eigen::Vector3d(current.x, current.y, 0.0));
+  const ClearanceRequirement clearance_gate = makeClearanceRequirement(
+    effective_clearance, rog_map_clearance, current_clearance.distance, current_clearance.ok);
+  const double travel_speed = std::hypot(control.vx, control.vy);
+  const int command_steps = std::max(1, static_cast<int>(std::ceil(horizon / dt)));
+  for (int i = 0; i <= command_steps; ++i) {
+    const double t = horizon * i / command_steps;
+    const Eigen::Vector3d odom_point(current.x + t * control.vx,
+      current.y + t * control.vy, 0.0);
+    const auto clearance = rog_query->query(odom_point);
+    if (!clearance.ok || clearance.distance <= clearance_gate.requiredAt(t * travel_speed)) {
+      return reject(ExecutorStatus::DYNAMIC_BLOCKED,
+        clearance.ok ? "clearance" : "clearance_out_of_map",
+        clearance.distance,
+        clearance_gate.requiredAt(t * travel_speed));
+    }
   }
   return reject(ExecutorStatus::PUBLISHED, "none");
 }

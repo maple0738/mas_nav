@@ -23,8 +23,12 @@ PathPlanner::PathPlanner(std::shared_ptr<TerrainGrid> terrain, double odom_timeo
 
   rog_map::Config config;
   config.loadFromRosNode(node_, "planner.rog_map");
+  if (!terrain_ && (!config.unknown_as_occupied || config.prior_map_enable)) {
+    throw std::invalid_argument(
+      "online navigation requires projection.unknown_as_occupied=true and prior_map.enable=false");
+  }
   rog_map_ = std::make_shared<rog_map::ROGMapROS>(node_, config, tf_buffer_);
-  // ROGMap supplies local online distance/gradient; terrain remains the global semantic map.
+  // ROGMap supplies live geometry; a non-null terrain adds prior global constraints.
   planner_ = std::make_shared<minco_planner::MincoPlanner>();
   planner_->setMap(rog_map_->queryInterface());
   planner_->configure(node_, "planner", tf_buffer_);
@@ -33,6 +37,11 @@ PathPlanner::PathPlanner(std::shared_ptr<TerrainGrid> terrain, double odom_timeo
   if (config.frame_id != odom_frame || planning_frame != odom_frame) {
     throw std::invalid_argument(
       "ROGMap frame, planner.frames.rog_frame and node.frames.odom must match");
+  }
+  bool unknown_blocked = false;
+  node_->get_parameter("planner.exploration.unknown_as_occupied", unknown_blocked);
+  if (!terrain_ && !unknown_blocked) {
+    throw std::invalid_argument("online navigation requires exploration.unknown_as_occupied=true");
   }
   planner_->setTerrainGrid(terrain_);
   task_manager_ = std::make_unique<TaskManager>(planner_, node_->get_logger(), odom_timeout_s_);
@@ -64,8 +73,8 @@ bool PathPlanner::copyLatestGlobalPath(std::vector<geometry_msgs::msg::PoseStamp
 
 bool PathPlanner::acceptGoal(const geometry_msgs::msg::PoseStamped & goal)
 {
-  const auto terrain = terrain_->snapshot();
-  if (!terrain) {
+  const auto terrain = terrain_ ? terrain_->snapshot() : nullptr;
+  if (terrain_ && !terrain) {
     RCLCPP_WARN(node_->get_logger(),
       "Ignoring goal until static terrain cost and label maps are ready");
     return false;
@@ -117,18 +126,20 @@ bool PathPlanner::acceptGoal(const geometry_msgs::msg::PoseStamped & goal)
   // transform() 是否改写输出时间戳取决于实现，显式再归零，让第二次（转地形图坐标系）同样取最新 TF。
   goal_in_planning.header.stamp = goal_query.header.stamp;
 
-  geometry_msgs::msg::PoseStamped goal_in_map;
-  try {
-    goal_in_map = tf_buffer_->transform(goal_in_planning, terrain->cost.header.frame_id,
-      tf2::durationFromSec(0.2));
-  } catch (const tf2::TransformException & ex) {
-    RCLCPP_WARN(node_->get_logger(), "Ignoring goal: terrain TF unavailable (%s)", ex.what());
-    return false;
-  }
-  const Eigen::Vector2d target(goal_in_map.pose.position.x, goal_in_map.pose.position.y);
-  if (!terrain->traversable(target)) {
-    RCLCPP_WARN(node_->get_logger(), "Ignoring goal: occupied in static terrain");
-    return false;
+  if (terrain) {
+    geometry_msgs::msg::PoseStamped goal_in_map;
+    try {
+      goal_in_map = tf_buffer_->transform(goal_in_planning, terrain->cost.header.frame_id,
+        tf2::durationFromSec(0.2));
+    } catch (const tf2::TransformException & ex) {
+      RCLCPP_WARN(node_->get_logger(), "Ignoring goal: terrain TF unavailable (%s)", ex.what());
+      return false;
+    }
+    const Eigen::Vector2d target(goal_in_map.pose.position.x, goal_in_map.pose.position.y);
+    if (!terrain->traversable(target)) {
+      RCLCPP_WARN(node_->get_logger(), "Ignoring goal: occupied in static terrain");
+      return false;
+    }
   }
   geometry_msgs::msg::PoseStamped start;
   if (!planner_->getRobotPose(start)) {

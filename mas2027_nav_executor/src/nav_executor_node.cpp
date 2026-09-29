@@ -24,6 +24,7 @@
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "sensor_msgs/msg/image.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "rcl_interfaces/msg/parameter_descriptor.hpp"
 #include "rclcpp/executors/multi_threaded_executor.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "tf2/utils.h"
@@ -59,6 +60,16 @@ public:
   NavExecutorNode()
   : Node("nav_executor")
   {
+    rcl_interfaces::msg::ParameterDescriptor map_source_descriptor;
+    map_source_descriptor.read_only = true;
+    map_source_descriptor.description = "Map source selected at startup: prior or online";
+    const auto map_source = declare_parameter<std::string>(
+      "node.map_source", "prior", map_source_descriptor);
+    if (map_source != "prior" && map_source != "online") {
+      throw std::invalid_argument("node.map_source must be prior or online");
+    }
+    const bool online_only = map_source == "online";
+    RCLCPP_INFO(get_logger(), "Navigation map source: %s", map_source.c_str());
     // ── 参数层：读取 ROS 话题名、坐标系和控制周期。
     control_rate_hz_ = declare_parameter<double>("node.control_rate_hz");
     planner_frequency_ = declare_parameter<double>("node.planner_frequency");
@@ -217,7 +228,7 @@ public:
     }
 
     // ── 地图与规划层：TerrainGrid 管静态语义地图；PathPlanner 管全局搜索、MINCO 和在线 ROGMap。
-    terrain_grid_ = std::make_shared<TerrainGrid>();
+    if (!online_only) terrain_grid_ = std::make_shared<TerrainGrid>();
     path_planner_ = std::make_shared<PathPlanner>(
       terrain_grid_, executor_params.odom_timeout_s, odom_frame_,
       executor_params.rog_map_timeout_s);
@@ -229,17 +240,19 @@ public:
 
     // ── 静态地图输入层：代价图与标签图构成 TerrainGrid 快照；变化后刷新规划约束可视化。
     const auto map_qos = rclcpp::QoS(1).reliable().transient_local();
-    terrain_cost_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
-      cost_map_topic, map_qos, [this](nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg) {
-        terrain_grid_->updateCost(*msg);
-        publish_planning_constraints();
-        refresh_region_plan();
-      });
-    terrain_label_sub_ = create_subscription<sensor_msgs::msg::Image>(
-      label_map_topic, map_qos, [this](sensor_msgs::msg::Image::ConstSharedPtr msg) {
-        terrain_grid_->updateLabels(*msg);
-        refresh_region_plan();
-      });
+    if (terrain_grid_) {
+      terrain_cost_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+        cost_map_topic, map_qos, [this](nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg) {
+          terrain_grid_->updateCost(*msg);
+          publish_planning_constraints();
+          refresh_region_plan();
+        });
+      terrain_label_sub_ = create_subscription<sensor_msgs::msg::Image>(
+        label_map_topic, map_qos, [this](sensor_msgs::msg::Image::ConstSharedPtr msg) {
+          terrain_grid_->updateLabels(*msg);
+          refresh_region_plan();
+        });
+    }
     online_terrain_label_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
       online_label_topic, rclcpp::SensorDataQoS(),
       [this](nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg) {
@@ -335,6 +348,7 @@ private:
   // 地图可视化层：把 TerrainGrid 约束栅格和受限/禁止点转换成 OccupancyGrid 与 Marker。
   void publish_planning_constraints()
   {
+    if (!terrain_grid_) return;
     auto constraints = terrain_grid_->planningConstraints();
     if (!constraints) return;
     constraints->header.stamp = now();
@@ -491,7 +505,7 @@ private:
     }
     if (!path_planner_->acceptGoal(*goal)) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "Ignoring goal until odometry, static terrain and ROGMap are ready (%s)", odom_topic_.c_str());
+        "Ignoring goal until required maps, TF and odometry are ready (%s)", odom_topic_.c_str());
     }
   }
 
@@ -525,7 +539,7 @@ private:
       online_labels_fresh(*online_labels, received_s, current_s);
     bool online_applied = online_current;
     std::shared_ptr<const RegionPlan> plan;
-    if (const auto terrain = terrain_grid_->snapshot()) {
+    if (const auto terrain = terrain_grid_ ? terrain_grid_->snapshot() : nullptr) {
       auto annotated = annotateRegions(*trajectory, *terrain, *tf_buffer_,
         region_rules_, odom_frame_, online_current ? online_labels.get() : nullptr);
       if (!annotated && online_current) {
@@ -538,6 +552,11 @@ private:
       if (annotated) {
         plan = std::make_shared<RegionPlan>(std::move(*annotated));
       }
+    } else if (!terrain_grid_) {
+      auto annotated = annotateOnlineRegions(*trajectory, *tf_buffer_, region_rules_,
+        odom_frame_, online_current ? online_labels.get() : nullptr);
+      // Conflicting semantic mode windows hold this trajectory until a valid plan arrives.
+      if (annotated) plan = std::make_shared<RegionPlan>(std::move(*annotated));
     }
     {
       std::lock_guard<std::mutex> lock(data_mutex_);

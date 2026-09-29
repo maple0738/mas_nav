@@ -17,7 +17,7 @@ struct CommandSafetyDetail
 {
   /// 命中的判据名（固定字符串，便于 grep/统计）：
   ///   "none"                   通过
-  ///   "grid_or_frame_missing"  地形快照、tf 或 rog_query 为空
+  ///   "grid_or_frame_missing"  所需地形快照/TF 或 rog_query 为空（terrain 为空表示 online 模式）
   ///   "rog_map_stale"          ROGMap 快照时间戳缺失或超时
   ///   "tf_unavailable"         lookupTransform 抛异常（map↔odom 一时拿不到）
   ///   "terrain_transition"     地形层 transition(pos -> pos+horizon*v) 返回 false
@@ -28,6 +28,8 @@ struct CommandSafetyDetail
   double threshold{0.0};
 };
 
+// A null terrain selects online-only checks; a non-null but unready terrain
+// still blocks motion in prior mode. Online freshness and clearance are always checked.
 ExecutorStatus checkCommandSafety(
   const std::shared_ptr<TerrainGrid> & terrain,
   const std::shared_ptr<rog_map::MapQueryInterface> & rog_query,

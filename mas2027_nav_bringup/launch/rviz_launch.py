@@ -53,7 +53,7 @@ def generate_launch_description():
         package="rviz2",
         executable="rviz2",
         namespace=namespace,
-        arguments=["-d", rviz_config_file],
+        arguments=["-d", rviz_config_file, "-f", LaunchConfiguration("fixed_frame")],
         output="screen",
         remappings=[
             ("/tf", "tf"),
@@ -72,6 +72,7 @@ def generate_launch_description():
     ld = LaunchDescription()
 
     # Declare the launch options
+    ld.add_action(DeclareLaunchArgument("fixed_frame", default_value="map"))
     ld.add_action(declare_namespace_cmd)
     ld.add_action(declare_rviz_config_file_cmd)
 

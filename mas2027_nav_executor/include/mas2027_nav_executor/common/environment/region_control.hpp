@@ -67,6 +67,14 @@ std::optional<RegionPlan> annotateRegions(
   const std::string & odom_frame,
   const nav_msgs::msg::OccupancyGrid * online_labels = nullptr);
 
+// No static terrain: use fresh online 5/6 labels, otherwise ordinary mode.
+std::optional<RegionPlan> annotateOnlineRegions(
+  const interfaces::msg::MpcPositionCommand & trajectory,
+  const tf2_ros::Buffer & tf_buffer,
+  const std::array<RegionRule, 3> & rules,
+  const std::string & odom_frame,
+  const nav_msgs::msg::OccupancyGrid * online_labels = nullptr);
+
 class RegionController final
 {
 public:

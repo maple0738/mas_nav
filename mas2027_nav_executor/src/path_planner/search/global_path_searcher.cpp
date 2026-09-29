@@ -310,7 +310,7 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
     }
   }
 
-  // 无地形图（terrain_ 为空）时退回旧行为，只在 ROGMap 局部窗口内搜索；cancel_checker 由两处共用。
+  // Online-only mode searches the rolling ROGMap and advances using observed subgoals.
   unsigned int sx = 0;
   unsigned int sy = 0;
   if (!query->worldToMap(start_rog.pose.position.x, start_rog.pose.position.y, sx, sy)) {
@@ -348,7 +348,7 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
     }
     RCLCPP_WARN(logger_,
       "[MincoPlanner] Exploration goal is inside ROGMap and traversable but unreachable; "
-      "fallback to reachable boundary search.");
+      "fallback to a reachable observed subgoal.");
   }
 
   const unsigned int nx = query->sizeX();
@@ -384,8 +384,6 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
   }
 
   const double resolution = std::max(1e-6, query->resolution());
-  const int margin_cells =
-    std::max(1, static_cast<int>(std::ceil(mode_context.explorationBoundaryMargin() / resolution)));
 
   struct QueueNode
   {
@@ -432,23 +430,25 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
 
     const unsigned int cx = static_cast<unsigned int>(current.idx % nx);
     const unsigned int cy = static_cast<unsigned int>(current.idx / nx);
-    const int min_edge_dist = std::min({static_cast<int>(cx),
-      static_cast<int>(cy),
-      static_cast<int>(nx - 1U - cx),
-      static_cast<int>(ny - 1U - cy)});
-    if (min_edge_dist <= margin_cells) {
-      double wx = 0.0;
-      double wy = 0.0;
-      query->mapToWorld(cx, cy, wx, wy);
-      double score = current.cost;
-      if (mode_context.explorationPreferGoalDirection() && goal_dir_norm.norm() > 1e-6) {
-        Eigen::Vector2d candidate_dir(wx - start_xy.x(), wy - start_xy.y());
-        if (candidate_dir.norm() > 1e-6) {
-          const double align = candidate_dir.normalized().dot(goal_dir_norm);
-          score += (1.0 - align) * std::max(1.0, mode_context.explorationBoundaryMargin());
-        }
-      }
-      if (score < best_score) {
+    // Advance through observed free space even when the sensor's free region
+    // does not reach the rolling window boundary. Unknown cells are obstacles
+    // in the online profile, including in the distance field.
+    double wx = 0.0, wy = 0.0;
+    query->mapToWorld(cx, cy, wx, wy);
+    const Eigen::Vector2d candidate(wx, wy);
+    const Eigen::Vector2d goal_xy(goal_rog.pose.position.x, goal_rog.pose.position.y);
+    const double remaining = (candidate - goal_xy).norm();
+    double score = remaining + 0.15 * current.cost;
+    if (mode_context.explorationPreferGoalDirection() && goal_dir_norm.norm() > 1e-6) {
+      const auto direction = candidate - start_xy;
+      if (direction.norm() > 1e-6) score += 0.2 * (1.0 - direction.normalized().dot(goal_dir_norm));
+    }
+    const double minimum_advance = std::max(0.5, 2.0 * tolerance_);
+    if ((candidate - start_xy).norm() >= minimum_advance &&
+      remaining < goal_dir.norm() - 0.1 && score < best_score) {
+      const auto clearance = query->query({wx, wy, 0.0});
+      if (clearance.ok && std::isfinite(clearance.distance) &&
+        clearance.distance >= online_subgoal_clearance_) {
         best_score = score;
         best_idx = current.idx;
       }
@@ -467,6 +467,8 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
         continue;
       }
       const bool diagonal = std::abs(offset[0]) + std::abs(offset[1]) == 2;
+      if (diagonal && (!traversable(index_of(nbx, cy)) ||
+        !traversable(index_of(cx, nby)))) continue;
       const double step = (diagonal ? 1.41421356237 : 1.0) * resolution;
       const double next_dist = current.cost + step;
       if (next_dist < dist[nb_idx]) {
@@ -478,7 +480,7 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
   }
 
   if (best_idx >= map_size) {
-    RCLCPP_ERROR(logger_, "[MincoPlanner] EXPLORATION cannot find a reachable ROGMap boundary candidate.");
+    RCLCPP_ERROR(logger_, "[MincoPlanner] Online search has no reachable observed subgoal with goal progress and clearance.");
     return false;
   }
 
@@ -490,7 +492,7 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
     }
     const int p = parent[idx];
     if (p < 0) {
-      RCLCPP_ERROR(logger_, "[MincoPlanner] EXPLORATION boundary path reconstruction failed.");
+      RCLCPP_ERROR(logger_, "[MincoPlanner] Online subgoal path reconstruction failed.");
       return false;
     }
     idx = static_cast<size_t>(p);
