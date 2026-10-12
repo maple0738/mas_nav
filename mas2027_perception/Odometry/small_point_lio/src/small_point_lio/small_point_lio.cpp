@@ -30,6 +30,7 @@ namespace small_point_lio {
         preprocess.reset();
         estimator.reset();
         pointcloud_odom_frame.clear();
+        last_odom_publish_time = -std::numeric_limits<double>::infinity();
         is_init = false;
     }
 
@@ -86,6 +87,48 @@ namespace small_point_lio {
         bool is_publish_odometry = !preprocess.imu_deque.empty() && !preprocess.dense_point_deque.empty() && !preprocess.point_deque.empty() &&
                                    preprocess.imu_deque.front().timestamp < preprocess.point_deque.back().timestamp;
         std::vector<std::pair<double, std::vector<Eigen::Vector3f>>> completed_clouds;
+        std::vector<common::Point> point_batch;
+        point_batch.reserve(parameters.point_update_batch_max_points);
+        const auto flush_point_batch = [this, &point_batch]() {
+            if (point_batch.empty()) {
+                return;
+            }
+            // Move every observation to the batch end using the predicted state.
+            // The EKF then linearizes the entire short window at one state.
+            const auto &s = estimator.kf.x;
+            const auto rotation_lidar_imu = parameters.extrinsic_est_en ? s.offset_R_L_I : estimator.Lidar_R_wrt_IMU;
+            const auto translation_lidar_imu = parameters.extrinsic_est_en ? s.offset_T_L_I : estimator.Lidar_T_wrt_IMU;
+            const Eigen::Vector3d world_acceleration = s.rotation * s.acceleration + s.gravity;
+            std::vector<Eigen::Vector3f> compensated;
+            compensated.reserve(point_batch.size());
+            for (const auto &point : point_batch) {
+                const double dt = point.timestamp - estimator.kf.time_state();
+                const Eigen::Vector3d point_imu = rotation_lidar_imu * point.position.cast<double>() + translation_lidar_imu;
+                const Eigen::Vector3d displacement = s.velocity * dt + 0.5 * world_acceleration * dt * dt;
+                const Eigen::Vector3d point_imu_at_end =
+                    exp<double>(s.omg * dt) * point_imu + s.rotation.transpose() * displacement;
+                compensated.push_back((rotation_lidar_imu.transpose() *
+                    (point_imu_at_end - translation_lidar_imu)).cast<float>());
+            }
+            estimator.kf.update_point_batch(compensated.size(), [this, &compensated](std::size_t i) {
+                estimator.point_lidar_frame = compensated[i];
+            });
+            const auto &updated = estimator.kf.x;
+            const Eigen::Matrix3d updated_rotation_lidar_imu = parameters.extrinsic_est_en ?
+                updated.offset_R_L_I : estimator.Lidar_R_wrt_IMU;
+            const Eigen::Vector3d updated_translation_lidar_imu = parameters.extrinsic_est_en ?
+                updated.offset_T_L_I : estimator.Lidar_T_wrt_IMU;
+            for (const auto &point : compensated) {
+                const Eigen::Vector3d point_imu = updated_rotation_lidar_imu * point.cast<double>() + updated_translation_lidar_imu;
+                estimator.ivox->add_point((updated.rotation * point_imu + updated.position).cast<float>());
+            }
+            if (parameters.publish_odometry_without_downsample &&
+                time_current - last_odom_publish_time >= parameters.odom_publish_interval_s - 1e-9) {
+                publish_odometry(time_current);
+                last_odom_publish_time = time_current;
+            }
+            point_batch.clear();
+        };
         while (!preprocess.imu_deque.empty() && !preprocess.dense_point_deque.empty() && !preprocess.point_deque.empty()) {
             const common::Point &point_lidar_frame = preprocess.point_deque.front();
             const common::Point &dense_point_lidar_frame = preprocess.dense_point_deque.front();
@@ -128,21 +171,15 @@ namespace small_point_lio {
                 // predict
                 estimator.kf.predict_state(time_current);
 
-                // update
-                estimator.point_lidar_frame = point_lidar_frame.position;
-                estimator.kf.update_point();
-
-                // publish odometry
-                if (parameters.publish_odometry_without_downsample) {
-                    publish_odometry(time_current);
+                point_batch.push_back(point_lidar_frame);
+                if (point_batch.size() >= parameters.point_update_batch_max_points ||
+                    time_current - point_batch.front().timestamp >= parameters.point_update_batch_interval_s) {
+                    flush_point_batch();
                 }
-
-                // map incremental
-                estimator.ivox->add_point(estimator.point_odom_frame);
-
                 preprocess.point_deque.pop_front();
             } else {
                 // imu update
+                flush_point_batch();
                 if (imu_msg.timestamp < time_current) {
                     preprocess.imu_deque.pop_front();
                     continue;
@@ -161,6 +198,8 @@ namespace small_point_lio {
                 preprocess.imu_deque.pop_front();
             }
         }
+
+        flush_point_batch();
 
         if (is_publish_odometry || !completed_clouds.empty()) {
             if (!parameters.publish_odometry_without_downsample) {

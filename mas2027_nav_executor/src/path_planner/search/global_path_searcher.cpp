@@ -1,5 +1,8 @@
 #include "mas2027_nav_executor/path_planner/search/global_path_searcher.hpp"
 #include "mas2027_nav_executor/common/environment/terrain_map_query.hpp"
+#include "mas2027_nav_executor/common/environment/terrain_semantics.hpp"
+#include "mas2027_nav_executor/common/environment/online_global_map.hpp"
+#include "rog_map/query_adapter.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -302,9 +305,16 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
       nav_msgs::msg::Path terrain_plan;
       terrain_plan.header.stamp = rclcpp::Clock().now();
       terrain_plan.header.frame_id = mode_context.outputFrame();
+      auto slope_edge = [terrain, terrain_query](unsigned int x, unsigned int y,
+          unsigned int next_x, unsigned int next_y) {
+        double ax = 0.0, ay = 0.0, bx = 0.0, by = 0.0;
+        terrain_query->mapToWorld(x, y, ax, ay);
+        terrain_query->mapToWorld(next_x, next_y, bx, by);
+        return terrain->slopeTransition({ax, ay}, {bx, by});
+      };
       if (!makePlanOnQuery(start_map.pose, goal_map.pose, terrain_query,
             mode_context.outputFrame(), "Terrain", tolerance_, cancel_checker, terrain_plan,
-            latest_global_path)) {
+            latest_global_path, slope_edge)) {
         return false;
       }
 
@@ -340,12 +350,40 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
   unsigned int gx = 0;
   unsigned int gy = 0;
   const bool goal_inside = query->worldToMap(goal_rog.pose.position.x, goal_rog.pose.position.y, gx, gy);
+  const auto adapter = std::dynamic_pointer_cast<rog_map::QueryAdapter>(query);
+  const auto semantic = adapter ? adapter->snapshot() : nullptr;
+  const auto remembered = online_terrain_ ? online_terrain_->snapshot() : nullptr;
+  const auto live_sides = semantic && semantic->width == static_cast<int>(query->sizeX()) &&
+      semantic->height == static_cast<int>(query->sizeY()) ?
+    std::make_shared<const std::vector<uint8_t>>(
+      mas2027_nav_executor::buildSlopeSideMask(semantic->width, semantic->height,
+        semantic->terrain_labels, semantic->uphill_x, semantic->uphill_y)) : nullptr;
+  const auto online_edge = [remembered, live_sides, query](unsigned int x, unsigned int y,
+      unsigned int next_x, unsigned int next_y) {
+    if (live_sides && live_sides->size() ==
+        static_cast<size_t>(query->sizeX()) * query->sizeY()) {
+      const size_t a = static_cast<size_t>(y) * query->sizeX() + x;
+      const size_t b = static_cast<size_t>(next_y) * query->sizeX() + next_x;
+      if ((*live_sides)[a] || (*live_sides)[b]) return false;
+      if (x != next_x && y != next_y &&
+          ((*live_sides)[static_cast<size_t>(y) * query->sizeX() + next_x] ||
+           (*live_sides)[static_cast<size_t>(next_y) * query->sizeX() + x])) return false;
+    }
+    if (remembered) {
+      double ax = 0.0, ay = 0.0, bx = 0.0, by = 0.0;
+      query->mapToWorld(x, y, ax, ay);
+      query->mapToWorld(next_x, next_y, bx, by);
+      if (!remembered->terrainTransition(ax, ay, bx, by)) return false;
+    }
+    return true;
+  };
   bool goal_traversable = false;
   if (goal_inside) {
     const unsigned char goal_cost = query->value(gx, gy);
     goal_traversable = goal_cost == kUnknownCost
                          ? !mode_context.explorationUnknownAsOccupied()
                          : goal_cost < kInscribedCost;
+    goal_traversable = goal_traversable && online_edge(gx, gy, gx, gy);
   }
   if (goal_traversable) {
     nav_msgs::msg::Path direct_plan;
@@ -359,7 +397,8 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
           tolerance_,
           cancel_checker,
           direct_plan,
-          latest_global_path)) {
+          latest_global_path,
+          online_edge)) {
       return true;
     }
     RCLCPP_WARN(logger_,
@@ -393,6 +432,9 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
   const auto traversable = [&](size_t idx) {
     if (traversability[idx] >= 0) return traversability[idx] != 0;
     bool allowed = smacTraversableCost(costs[idx], allow_unknown);
+    if (allowed) allowed = online_edge(static_cast<unsigned int>(idx % nx),
+      static_cast<unsigned int>(idx / nx), static_cast<unsigned int>(idx % nx),
+      static_cast<unsigned int>(idx / nx));
     if (allowed && route_clearance > 0.0) {
       double wx = 0.0, wy = 0.0;
       query->mapToWorld(static_cast<unsigned int>(idx % nx),
@@ -493,6 +535,7 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
       if (closed[nb_idx] || !traversable(nb_idx)) {
         continue;
       }
+      if (!online_edge(cx, cy, nbx, nby)) continue;
       const bool diagonal = std::abs(offset[0]) + std::abs(offset[1]) == 2;
       if (diagonal && (!traversable(index_of(nbx, cy)) ||
         !traversable(index_of(cx, nby)))) continue;
@@ -573,7 +616,8 @@ bool GlobalPathSearcher::makePlanOnQuery(const geometry_msgs::msg::Pose & start,
   double tolerance,
   std::function<bool()> cancel_checker,
   nav_msgs::msg::Path & plan,
-  std::vector<geometry_msgs::msg::PoseStamped> & latest_global_path)
+  std::vector<geometry_msgs::msg::PoseStamped> & latest_global_path,
+  mas2027_nav_executor::smac::SmacPlanner2DSimple::EdgeFilter edge_filter)
 {
   plan.poses.clear();
   plan.header.stamp = rclcpp::Clock().now();
@@ -673,6 +717,7 @@ bool GlobalPathSearcher::makePlanOnQuery(const geometry_msgs::msg::Pose & start,
     // 量纲与旧工程 ROGMap ESDF 一致，smac_2d.use_esdf_cost 势场偏置可复用；两者同系，无需换算层。
     smac_->setMap(query);
     smac_->setESDFQuery(query);
+    smac_->setEdgeFilter(edge_filter);
 
     mas2027_nav_executor::smac::SmacPlanner2DSimple::CoordinateVector smac_path;
     const bool smac_success =
@@ -792,6 +837,29 @@ bool GlobalPathSearcher::makePlanOnQuery(const geometry_msgs::msg::Pose & start,
       pose.pose.orientation.w = 1.0;
       latest_global_path.push_back(pose);
       plan.poses.push_back(pose);
+    }
+  }
+
+  // The legacy Astar path cannot filter graph edges during expansion. Keep its
+  // result fail-closed if it crossed a restricted slope boundary.
+  if (edge_filter) {
+    for (size_t i = 1; i < latest_global_path.size(); ++i) {
+      const auto & a = latest_global_path[i - 1].pose.position;
+      const auto & b = latest_global_path[i].pose.position;
+      const double length = std::hypot(b.x - a.x, b.y - a.y);
+      const int steps = std::max(1, static_cast<int>(std::ceil(
+        length / (0.5 * query->resolution()))));
+      unsigned int previous_x = 0, previous_y = 0;
+      if (!query->worldToMap(a.x, a.y, previous_x, previous_y)) return false;
+      for (int step = 1; step <= steps; ++step) {
+        const double ratio = static_cast<double>(step) / steps;
+        unsigned int x = 0, y = 0;
+        if (!query->worldToMap(a.x + ratio * (b.x - a.x),
+            a.y + ratio * (b.y - a.y), x, y)) return false;
+        if ((x != previous_x || y != previous_y) &&
+            !edge_filter(previous_x, previous_y, x, y)) return false;
+        previous_x = x; previous_y = y;
+      }
     }
   }
 

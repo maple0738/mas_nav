@@ -1,6 +1,7 @@
 #include "mas2027_nav_executor/common/environment/online_global_map.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -9,6 +10,7 @@
 #include <opencv2/imgproc.hpp>
 #include "rclcpp/time.hpp"
 #include "rog_map/query_adapter.hpp"
+#include "mas2027_nav_executor/common/environment/terrain_semantics.hpp"
 
 namespace mas2027_nav_executor {
 namespace {
@@ -55,6 +57,42 @@ bool OnlineGlobalMapSnapshot::worldToMap(double x, double y, unsigned int & mx,
   mx = static_cast<unsigned int>(std::floor(fx));
   my = static_cast<unsigned int>(std::floor(fy));
   return true;
+}
+
+nav_msgs::msg::OccupancyGrid OnlineGlobalMapSnapshot::terrainGrid() const
+{
+  auto result = grid_;
+  result.data.resize(terrain_labels_.size());
+  for (size_t i = 0; i < terrain_labels_.size(); ++i) {
+    result.data[i] = terrain_labels_[i] == 255U ? -1 :
+      static_cast<int8_t>(terrain_labels_[i]);
+  }
+  return result;
+}
+
+sensor_msgs::msg::Image OnlineGlobalMapSnapshot::uphillImage() const
+{
+  sensor_msgs::msg::Image image;
+  image.header = grid_.header;
+  image.width = grid_.info.width;
+  image.height = grid_.info.height;
+  image.encoding = "32FC2";
+  image.is_bigendian = false;
+  image.step = image.width * 2U * sizeof(float);
+  image.data.resize(static_cast<size_t>(image.step) * image.height);
+  for (size_t i = 0; i < uphill_x_.size(); ++i) {
+    std::memcpy(image.data.data() + i * 2 * sizeof(float), &uphill_x_[i], sizeof(float));
+    std::memcpy(image.data.data() + (i * 2 + 1) * sizeof(float), &uphill_y_[i], sizeof(float));
+  }
+  return image;
+}
+
+bool OnlineGlobalMapSnapshot::terrainTransition(double from_x, double from_y,
+  double to_x, double to_y) const
+{
+  return terrainSideTransitionAllowed(static_cast<int>(sizeX()),
+    static_cast<int>(sizeY()), resolution_, originX(), originY(), slope_side_mask_,
+    from_x, from_y, to_x, to_y, false);
 }
 
 void OnlineGlobalMapSnapshot::mapToWorld(unsigned int mx, unsigned int my, double & x,
@@ -136,6 +174,8 @@ OnlineGlobalMap::OnlineGlobalMap(const OnlineGlobalMapConfig & config, std::stri
     config.evidence_limit <= 0 || config.evidence_limit > 127 ||
     config.occupied_increment > config.evidence_limit || config.free_decrement > config.evidence_limit ||
     config.occupied_confirmations < 1 || config.occupied_confirmations > 255 ||
+    config.terrain_confirmations < 1 || config.terrain_confirmations > 255 ||
+    config.terrain_clear_confirmations < 1 || config.terrain_clear_confirmations > 255 ||
     !std::isfinite(config.confirmation_max_gap_s) || config.confirmation_max_gap_s <= 0 ||
     frame_.empty()) throw std::invalid_argument("invalid online global map configuration");
 }
@@ -158,7 +198,12 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
   if (source_count > config_.max_cells || source.values.size() != source_count ||
     source.types.size() != source_count ||
     (!source.raw_types.empty() && source.raw_types.size() != source_count) ||
-    (!source.confidence.empty() && source.confidence.size() != source_count)) return UpdateResult::INVALID_INPUT;
+    (!source.confidence.empty() && source.confidence.size() != source_count) ||
+    ((!source.terrain_labels.empty() || !source.uphill_x.empty() ||
+       !source.uphill_y.empty()) &&
+      (source.terrain_labels.size() != source_count ||
+       source.uphill_x.size() != source_count || source.uphill_y.size() != source_count)))
+    return UpdateResult::INVALID_INPUT;
   const double ratio = config_.resolution / source.resolution;
   // Conservative downsampling requires aligned, integer-sized source cells.
   if (ratio < 1 - 1e-6 || ratio > 32 || std::abs(ratio - std::round(ratio)) > 1e-6 ||
@@ -177,7 +222,15 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
   if (ow <= 0 || oh <= 0 || static_cast<uint64_t>(ow) * oh > config_.max_cells) {
     return UpdateResult::INVALID_INPUT;
   }
-  struct Observation { unsigned int free_count{0}; bool occupied{false}; };
+  struct Observation {
+    unsigned int free_count{0};
+    bool occupied{false};
+    unsigned int ordinary_count{0};
+    bool terrain_conflict{false};
+    uint8_t terrain_label{255U};
+    float uphill_x{0.0f};
+    float uphill_y{0.0f};
+  };
   std::vector<Observation> observations(static_cast<size_t>(ow) * oh);
   for (int y = 0; y < source.height; ++y) {
     for (int x = 0; x < source.width; ++x) {
@@ -200,8 +253,35 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
         return UpdateResult::INVALID_INPUT;
       }
       auto & observation = observations[static_cast<size_t>(gy - by) * ow + gx - bx];
+      if (!source.terrain_labels.empty() &&
+          (source.terrain_labels[i] == 5U || source.terrain_labels[i] == 6U ||
+           source.terrain_labels[i] == 7U)) {
+        const uint8_t label = source.terrain_labels[i];
+        if (observation.terrain_label != 255U && observation.terrain_label != label) {
+          observation.terrain_conflict = true;
+        }
+        if (!observation.terrain_conflict &&
+            (observation.terrain_label == 255U || observation.terrain_label == label)) {
+          observation.terrain_label = label;
+          if (label == 5U && std::isfinite(source.uphill_x[i]) &&
+              std::isfinite(source.uphill_y[i])) {
+            observation.uphill_x += source.uphill_x[i];
+            observation.uphill_y += source.uphill_y[i];
+          }
+        }
+      } else if (!source.terrain_labels.empty() && source.terrain_labels[i] == 0U &&
+                 type != 3U && source.values[i] < 253U) {
+        ++observation.ordinary_count;
+      }
       if (type == 3U || source.values[i] >= 253U) observation.occupied = true;
       else ++observation.free_count;
+    }
+  }
+  for (auto & observation : observations) {
+    if (observation.terrain_conflict) {
+      observation.terrain_label = 255U;
+      observation.uphill_x = 0.0F;
+      observation.uphill_y = 0.0F;
     }
   }
   const auto free_coverage = static_cast<unsigned int>(std::round(ratio) * std::round(ratio));
@@ -209,7 +289,7 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
   for (int y = 0; y < oh; ++y) {
     for (int x = 0; x < ow; ++x) {
       const auto & o = observations[static_cast<size_t>(y) * ow + x];
-      if (!o.occupied && o.free_count < free_coverage) continue;
+      if (!o.occupied && o.free_count < free_coverage && o.terrain_label == 255U) continue;
       min_x = std::min(min_x, bx + x); min_y = std::min(min_y, by + y);
       max_x = std::max(max_x, bx + x); max_y = std::max(max_y, by + y);
     }
@@ -237,8 +317,55 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
   for (int y = 0; y < oh; ++y) {
     for (int x = 0; x < ow; ++x) {
       const auto & o = observations[static_cast<size_t>(y) * ow + x];
-      if (!o.occupied && o.free_count < free_coverage) continue;
+      if (!o.occupied && o.free_count < free_coverage && o.terrain_label == 255U) continue;
       auto & cell = next_cells[static_cast<size_t>(by + y - ny) * width + bx + x - nx];
+      // Confirm special terrain over distinct, consecutive snapshots before
+      // retaining it outside the live window. Unknown observations do not erase
+      // history; complete ordinary observations can correct a false label.
+      if (o.terrain_label != 255U) {
+        cell.ordinary_hits = 0;
+        if (cell.terrain_label == o.terrain_label) {
+          cell.terrain_hits = 0;
+          cell.pending_terrain_label = 255U;
+        } else {
+          const bool consecutive = cell.pending_terrain_label == o.terrain_label &&
+            cell.last_terrain_observation_sequence == last_source_sequence_ &&
+            source.stamp - last_source_stamp_ <= config_.confirmation_max_gap_s;
+          cell.terrain_hits = consecutive ? static_cast<uint8_t>(
+            std::min(config_.terrain_confirmations, static_cast<int>(cell.terrain_hits) + 1)) : 1U;
+          cell.pending_terrain_label = o.terrain_label;
+          cell.last_terrain_observation_sequence = source.sequence;
+          if (cell.terrain_hits >= config_.terrain_confirmations) {
+            cell.terrain_label = o.terrain_label;
+            cell.terrain_hits = 0;
+            cell.pending_terrain_label = 255U;
+          }
+        }
+        if (cell.terrain_label == 5U && o.terrain_label == 5U &&
+            std::hypot(o.uphill_x, o.uphill_y) > 0.5f) {
+          const float length = std::hypot(o.uphill_x, o.uphill_y);
+          cell.uphill_x = o.uphill_x / length;
+          cell.uphill_y = o.uphill_y / length;
+        }
+      } else if (o.ordinary_count >= free_coverage) {
+        cell.terrain_hits = 0;
+        cell.pending_terrain_label = 255U;
+        const bool consecutive = cell.last_terrain_observation_sequence == last_source_sequence_ &&
+          source.stamp - last_source_stamp_ <= config_.confirmation_max_gap_s;
+        cell.ordinary_hits = consecutive ? static_cast<uint8_t>(std::min(
+          config_.terrain_clear_confirmations, static_cast<int>(cell.ordinary_hits) + 1)) : 1U;
+        cell.last_terrain_observation_sequence = source.sequence;
+        if (cell.ordinary_hits >= config_.terrain_clear_confirmations) {
+          cell.terrain_label = 255U;
+          cell.uphill_x = 0.0F;
+          cell.uphill_y = 0.0F;
+        }
+      } else {
+        cell.terrain_hits = 0;
+        cell.pending_terrain_label = 255U;
+        cell.ordinary_hits = 0;
+      }
+      if (!o.occupied && o.free_count < free_coverage) continue;
       if (o.occupied && !(cell.observed && cell.evidence >= 0)) {
         const bool consecutive = cell.last_pending_stamp == last_source_stamp_ &&
           source.stamp - cell.last_pending_stamp <= config_.confirmation_max_gap_s;
@@ -275,9 +402,20 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
   grid.info.origin.position.y = ny * config_.resolution;
   grid.info.origin.orientation.w = 1.0;
   grid.data.resize(next_cells.size());
+  next->terrain_labels_.resize(next_cells.size());
+  next->uphill_x_.resize(next_cells.size());
+  next->uphill_y_.resize(next_cells.size());
   for (size_t i = 0; i < next_cells.size(); ++i) {
     const auto & cell = next_cells[i];
     grid.data[i] = !cell.observed ? -1 : (cell.evidence < 0 ? 0 : 100);
+    next->terrain_labels_[i] = cell.terrain_label;
+    next->uphill_x_[i] = cell.uphill_x;
+    next->uphill_y_[i] = cell.uphill_y;
+  }
+  next->slope_side_mask_ = buildSlopeSideMask(width, height,
+    next->terrain_labels_, next->uphill_x_, next->uphill_y_);
+  for (size_t i = 0; i < grid.data.size(); ++i) {
+    if (next->slope_side_mask_[i]) grid.data[i] = 100;
   }
   if (previous && width == width_ && height == height_ && nx == origin_x_ && ny == origin_y_ &&
     grid.data == previous->grid_.data) next->distances_ = previous->distances_;

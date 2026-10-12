@@ -1,5 +1,27 @@
 # Small Point-LIO
 
+## MAS 2027 navigation integration
+
+The active robot configuration is
+`mas2027_nav_bringup/config/small_point_lio_params.yaml`. Localization uses
+filtered, voxel sampled points while `/cloud_registered_full` publishes the
+complete valid input frame after per-point motion compensation. The navigation
+ROGMap subscribes to `/cloud_registered_full`; `/cloud_registered` remains an
+identical compatibility output for existing visualization and map tools.
+
+Localization points are grouped into bounded time windows and linearized at
+one predicted state. The iVox receives these filtered points after each batch
+update. `point_update_batch_interval_s` (5 ms) and
+`point_update_batch_max_points` (128) bound the batch, and an IMU update flushes
+any pending points. `ivox_capacity` bounds retained voxels.
+
+When `publish_odometry_without_downsample` is enabled, odometry follows batch
+updates with a minimum `odom_publish_interval_s` (10 ms). Complete point cloud
+frames use a separate `full_cloud_publish_interval_s` (50 ms); saving PCD data
+is unaffected by this publish throttle. These are configured targets, not
+measured on-robot frequencies. The full cloud publisher and ROGMap subscriber
+both use best effort QoS with depth 1; odometry uses best effort QoS.
+
 Small Point-LIO is an advanced implementation of the [Point-LIO algorithm](https://github.com/hku-mars/Point-LIO), delivering a 2-3x speed improvement over the original.
 
 The default branch is for ROS2. If you want to run it without ros, please checkout the `main` branch.

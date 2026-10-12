@@ -28,10 +28,15 @@ namespace small_point_lio {
         bool publish_odom_tf = declare_parameter<bool>("publish_odom_tf", true);
         bool align_odom_with_gravity = declare_parameter<bool>("align_odom_with_gravity", true);
         bool save_pcd = declare_parameter<bool>("save_pcd");
+        const double full_cloud_publish_interval_s =
+            declare_parameter<double>("full_cloud_publish_interval_s", 0.0);
+        if (!std::isfinite(full_cloud_publish_interval_s) || full_cloud_publish_interval_s < 0.0) {
+            throw std::invalid_argument("full_cloud_publish_interval_s must be finite and nonnegative");
+        }
         small_point_lio = std::make_unique<small_point_lio::SmallPointLio>(*this);
         odometry_publisher = create_publisher<nav_msgs::msg::Odometry>("/Odometry", rclcpp::QoS(10).best_effort());
         // 点云可丢，故取 best_effort + 深度 1：深度 10 会让旧帧在高负载下排队，下游只能拿到滞后点云。
-        // /cloud_registered_full 是稠密去畸变点云主输出，/cloud_registered 同内容供 ROG-Map 等旧下游与离线存图。
+        // /cloud_registered_full 是 ROGMap 稠密去畸变点云输入；/cloud_registered 同内容供旧下游与离线存图。
         pointcloud_full_publisher = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_full", rclcpp::SensorDataQoS().keep_last(1));
         pointcloud_publisher = create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", rclcpp::SensorDataQoS().keep_last(1));
         if (publish_odom_tf) {
@@ -222,12 +227,15 @@ namespace small_point_lio {
             }
             odometry_publisher->publish(odometry_msg);
         });
-        small_point_lio->set_pointcloud_callback([this, save_pcd, odom_frame](const std::vector<Eigen::Vector3f> &pointcloud, double stamp) {
+        small_point_lio->set_pointcloud_callback([this, save_pcd, odom_frame, full_cloud_publish_interval_s](const std::vector<Eigen::Vector3f> &pointcloud, double stamp) {
             // 只在真有订阅者时才组装这一帧稠密点云，无人订阅时序列化它纯属浪费。
             // get_subscription_count() 只统计 QoS 兼容（matched）的订阅，reliable 端不计入、收不到点云。
             const bool has_full_subscriber = pointcloud_full_publisher->get_subscription_count() > 0;
             const bool has_legacy_subscriber = pointcloud_publisher->get_subscription_count() > 0;
-            if (has_full_subscriber || has_legacy_subscriber) {
+            const bool publish_this_frame = full_cloud_publish_interval_s == 0.0 ||
+                stamp < last_full_cloud_publish_stamp ||
+                stamp - last_full_cloud_publish_stamp >= full_cloud_publish_interval_s - 1e-4;
+            if (publish_this_frame && (has_full_subscriber || has_legacy_subscriber)) {
                 builtin_interfaces::msg::Time time_msg;
                 time_msg.sec = std::floor(stamp);
                 time_msg.nanosec = static_cast<uint32_t>((stamp - time_msg.sec) * 1e9);
@@ -304,6 +312,7 @@ namespace small_point_lio {
                 if (has_legacy_subscriber) {
                     pointcloud_publisher->publish(msg);
                 }
+                last_full_cloud_publish_stamp = stamp;
             }
             if (save_pcd) {
                 for (const auto &point: pointcloud) {

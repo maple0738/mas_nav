@@ -42,8 +42,10 @@ struct LocalPathSeed
 {
   bool valid{false};
   bool local_end_is_goal{false};
-  // 原全局路径局部段被实时 ROGMap 阻挡，已替换为滚动窗口内栅格搜索得到的绕行路径。
+  // 原局部段被阻挡或净空偏小，已替换为滚动窗口内栅格搜索得到的绕行路径。
   bool used_dynamic_detour{false};
+  // 原路径只有净空不足时，找到并采用了满足优化器软目标净空的绕行种子。
+  bool used_clearance_detour{false};
   // 当前 ROGMap 窗口内无路可绕，种子停在障碍前的安全点；即使不是任务终点也必须用零末速度。
   bool stop_at_local_end{false};
   // 已生成绕行路径或安全停车前缀但种子仍未过校验：据此区分"修复后被否决"与笼统的 COLLISION。
@@ -66,9 +68,12 @@ public:
     double max_acc,
     double traj_goal_tolerance,
     double collision_dist,
+    double preferred_clearance,
     rclcpp::Logger logger);
 
   void updateLimits(double max_vel, double max_acc, double traj_goal_tolerance);
+
+  void setClearanceDetourEnabled(bool enabled) { clearance_detour_enabled_ = enabled; }
 
   /// 短距离脱困前缀（第四层兜底）参数：enable=false 即完全恢复"三层兜底"行为；min_length/buffer
   /// 是障碍前至少保留的净空与收尾余量，长度上限固定为 collision_dist（整段在近场豁免半径内）。
@@ -111,9 +116,10 @@ private:
     const std::function<bool(const Eigen::Vector3d &, const Eigen::Vector3d &)> &
       terrain_segment_free,
     SeedRejectInfo * reject_info = nullptr,
-    bool enforce_clearance = false) const;
+    bool enforce_clearance = false,
+    double preferred_clearance = 0.0) const;
 
-  /// 始终按"软"口径逐段检查：只否决占据/地形/查询失效；停车前缀要硬口径时另调 `segmentClear`。
+  /// 默认按软口径逐段检查；传入 preferred_clearance 时，额外要求绕行候选达到软目标净空。
   bool pathClear(const std::vector<Eigen::Vector3d> & path,
     const Eigen::Vector3d & planning_start,
     const std::shared_ptr<rog_map::MapQueryInterface> & query,
@@ -121,7 +127,8 @@ private:
     bool start_clearance_ok,
     const std::function<bool(const Eigen::Vector3d &, const Eigen::Vector3d &)> &
       terrain_segment_free,
-    SeedRejectInfo * reject_info = nullptr) const;
+    SeedRejectInfo * reject_info = nullptr,
+    double preferred_clearance = 0.0) const;
 
   bool searchDynamicDetour(const Eigen::Vector3d & start,
     const Eigen::Vector3d & goal,
@@ -131,7 +138,8 @@ private:
     const std::function<bool(const Eigen::Vector3d &, const Eigen::Vector3d &)> &
       terrain_segment_free,
     std::vector<Eigen::Vector3d> & detour,
-    SeedRejectInfo * reject_info = nullptr) const;
+    SeedRejectInfo * reject_info = nullptr,
+    double preferred_clearance = 0.0) const;
 
   bool buildSafeStoppingPrefix(const Eigen::Vector3d & start,
     const std::vector<Eigen::Vector3d> & path,
@@ -174,6 +182,8 @@ private:
   double max_acc_{4.0};
   double traj_goal_tolerance_{0.5};
   double collision_dist_{0.30};
+  double preferred_clearance_{0.35};
+  bool clearance_detour_enabled_{true};
   bool escape_enable_{true};
   double escape_min_length_{0.08};
   double escape_buffer_{0.05};

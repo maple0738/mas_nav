@@ -110,9 +110,11 @@ MapServerNode::MapServerNode(const rclcpp::NodeOptions& options) : Node("map_ser
     cost_grid_ = to_occupancy_grid(maps_.cost_map, maps_.width, maps_.height,
         maps_.resolution, metadata.origin_x, metadata.origin_y, frame_id_);
     terrain_label_image_ = to_image(maps_.terrain_label_map, "mono8", frame_id_, now());
+    uphill_image_ = to_image(maps_.uphill_map, "32FC2", frame_id_, now());
     const auto map_qos = rclcpp::QoS(1).reliable().transient_local();
     cost_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>("cost_map", map_qos);
     terrain_label_pub_ = create_publisher<sensor_msgs::msg::Image>("terrain_label_map", map_qos);
+    uphill_pub_ = create_publisher<sensor_msgs::msg::Image>("terrain_uphill_map", map_qos);
     timer_ = create_wall_timer(std::chrono::milliseconds(500), [this] { publish_maps(); });
     RCLCPP_INFO(get_logger(),
         "loaded %dx%d static terrain map at %.3f m/px, origin=(%.6f, %.6f) from %s",
@@ -124,8 +126,10 @@ void MapServerNode::publish_maps() {
     const auto stamp = now();
     cost_grid_.header.stamp = stamp;
     terrain_label_image_.header.stamp = stamp;
+    uphill_image_.header.stamp = stamp;
     cost_pub_->publish(cost_grid_);
     terrain_label_pub_->publish(terrain_label_image_);
+    uphill_pub_->publish(uphill_image_);
 }
 
 nav_msgs::msg::OccupancyGrid MapServerNode::to_occupancy_grid(

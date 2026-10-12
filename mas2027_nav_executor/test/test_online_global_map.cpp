@@ -18,6 +18,7 @@ OnlineGlobalMapConfig immediateConfig()
 {
   OnlineGlobalMapConfig config;
   config.occupied_confirmations = 1;
+  config.terrain_confirmations = 1;
   return config;
 }
 
@@ -55,6 +56,88 @@ TEST(OnlineGlobalMap, SingleObstacleBecomesUnknownAndFreeReobservationClearsIt)
   EXPECT_LT(pending->query({0.45, 0.45, 0}).distance, 0.0);
   ASSERT_EQ(map.update(source(3)), Result::UPDATED);
   EXPECT_EQ(valueAt(map.snapshot(), 0.45, 0.45), 0U);
+}
+
+TEST(OnlineGlobalMap, SpecialTerrainPersistsAndSlopeBoundaryRejectsSideEntry)
+{
+  OnlineGlobalMap map(immediateConfig(), "odom");
+  auto slope = source(1);
+  slope.terrain_labels.assign(slope.types.size(), 0U);
+  slope.uphill_x.assign(slope.types.size(), 0.0F);
+  slope.uphill_y.assign(slope.types.size(), 0.0F);
+  for (int y = 4; y <= 6; ++y) for (int x = 4; x <= 6; ++x) {
+    const size_t index = static_cast<size_t>(y) * slope.width + x;
+    slope.terrain_labels[index] = 5U;
+    slope.uphill_x[index] = 1.0F;
+  }
+  ASSERT_EQ(map.update(slope), Result::UPDATED);
+  const auto first = map.snapshot();
+  ASSERT_TRUE(first);
+  EXPECT_TRUE(first->terrainTransition(0.35, 0.45, 0.45, 0.45));
+  EXPECT_FALSE(first->terrainTransition(0.45, 0.35, 0.45, 0.45));
+  EXPECT_FALSE(first->terrainTransition(0.45, 0.35, 0.55, 0.35));
+  EXPECT_EQ(valueAt(first, 0.45, 0.35), 254U);
+  EXPECT_EQ(valueAt(first, 0.35, 0.45), 0U);
+  const auto labels = first->terrainGrid();
+  unsigned int mx = 0, my = 0;
+  ASSERT_TRUE(first->worldToMap(0.45, 0.45, mx, my));
+  EXPECT_EQ(labels.data[static_cast<size_t>(my) * labels.info.width + mx], 5);
+
+  ASSERT_EQ(map.update(source(2, 2.0, 0.0)), Result::UPDATED);
+  const auto remembered = map.snapshot();
+  EXPECT_FALSE(remembered->terrainTransition(0.45, 0.35, 0.45, 0.45));
+  EXPECT_EQ(valueAt(remembered, 0.45, 0.35), 254U);
+  ASSERT_EQ(map.update(source(3)), Result::UPDATED);
+  EXPECT_FALSE(map.snapshot()->terrainTransition(0.45, 0.35, 0.45, 0.45));
+}
+
+TEST(OnlineGlobalMap, TerrainNeedsRepeatedEvidenceAndCompleteOrdinaryReobservationClearsIt)
+{
+  OnlineGlobalMapConfig config = immediateConfig();
+  config.terrain_confirmations = 3;
+  config.terrain_clear_confirmations = 2;
+  OnlineGlobalMap map(config, "odom");
+  auto slope = [](uint64_t sequence) {
+    auto s = source(sequence);
+    s.terrain_labels.assign(s.types.size(), 0U);
+    s.uphill_x.assign(s.types.size(), 0.0F);
+    s.uphill_y.assign(s.types.size(), 0.0F);
+    for (int y = 4; y <= 6; ++y) for (int x = 4; x <= 6; ++x) {
+      const size_t i = static_cast<size_t>(y) * s.width + x;
+      s.terrain_labels[i] = 5U;
+      s.uphill_x[i] = 1.0F;
+    }
+    return s;
+  };
+  auto label_at = [&map]() {
+    const auto snapshot = map.snapshot();
+    const auto grid = snapshot->terrainGrid();
+    unsigned int x = 0, y = 0;
+    EXPECT_TRUE(snapshot->worldToMap(0.45, 0.45, x, y));
+    return grid.data[static_cast<size_t>(y) * grid.info.width + x];
+  };
+  ASSERT_EQ(map.update(slope(1)), Result::UPDATED);
+  EXPECT_EQ(label_at(), -1);
+  auto ordinary = source(2);
+  ordinary.terrain_labels.assign(ordinary.types.size(), 0U);
+  ordinary.uphill_x.assign(ordinary.types.size(), 0.0F);
+  ordinary.uphill_y.assign(ordinary.types.size(), 0.0F);
+  ASSERT_EQ(map.update(ordinary), Result::UPDATED);
+  ASSERT_EQ(map.update(slope(3)), Result::UPDATED);
+  ASSERT_EQ(map.update(slope(4)), Result::UPDATED);
+  EXPECT_EQ(label_at(), -1);
+  ASSERT_EQ(map.update(slope(5)), Result::UPDATED);
+  EXPECT_EQ(label_at(), 5);
+  EXPECT_FALSE(map.snapshot()->terrainTransition(0.45, 0.35, 0.45, 0.45));
+  ASSERT_EQ(map.update(source(6)), Result::UPDATED);  // No terrain observation.
+  EXPECT_EQ(label_at(), 5);
+  ordinary.sequence = 7; ordinary.stamp = 7;
+  ASSERT_EQ(map.update(ordinary), Result::UPDATED);
+  EXPECT_EQ(label_at(), 5);
+  ordinary.sequence = 8; ordinary.stamp = 8;
+  ASSERT_EQ(map.update(ordinary), Result::UPDATED);
+  EXPECT_EQ(label_at(), -1);
+  EXPECT_TRUE(map.snapshot()->terrainTransition(0.45, 0.35, 0.45, 0.45));
 }
 
 TEST(OnlineGlobalMap, ConfirmationsNeedConsecutiveFreshSnapshots)

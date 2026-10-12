@@ -400,6 +400,9 @@ bool SmacPlanner2DSimple::createPath(const unsigned int & start_x,
       if (!is_traversable(neighbor_index)) {
         continue;
       }
+      if (edge_filter_ && !edge_filter_(cx_u, cy_u, nx, ny)) {
+        continue;
+      }
 
       const bool diagonal = (k >= 4);
       if (diagonal) {

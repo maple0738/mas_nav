@@ -5,6 +5,9 @@
 #include <cmath>
 #include <limits>
 #include <queue>
+#include <cstring>
+
+#include "mas2027_nav_executor/common/environment/terrain_semantics.hpp"
 
 namespace mas2027_nav_executor {
 namespace {
@@ -27,6 +30,14 @@ void TerrainGrid::updateLabels(const sensor_msgs::msg::Image & image)
   revision_.fetch_add(1, std::memory_order_release);
 }
 
+void TerrainGrid::updateDirections(const sensor_msgs::msg::Image & image)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  directions_ = image;
+  refresh();
+  revision_.fetch_add(1, std::memory_order_release);
+}
+
 void TerrainGrid::refresh()
 {
   snapshot_.reset();
@@ -45,7 +56,31 @@ void TerrainGrid::refresh()
     std::abs(cost_.info.origin.orientation.w - 1.0) > 1e-6) {
     return;
   }
-  snapshot_ = std::make_shared<Snapshot>(Snapshot{cost_, labels_});
+  const bool direction_valid = directions_.width == width && directions_.height == height &&
+    directions_.header.frame_id == cost_.header.frame_id &&
+    directions_.encoding == "32FC2" && !directions_.is_bigendian &&
+    directions_.step >= width * 2U * sizeof(float) &&
+    directions_.data.size() >= static_cast<size_t>(directions_.step) * height;
+  auto next = std::make_shared<Snapshot>(Snapshot{
+    cost_, labels_, direction_valid ? directions_ : sensor_msgs::msg::Image{}});
+  const size_t count = static_cast<size_t>(width) * height;
+  std::vector<uint8_t> labels(count);
+  std::vector<float> uphill_x(count, 0.0F), uphill_y(count, 0.0F);
+  for (unsigned int y = 0; y < height; ++y) {
+    for (unsigned int x = 0; x < width; ++x) {
+      const size_t index = static_cast<size_t>(y) * width + x;
+      labels[index] = labels_.data[static_cast<size_t>(y) * labels_.step + x];
+      if (direction_valid) {
+        const size_t byte = static_cast<size_t>(y) * directions_.step +
+          static_cast<size_t>(x) * 2U * sizeof(float);
+        std::memcpy(&uphill_x[index], directions_.data.data() + byte, sizeof(float));
+        std::memcpy(&uphill_y[index], directions_.data.data() + byte + sizeof(float), sizeof(float));
+      }
+    }
+  }
+  next->slope_side_mask = buildSlopeSideMask(
+    static_cast<int>(width), static_cast<int>(height), labels, uphill_x, uphill_y);
+  snapshot_ = std::move(next);
 }
 
 std::shared_ptr<const TerrainGrid::Snapshot> TerrainGrid::snapshot() const
@@ -62,7 +97,8 @@ std::optional<nav_msgs::msg::OccupancyGrid> TerrainGrid::planningConstraints() c
   nav_msgs::msg::OccupancyGrid result = snapshot_->cost;
   for (size_t index = 0; index < result.data.size(); ++index) {
     const int8_t cost = snapshot_->cost.data[index];
-    result.data[index] = cost < 0 || cost >= kOccupiedCost ? 100 : 0;
+    result.data[index] = cost < 0 || cost >= kOccupiedCost ||
+      snapshot_->slope_side_mask[index] ? 100 : 0;
   }
   return result;
 }
@@ -90,7 +126,8 @@ Eigen::Vector2d TerrainGrid::Snapshot::center(int x, int y) const
 bool TerrainGrid::Snapshot::freeCell(int x, int y) const
 {
   const size_t index = static_cast<size_t>(y) * cost.info.width + x;
-  return cost.data[index] >= 0 && cost.data[index] < kOccupiedCost;
+  return cost.data[index] >= 0 && cost.data[index] < kOccupiedCost &&
+    (slope_side_mask.empty() || slope_side_mask[index] == 0U);
 }
 
 bool TerrainGrid::Snapshot::contains(const Eigen::Vector2d & point) const
@@ -126,7 +163,16 @@ bool TerrainGrid::Snapshot::transition(
     int x = 0, y = 0;
     if (!cell(point, x, y) || !freeCell(x, y)) return false;
   }
-  return true;
+  return slopeTransition(from, to);
+}
+
+bool TerrainGrid::Snapshot::slopeTransition(
+  const Eigen::Vector2d & from, const Eigen::Vector2d & to) const
+{
+  return terrainSideTransitionAllowed(static_cast<int>(cost.info.width),
+    static_cast<int>(cost.info.height), cost.info.resolution,
+    cost.info.origin.position.x, cost.info.origin.position.y, slope_side_mask,
+    from.x(), from.y(), to.x(), to.y(), true);
 }
 
 bool TerrainGrid::Snapshot::search(const Eigen::Vector2d & start,

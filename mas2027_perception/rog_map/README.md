@@ -230,10 +230,10 @@ RViz 的 `ROGMAP` 分组默认开启 `Online Terrain (orange=slope, cyan=tunnel)
 |---|---:|---:|---|
 | `performance.enable` | `true` | `true` | 性能统计总开关 |
 | `performance.summary_csv_enable` | `true` | `false` | 每秒一行的汇总 CSV |
-| `performance.summary_csv_path` | `.scratch/rog_map_perf_summary.csv` | `/tmp/rog_map_perf_summary.csv` | **必须落在工作区内**：写 `/tmp` 时排障侧读不到 |
+| `performance.summary_csv_path` | `.scratch/rog_map_perf_summary.csv` | `/tmp/rog_map_perf_summary.csv` | 运行时加时间后缀生成独立文件，保留每次启动的汇总数据 |
 | `performance.summary_rate` | `1.0` | `1.0` | 汇总频率（Hz） |
 | `performance.detailed_csv_enable` | `true` | `false` | **每次更新一行，开销大**；只在需要逐帧时序时打开，诊断完应关回 false |
-| `performance.detailed_csv_path` | 未设置 | `/tmp/rog_map_perf_detailed.csv` | 明细 CSV 路径 |
+| `performance.detailed_csv_path` | `.scratch/rog_map_perf_detailed.csv` | `/tmp/rog_map_perf_detailed.csv` | 运行时加时间后缀生成独立明细文件；实际路径写入启动日志 |
 | `performance.print_enable` | `false` | `false` | 打到 stdout（不进 ROS 日志文件） |
 | `performance.dirty_column_enable` | `true` | `false` | 脏列增量投影（false = 每帧全量重投影整张二维窗口） |
 | `performance.dirty_full_ratio` | `0.95` | `0.30` | 脏列比例超过它就回退全量。稠密点云下脏列常年 ~49%，阈值太低会让增量路径永不生效 |

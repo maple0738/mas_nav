@@ -29,6 +29,9 @@ struct MapSnapshot
   std::vector<double> distances;
   std::vector<float> height_deltas;
   std::vector<float> confidence;
+  std::vector<uint8_t> terrain_labels;
+  std::vector<float> uphill_x;
+  std::vector<float> uphill_y;
   uint64_t field_sequence{0};
   double field_stamp{0.0};
   bool field_stale{true};

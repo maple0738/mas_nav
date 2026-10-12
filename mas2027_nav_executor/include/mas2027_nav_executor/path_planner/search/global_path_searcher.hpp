@@ -5,6 +5,8 @@
 #include "mas2027_nav_executor/common/environment/terrain_grid.hpp"
 #include "mas2027_nav_executor/path_planner/search/smac/smac_planner_2d_simple.hpp"
 
+namespace mas2027_nav_executor { class OnlineGlobalMap; }
+
 namespace minco_planner {
 
 class PlannerModeContext;
@@ -25,6 +27,8 @@ public:
   void setQuery(const std::shared_ptr<rog_map::MapQueryInterface> & global_query);
   void setTerrainGrid(std::shared_ptr<mas2027_nav_executor::TerrainGrid> terrain)
   { terrain_ = std::move(terrain); }
+  void setOnlineTerrainMap(std::shared_ptr<mas2027_nav_executor::OnlineGlobalMap> terrain)
+  { online_terrain_ = std::move(terrain); }
 
   // 全局搜索不再接收运动学输入（实测速度 / max_speed / max_acceleration）：主搜索是地形图上的
   // 纯栅格 A*，与 mas_nav_2027 的 SMAC2D 同口径，不含速度/加速度可行性约束。
@@ -60,7 +64,8 @@ private:
     double tolerance,
     std::function<bool()> cancel_checker,
     nav_msgs::msg::Path & plan,
-    std::vector<geometry_msgs::msg::PoseStamped> & latest_global_path);
+    std::vector<geometry_msgs::msg::PoseStamped> & latest_global_path,
+    mas2027_nav_executor::smac::SmacPlanner2DSimple::EdgeFilter edge_filter = {});
 
   std::shared_ptr<tf2_ros::Buffer> tf_;
   Astar * astar_{nullptr};
@@ -68,6 +73,7 @@ private:
   bool use_smac_{false};
   std::shared_ptr<rog_map::MapQueryInterface> global_query_;
   std::shared_ptr<mas2027_nav_executor::TerrainGrid> terrain_;
+  std::shared_ptr<mas2027_nav_executor::OnlineGlobalMap> online_terrain_;
   bool allow_unknown_{true};
   double tolerance_{0.5};
   double online_subgoal_clearance_{0.33};

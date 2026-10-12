@@ -129,7 +129,7 @@ Foxglove → `Open connection` → 选 **Foxglove WebSocket** → 填 URL → `O
 | 面板类型 | Topic | 看什么 |
 |---|---|---|
 | TF | — | `map→odom→base_link` 是否通 |
-| PointCloud2 | `/cloud_registered` | 实时配准点云（首选） |
+| PointCloud2 | `/cloud_registered_full` | ROGMap 使用的完整配准点云；`/cloud_registered` 为相同内容的兼容话题 |
 | PointCloud2 | `/rog_map/occupied` | ROGMap 动态占据 |
 | PointCloud2 | `/rog_map/field` | 2D 距离场 |
 | MarkerArray | `/rog_map/terrain_markers` | 在线坡道（橙）/隧道（青）候选区域 |
@@ -199,7 +199,7 @@ HTTP 响应体是 `Missing expected sec-websocket-protocol header`（该字符�
 
 ### 5.5 带宽
 
-点云很吃带宽。优先 `/cloud_registered`，别一上来开 `/cloud_registered_full`；
+点云很吃带宽。`/cloud_registered_full` 与 `/cloud_registered` 内容相同，远程调试只选一个；
 `/rog_map/*` 那六七个层全开，走 WiFi 会明显卡。必要时用 `topic_whitelist` 限流。
 
 ### 5.6 代理

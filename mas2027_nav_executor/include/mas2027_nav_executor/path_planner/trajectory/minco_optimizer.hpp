@@ -134,7 +134,7 @@ private:
     int iter_num{0};
     double rho;
     double smooth_eps;
-    double integral_res;
+    int integral_res;
     bool default_init{true};
 
     // Environment map pointer.

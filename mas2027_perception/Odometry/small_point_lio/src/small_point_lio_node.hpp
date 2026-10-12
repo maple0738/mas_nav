@@ -41,6 +41,7 @@ namespace small_point_lio {
         bool odom_frame_initialized = false;
         tf2::Transform transform_odom_from_internal_world = tf2::Transform::getIdentity();
         common::Odometry last_odometry;
+        double last_full_cloud_publish_stamp = -std::numeric_limits<double>::infinity();
         std::unique_ptr<util::PointcloudMapping> pointcloud_mapping;
 
     public:

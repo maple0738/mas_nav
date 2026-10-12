@@ -1,11 +1,13 @@
 #pragma once
 
 #include <memory>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include "nav_msgs/msg/occupancy_grid.hpp"
+#include "sensor_msgs/msg/image.hpp"
 #include "rog_map/map_query_interface.hpp"
 namespace rog_map { struct MapSnapshot; }
 
@@ -20,6 +22,8 @@ struct OnlineGlobalMapConfig
   int evidence_limit{5};
   int occupied_confirmations{2};
   double confirmation_max_gap_s{1.5};
+  int terrain_confirmations{3};
+  int terrain_clear_confirmations{10};
 };
 
 // Each instance is immutable. Pin one for an entire search so an expansion
@@ -28,6 +32,9 @@ class OnlineGlobalMapSnapshot final : public rog_map::MapQueryInterface
 {
 public:
   const nav_msgs::msg::OccupancyGrid & grid() const { return grid_; }
+  nav_msgs::msg::OccupancyGrid terrainGrid() const;
+  sensor_msgs::msg::Image uphillImage() const;
+  bool terrainTransition(double from_x, double from_y, double to_x, double to_y) const;
   uint64_t revision() const { return revision_; }
   bool worldToMap(double x, double y, unsigned int & mx, unsigned int & my) const override;
   void mapToWorld(unsigned int mx, unsigned int my, double & x, double & y) const override;
@@ -49,6 +56,10 @@ public:
 private:
   friend class OnlineGlobalMap;
   nav_msgs::msg::OccupancyGrid grid_;
+  std::vector<uint8_t> terrain_labels_;
+  std::vector<float> uphill_x_;
+  std::vector<float> uphill_y_;
+  std::vector<uint8_t> slope_side_mask_;
   std::shared_ptr<const std::vector<double>> distances_;
   uint64_t revision_{0};
   double resolution_{0.1};
@@ -73,6 +84,13 @@ private:
     bool observed{false};
     uint8_t pending_hits{0};
     double last_pending_stamp{0.0};
+    uint8_t terrain_label{255U};
+    float uphill_x{0.0f};
+    float uphill_y{0.0f};
+    uint8_t pending_terrain_label{255U};
+    uint8_t terrain_hits{0};
+    uint8_t ordinary_hits{0};
+    uint64_t last_terrain_observation_sequence{0};
   };
   OnlineGlobalMapConfig config_;
   std::string frame_;

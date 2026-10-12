@@ -32,4 +32,12 @@ install(TARGETS ${PROJECT_NAME}_core map_server_node
   RUNTIME DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
 ament_export_include_directories(include)
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_terrain_direction test/test_terrain_direction.cpp)
+  target_link_libraries(test_terrain_direction ${PROJECT_NAME}_core)
+  target_include_directories(test_terrain_direction PRIVATE include ${MSGPACK_INCLUDE_DIR})
+endif()
+
 ament_package()

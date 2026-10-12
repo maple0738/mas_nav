@@ -32,6 +32,9 @@ namespace small_point_lio {
 
         double map_resolution;
         size_t init_map_size;
+        size_t ivox_capacity = 1000000;
+        double point_update_batch_interval_s = 0.005;
+        size_t point_update_batch_max_points = 128;
 
         bool extrinsic_est_en;
         Eigen::Vector3d extrinsic_T;
@@ -49,6 +52,7 @@ namespace small_point_lio {
         double match_sqaured;
 
         bool publish_odometry_without_downsample = false;
+        double odom_publish_interval_s = 0.01;
 
         void read_parameters(rclcpp::Node &node);
     };

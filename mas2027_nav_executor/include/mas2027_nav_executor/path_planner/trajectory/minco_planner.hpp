@@ -13,6 +13,7 @@
 namespace mas2027_nav_executor {
 class FusedMapQuery;
 class TerrainMapQuery;
+class OnlineGlobalMap;
 }  // namespace mas2027_nav_executor
 
 namespace minco_planner {
@@ -39,6 +40,7 @@ public:
 
   void setMap(const std::shared_ptr<rog_map::MapQueryInterface> & map);
   void setTerrainGrid(std::shared_ptr<mas2027_nav_executor::TerrainGrid> terrain);
+  void setOnlineTerrainMap(std::shared_ptr<mas2027_nav_executor::OnlineGlobalMap> terrain);
 
   bool ReplanLocal(const geometry_msgs::msg::PoseStamped & current_pose);
   bool makePlan(const geometry_msgs::msg::Pose & start,
@@ -204,6 +206,7 @@ private:
   std::unique_ptr<PlannerModeContext> mode_context_;
   std::unique_ptr<GlobalPathSearcher> global_path_searcher_;
   std::shared_ptr<mas2027_nav_executor::TerrainGrid> terrain_;
+  std::shared_ptr<mas2027_nav_executor::OnlineGlobalMap> online_terrain_;
   std::shared_ptr<mas2027_nav_executor::TerrainMapQuery> terrain_query_;
   std::shared_ptr<mas2027_nav_executor::FusedMapQuery> fused_query_;
   double normal_speed_cap_{3.0};

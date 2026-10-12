@@ -223,12 +223,15 @@ def _launch_setup(context):
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("use_sim_time", default_value="False"),
-        # 无显示器/SSH 时用 use_rviz:=False。
-        DeclareLaunchArgument("use_rviz", default_value="true"),
+        # RViz 默认关闭，需要图形窗口时显式传 use_rviz:=True。
+        DeclareLaunchArgument("use_rviz", default_value="false"),
         # CDC1 直接发送 vx/vy/nav_state；该固件协议没有 mode 字段。
         # 只观察导航时用 use_nav_serial:=False 关掉硬件输出。
         DeclareLaunchArgument("use_nav_serial", default_value="True"),
-        DeclareLaunchArgument("nav_serial_device", default_value=""),
+        DeclareLaunchArgument(
+            "nav_serial_device",
+            default_value="",
+        ),
         DeclareLaunchArgument("use_odom_localizer", default_value="True"),
         DeclareLaunchArgument("use_foxglove", default_value="True"),
         DeclareLaunchArgument("foxglove_address", default_value="127.0.0.1"),

@@ -72,6 +72,32 @@ TEST(SmacWallClearance, CannotCrossBlockedDiagonalCorner)
   EXPECT_FALSE(planner.createPath(0U, 0U, 2U, 2U, path));
 }
 
+TEST(SmacWallClearance, EdgeFilterRoutesThroughPermittedSlopeEntrance)
+{
+  auto map = std::make_shared<GridQuery>(7U, 7U, 0.1);
+  mas2027_nav_executor::smac::SmacPlanner2DSimple planner;
+  planner.setMap(map);
+  planner.setParameters(false, 1000, 0.0F);
+  planner.setEdgeFilter([](unsigned int x, unsigned int y,
+      unsigned int next_x, unsigned int next_y) {
+    const bool crosses = (x <= 2U && next_x >= 3U) || (x >= 3U && next_x <= 2U);
+    return !crosses || (y == 3U && next_y == 3U);
+  });
+  mas2027_nav_executor::smac::SmacPlanner2DSimple::CoordinateVector path;
+  ASSERT_TRUE(planner.createPath(1U, 1U, 5U, 1U, path));
+  bool used_entrance = false;
+  for (size_t i = 1; i < path.size(); ++i) {
+    const auto & a = path[i - 1];
+    const auto & b = path[i];
+    if ((a.x <= 2.0F && b.x >= 3.0F) || (a.x >= 3.0F && b.x <= 2.0F)) {
+      EXPECT_EQ(a.y, 3.0F);
+      EXPECT_EQ(b.y, 3.0F);
+      used_entrance = true;
+    }
+  }
+  EXPECT_TRUE(used_entrance);
+}
+
 TEST(SmacWallClearance, ShortWallEndKeepsConfiguredClearance)
 {
   auto map = std::make_shared<GridQuery>(45U, 35U, 0.05);

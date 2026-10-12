@@ -4,7 +4,10 @@
 #include "mas2027_nav_executor/common/environment/fused_map_query.hpp"
 #include "mas2027_nav_executor/common/environment/terrain_map_query.hpp"
 #include "mas2027_nav_executor/common/environment/clearance_gate.hpp"
+#include "mas2027_nav_executor/common/environment/terrain_semantics.hpp"
+#include "mas2027_nav_executor/common/environment/online_global_map.hpp"
 #include "mas2027_nav_executor/path_planner/trajectory/arc_length_speed_profile.hpp"
+#include "rog_map/query_adapter.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -26,6 +29,15 @@ constexpr double kMonitorClearanceTolerance = mas2027_nav_executor::kEsdfJitterT
 // 地形门否决日志节流：前 N 条逐条打印、之后每 M 次采样一条，不按时间节流以免失败密集时丢光现场。
 constexpr uint64_t kTerrainRejectLogFirstN = 10;
 constexpr uint64_t kTerrainRejectLogEveryN = 50;
+
+bool onlineSlopeTransition(const rog_map::MapSnapshot & map,
+  const std::vector<uint8_t> & sides,
+  const Eigen::Vector3d & from, const Eigen::Vector3d & to)
+{
+  return mas2027_nav_executor::terrainSideTransitionAllowed(map.width, map.height,
+    map.resolution, map.origin_x, map.origin_y, sides,
+    from.x(), from.y(), to.x(), to.y(), false);
+}
 
 void declareParameterIfMissing(
   const rclcpp_lifecycle::LifecycleNode::SharedPtr & node,
@@ -605,7 +617,12 @@ void MincoPlanner::configure(const rclcpp_lifecycle::LifecycleNode::WeakPtr & pa
   local_path_processor_ = std::make_unique<LocalPathProcessor>();
   local_path_processor_->configure(
     lookahead_dist_, minco_config.max_vel, minco_config.max_acc, traj_goal_tolerance_,
-    collision_dist_, logger_);
+    collision_dist_, minco_config.safe_dist, logger_);
+  declareParameterIfMissing(
+    node, prefix + "minco_optimizer.clearance_detour_enable", rclcpp::ParameterValue(true));
+  bool clearance_detour_enable = true;
+  node->get_parameter(prefix + "minco_optimizer.clearance_detour_enable", clearance_detour_enable);
+  local_path_processor_->setClearanceDetourEnabled(clearance_detour_enable);
   // 第四层兜底（短距离脱困前缀）的参数在此注入；stuck_escape.* 已在上面读取。
   local_path_processor_->setEscapeOptions(
     escape_enable_, escape_min_length_, escape_buffer_);
@@ -873,6 +890,16 @@ rcl_interfaces::msg::SetParametersResult MincoPlanner::onSetParameters(
       smac_config_changed = true;
       continue;
     }
+
+    // Other planner parameters are read only during configuration. Accepting
+    // a runtime write here would change the reported value without changing
+    // the safety checks or the planner that uses it.
+    if (param_name.rfind(name_ + ".", 0) == 0) {
+      result.successful = false;
+      result.reason = "Parameter requires a planner restart: " + param_name;
+      RCLCPP_ERROR(logger_, "[MincoPlanner] %s", result.reason.c_str());
+      return result;
+    }
   }
 
   if (smac_config_changed) {
@@ -979,6 +1006,13 @@ void MincoPlanner::setTerrainGrid(std::shared_ptr<mas2027_nav_executor::TerrainG
   terrain_ = std::move(terrain);
   if (global_path_searcher_) global_path_searcher_->setTerrainGrid(terrain_);
   rebuildFusedQuery();
+}
+
+void MincoPlanner::setOnlineTerrainMap(
+  std::shared_ptr<mas2027_nav_executor::OnlineGlobalMap> terrain)
+{
+  online_terrain_ = std::move(terrain);
+  if (global_path_searcher_) global_path_searcher_->setOnlineTerrainMap(online_terrain_);
 }
 
 void MincoPlanner::rebuildFusedQuery()
@@ -1136,6 +1170,21 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
       };
     } catch (const tf2::TransformException &) {
       return finish(false, "TERRAIN_TF_UNAVAILABLE");
+    }
+  }
+  if (!terrain_) {
+    const auto adapter = std::dynamic_pointer_cast<rog_map::QueryAdapter>(map_);
+    const auto semantic = adapter ? adapter->snapshot() : nullptr;
+    const auto remembered = online_terrain_ ? online_terrain_->snapshot() : nullptr;
+    const auto live_sides = semantic ? std::make_shared<const std::vector<uint8_t>>(
+      mas2027_nav_executor::buildSlopeSideMask(semantic->width, semantic->height,
+        semantic->terrain_labels, semantic->uphill_x, semantic->uphill_y)) : nullptr;
+    if (semantic || remembered) {
+      terrain_segment_free = [semantic, remembered, live_sides](const Eigen::Vector3d & a,
+          const Eigen::Vector3d & b) {
+        return (!semantic || onlineSlopeTransition(*semantic, *live_sides, a, b)) &&
+          (!remembered || remembered->terrainTransition(a.x(), a.y(), b.x(), b.y()));
+      };
     }
   }
   const LocalPathSeed seed = local_path_processor_->buildSeed(
@@ -1330,10 +1379,11 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
 
     if (has_last_traj && isTrajSafe()) {
       if (!isTrajectoryTimeExpired(rclcpp::Clock().now().seconds())) {
-        std::cout << YELLOW
-                  << "[MincoPlanner] Last trajectory is still valid and safe. Continuing to execute it."
-                  << RESET << std::endl;
-        return finish(true, "NONE");
+        RCLCPP_WARN(logger_,
+          "[MincoPlanner] Optimization failed; keeping the previous safe trajectory");
+        // No new trajectory was published. TaskManager must not advance its
+        // minimum accepted trajectory stamp in this case.
+        return finish(false, "OPTIMIZER_FAILED");
       }
       return finish(false, "OPTIMIZER_FAILED");
     }
@@ -1970,6 +2020,31 @@ bool MincoPlanner::validateTrajectory(
       RCLCPP_WARN(logger_, "Terrain trajectory validation TF failed: %s", ex.what());
       last_validation_failure_reason_ = "TERRAIN_TF_UNAVAILABLE";
       return false;
+    }
+  }
+
+  if (!terrain_) {
+    const auto adapter = std::dynamic_pointer_cast<rog_map::QueryAdapter>(map_);
+    const auto semantic = adapter ? adapter->snapshot() : nullptr;
+    const auto remembered = online_terrain_ ? online_terrain_->snapshot() : nullptr;
+    const auto live_sides = semantic ? mas2027_nav_executor::buildSlopeSideMask(
+      semantic->width, semantic->height, semantic->terrain_labels,
+      semantic->uphill_x, semantic->uphill_y) : std::vector<uint8_t>{};
+    if (semantic || remembered) {
+      const int intervals = std::max(1, static_cast<int>(std::ceil(
+        dur * std::max(0.1, vmax) /
+        (0.5 * (semantic ? semantic->resolution : remembered->resolution())))));
+      Eigen::Vector3d previous = traj.getPos(0.0);
+      for (int i = 1; i <= intervals; ++i) {
+        const Eigen::Vector3d current = traj.getPos(dur * i / intervals);
+        if ((semantic && !onlineSlopeTransition(*semantic, live_sides, previous, current)) ||
+            (remembered && !remembered->terrainTransition(
+              previous.x(), previous.y(), current.x(), current.y()))) {
+          last_validation_failure_reason_ = "TERRAIN_SIDE_ENTRY";
+          return false;
+        }
+        previous = current;
+      }
     }
   }
 

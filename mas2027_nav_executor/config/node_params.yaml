@@ -15,8 +15,8 @@
       # ROGMap 最后一次完成点云地图更新的最大年龄。点云断流或地图工作线程停滞时
       # 目标接纳和速度指令 fail closed；这直接读 ROGMap 快照时戳，不依赖任何 ROS 心跳话题。
       rog_map_timeout_s: 0.5
-      # Online terrain labels take precedence while fresh; stale/missing cells
-      # fall back to the annotated terrain map.
+      # The session terrain map retains observed special regions after the
+      # rolling sensor window has moved away.
       online_terrain_label_timeout_s: 0.8
       output_in_body_frame: true
       frames:
@@ -40,7 +40,8 @@
         region_status_pub: /nav_executor/region_status
         terrain_cost_sub: /cost_map
         terrain_label_sub: /terrain_label_map
-        online_terrain_label_sub: /rog_map/terrain_label
+        terrain_uphill_sub: /terrain_uphill_map
+        online_terrain_label_sub: /nav_executor/online_terrain_map
       visualization:
         velocity_color_min: 0.0
         velocity_color_max: 3.0

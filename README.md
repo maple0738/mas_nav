@@ -98,9 +98,9 @@ required(v) = collision_dist + max(v * replan_react_time, monitor_margin)
   阈值与 `node.rog_map_clearance` 需在静止实车上标定。已移除目标跟踪与未来预测（防振动误判）。
 - MPC 仍为全向模型（`linear.x/y`、`angular.z`，±2 rad/s、±4 rad/s²，需按底盘标定）。
   区域控制沿最终轨迹标注坡道、隧道和起伏路，以 `/nav_executor/chassis_cmd` 同步下发速度与
-  mode；`/cmd_vel` 保留供观测。`ros2_comm` 默认继续发兼容 mas_vision 的 9 字节
-  `vx`/`vy`/`nav_state`，不会转发 `angular.z` 或新 mode。模式透传需要按
-  [区域控制集成说明](docs/region_control_2026-09-24.md) 选定传输方式。
+  mode；`/cmd_vel` 保留供观测。`nav_serial_bridge` 从同一消息提取 `vx`/`vy`，
+  通过导航专用 CDC1 串口直接发送；当前固件包没有 `mode` 和 `angular.z` 字段。
+  区域 mode 只在导航内部生效，底盘模式切换仍需后续扩展固件协议。
 - `lab3_terrain.msgpack` 只有平地/障碍，无坡道台阶与方向数据；方向层实测全 0，逐边方向约束只在
   `validateTrajectory` 的 `terrain->transition()`（失败记 `TERRAIN_COLLISION`）。
 - **折线与轨迹是两条线**：粗青线 = 搜索想怎么绕，细彩线 = 车准备怎么走，明显不重合时问题在 MINCO
@@ -263,8 +263,9 @@ map_files:
 ```
 
 相对路径以安装后的 `mas2027_nav_bringup` share 目录为基准，也可以填写绝对路径。随后重新执行
-`colcon build --symlink-install --packages-select mas2027_nav_bringup`，让新增地图文件与配置进入
-`install/`，再启动导航。`map_server` 会直接读取 `occupancy_yaml` 中的
+`colcon build --symlink-install --packages-select mas2027_nav_bringup`，让清单选中的 PCD、地图 YAML、
+该 YAML 引用的 PGM 和 terrain msgpack 进入 `install/`，再启动导航。其他历史地图留在源码目录，
+不会复制到新安装包；绝对路径指向仓库外时，部署机器需要自行提供该文件。`map_server` 会直接读取 `occupancy_yaml` 中的
 `origin: [x, y, yaw]` 和 `resolution`，不再接受手填 `origin_x/origin_y`；同时核对该 YAML 引用的 PGM
 与 terrain msgpack 的宽、高、分辨率，防止误配不同批次地图。当前地形查询只支持 `yaw: 0`，控制台
 导出时应先把 PCD、PGM 和 terrain 成组旋转到最终 map 坐标系。

@@ -8,6 +8,7 @@
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
+#include "visualization_msgs/msg/marker_array.hpp"
 
 #include "mas2027_nav_executor/common/environment/terrain_grid.hpp"
 #include "mas2027_nav_executor/task_manager/task_manager.hpp"
@@ -45,10 +46,13 @@ private:
   minco_planner::MincoPlanner::Ptr planner_;
   std::unique_ptr<TaskManager> task_manager_;
   rclcpp::TimerBase::SharedPtr task_timer_;
-  std::unique_ptr<OnlineGlobalMap> online_global_map_;
+  std::shared_ptr<OnlineGlobalMap> online_global_map_;
   rclcpp::TimerBase::SharedPtr global_map_timer_;
   rclcpp::CallbackGroup::SharedPtr global_map_callback_group_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr global_map_pub_;
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr global_terrain_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr global_uphill_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr global_terrain_markers_pub_;
   std::shared_ptr<TerrainGrid> terrain_;
   double odom_timeout_s_;
   double rog_map_timeout_s_;

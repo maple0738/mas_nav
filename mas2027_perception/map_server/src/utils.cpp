@@ -170,7 +170,16 @@ TerrainMapData load_terrain_msgpack(const std::string& path) {
             data.resolution = m.ptr[i].val.as<double>();
         } else if (key == "terrain") {
             data.terrain.clear(); for (uint32_t j = 0; j < m.ptr[i].val.via.array.size; ++j) data.terrain.push_back(m.ptr[i].val.via.array.ptr[j].as<uint8_t>());
-
+        } else if (key == "uphill") {
+            const auto& values = m.ptr[i].val;
+            if (values.type != msgpack::type::ARRAY) {
+                throw std::runtime_error("uphill must be a flat array of XY pairs");
+            }
+            data.uphill.clear();
+            data.uphill.reserve(values.via.array.size);
+            for (uint32_t j = 0; j < values.via.array.size; ++j) {
+                data.uphill.push_back(values.via.array.ptr[j].as<float>());
+            }
         }
     }
 
@@ -195,6 +204,18 @@ TerrainMapData load_terrain_msgpack(const std::string& path) {
                 "invalid terrain label " + std::to_string(data.terrain[i])
                 + " at flat index " + std::to_string(i)
             );
+        }
+    }
+    if (!data.uphill.empty() && data.uphill.size() != 2 * expected) {
+        throw std::runtime_error("uphill data size must equal twice the terrain cell count");
+    }
+    for (size_t i = 0; i < expected && !data.uphill.empty(); ++i) {
+        const float x = data.uphill[2 * i], y = data.uphill[2 * i + 1];
+        const float length = std::hypot(x, y);
+        if (!std::isfinite(length) ||
+            (length > 0.01f && std::abs(length - 1.0f) > 0.05f) ||
+            (data.terrain[i] != static_cast<uint8_t>(TerrainType::SLOPE) && length > 0.01f)) {
+            throw std::runtime_error("invalid uphill vector at flat index " + std::to_string(i));
         }
     }
 
@@ -223,6 +244,53 @@ NavigationMapData load_navigation_maps(
 
     cv::Mat terrain_label_map(terrain_data.height, terrain_data.width, CV_8UC1);
     std::copy(terrain_data.terrain.begin(), terrain_data.terrain.end(), terrain_label_map.ptr<uint8_t>(0));
+    cv::Mat uphill_map = cv::Mat::zeros(terrain_data.height, terrain_data.width, CV_32FC2);
+    if (!terrain_data.uphill.empty()) {
+        std::copy(terrain_data.uphill.begin(), terrain_data.uphill.end(),
+            uphill_map.ptr<float>(0));
+    } else {
+        // A label-only prior map cannot tell which end is higher. Its long
+        // connected-component axis can still prevent entry from the sides.
+        cv::Mat slope_mask = terrain_label_map == static_cast<uint8_t>(TerrainType::SLOPE);
+        cv::Mat components;
+        const int component_count = cv::connectedComponents(slope_mask, components, 8, CV_32S);
+        struct Moments {
+            double x{0.0}, y{0.0}, xx{0.0}, xy{0.0}, yy{0.0};
+            int count{0};
+        };
+        std::vector<Moments> moments(static_cast<size_t>(component_count));
+        for (int y = 0; y < terrain_data.height; ++y) {
+            for (int x = 0; x < terrain_data.width; ++x) {
+                const int component = components.at<int>(y, x);
+                if (component == 0) continue;
+                auto& m = moments[component];
+                m.x += x; m.y += y; m.xx += static_cast<double>(x) * x;
+                m.xy += static_cast<double>(x) * y; m.yy += static_cast<double>(y) * y;
+                ++m.count;
+            }
+        }
+        std::vector<cv::Vec2f> axes(moments.size(), cv::Vec2f(0.0f, 0.0f));
+        for (size_t i = 1; i < moments.size(); ++i) {
+            const auto& m = moments[i];
+            if (m.count < 16) continue;
+            const double mx = m.x / m.count, my = m.y / m.count;
+            const double xx = m.xx / m.count - mx * mx;
+            const double xy = m.xy / m.count - mx * my;
+            const double yy = m.yy / m.count - my * my;
+            const double discriminant = std::hypot(xx - yy, 2.0 * xy);
+            const double major = (xx + yy + discriminant) * 0.5;
+            const double minor = (xx + yy - discriminant) * 0.5;
+            if (major < 1.5 * std::max(1.0, minor)) continue;
+            const double angle = 0.5 * std::atan2(2.0 * xy, xx - yy);
+            axes[i] = cv::Vec2f(static_cast<float>(std::cos(angle)),
+                                static_cast<float>(std::sin(angle)));
+        }
+        for (int y = 0; y < terrain_data.height; ++y) {
+            for (int x = 0; x < terrain_data.width; ++x) {
+                uphill_map.at<cv::Vec2f>(y, x) = axes[components.at<int>(y, x)];
+            }
+        }
+    }
 
     return {
         .width = terrain_data.width,
@@ -230,6 +298,7 @@ NavigationMapData load_navigation_maps(
         .resolution = terrain_data.resolution,
         .cost_map = std::move(cost_map),
         .terrain_label_map = std::move(terrain_label_map),
+        .uphill_map = std::move(uphill_map),
     };
 }
 

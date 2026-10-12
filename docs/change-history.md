@@ -7,6 +7,101 @@
 - 改动：`nav_serial_bridge` 默认扫描 Linux CDC ACM 串口，读取各端口所属 USB 接口的 sysfs `interface` 属性，仅在唯一匹配 `PCCOMM-NAV` 时连接；每次重连重新查找，不使用 `ttyACM` 编号、接口序号或 USB 产品名称。`nav_serial_device` 仍可显式指定路径，bringup 默认改为空值以启用自动识别。更新导航说明；发送和接收帧格式、CRC 实现未改动。视觉工程未修改。
 - 验证：`nav_serial_bridge`、`mas2027_nav_bringup` 构建通过；协议 GTest 3 项、接口识别 GTest 1 项通过。识别测试把产品名称设为 `PCCOMM-NAV`、打乱 `ttyACM` 编号，并验证仅接口字符串匹配及多个匹配时的数量检测；Python 语法检查和 `git diff --check` 通过。当前系统没有 `ttyACM` 设备，未刷入新固件，也未做重新插拔后的实板收发或双路联调。
 
+## 2026-10-12 — RViz 固定默认不启动
+
+- 改动：`mas2027_nav_bringup/launch/nav_executor_launch.py` 将 `use_rviz` 默认值固定为 `false`，不再根据 `DISPLAY` 或 `WAYLAND_DISPLAY` 自动开启；需要图形窗口时显式传 `use_rviz:=True`。`docs/online_navigation.md` 同步更新说明。
+- 验证：有无 `DISPLAY` 时，`ros2 launch ... --show-args` 均显示 `use_rviz` 默认 `false`；Python 语法检查与 `git diff --check` 通过。未启动真实硬件或 RViz。
+
+## 2026-10-12 — 无图形显示时默认跳过 RViz
+
+- 改动：检查最近三次导航启动日志和 RViz core，确认最近两次在没有图形显示环境的 SSH 会话中因 Qt 无法连接 display 而中止，随后 RViz 退出事件关闭整套导航。`mas2027_nav_bringup/launch/nav_executor_launch.py` 现在仅在有 `DISPLAY` 或 `WAYLAND_DISPLAY` 时默认启动 RViz，仍可通过 `use_rviz` 显式覆盖；`docs/online_navigation.md` 更新启动说明。较早一次另见 Foxglove 8766 端口被占用，以及 MID360 驱动中止，后者缺少崩溃堆栈，尚不能确定原因。
+- 验证：无 `DISPLAY`/`WAYLAND_DISPLAY` 时 `ros2 launch ... --show-args` 显示 `use_rviz` 默认 `false`，设置 `DISPLAY=:0` 时显示默认 `true`；Python 语法检查与 `git diff --check` 通过。未启动真实硬件或 RViz 窗口，尚未验证图形桌面中的 RViz 显示。
+
+## 2026-10-12 — 修复在线导航启动时参数声明被误拒绝
+
+- 改动：`mas2027_nav_executor/src/path_planner/path_planner.cpp` 在 MINCO 注册运行时参数回调之前声明并校验 `planner.online_global_map.*` 启动参数，避免在线模式启动时把参数声明误判为运行时改参并使导航执行器退出；运行时只读设置仍保持只读。
+- 验证：`mas2027_nav_executor` Release 构建通过；真实双雷达和控制板下启动 `nav_executor_launch.py use_rviz:=False`，导航执行器成功创建在线累计地图，ROS 节点持续运行，`/Odometry` 与 `/cloud_registered_full` 持续发布，底盘指令采样为零速度。CDC1 连续多个 5 秒窗口约 50 Hz 发送、500 Hz CRC 有效接收，发送失败与 CRC 错误均为 0。未发送导航目标、未验证实车运动或 RViz 窗口。
+
+## 2026-10-10 — 删除双串口持续发送脚本并恢复导航系统唯一指令来源
+
+- 改动：删除 `mas2027_nav_bringup/scripts/dual_serial_zero_bench.sh`；从 `nav_serial_bridge` 移除仅供该脚本使用的 `force_zero` 参数，CDC1 指令仍只订阅导航系统的 `/nav_executor/chassis_cmd`，指令缺失或超过 300 ms 时发送零速度。视觉工程 `vision_serial_bench` 移除参数 `0` 的无限时长模式，保留有时长上限的独立台架测试。更新本仓库 `src/README.md` 与视觉工程 `README.MD`，清除脚本及 `force_zero` 使用说明。
+- 验证：导航桥和视觉台架程序重新编译通过；虚拟串口向导航话题发布 `vx=1.25`、`vy=-0.5`，读取 179 个 CRC 有效帧，其中 126 帧为对应非零指令，停止发布后出现零速度帧。源码与当前说明中已无脚本或 `force_zero` 引用，视觉工程 `git diff --check` 通过。未在真实底盘发送非零速度，未复测双路长时间运行或板端接收丢包率。
+
+## 2026-10-10 — 增加视觉与导航双串口持续零指令台架脚本
+
+- 改动：新增 `mas2027_nav_bringup/scripts/dual_serial_zero_bench.sh`，一条命令构建并持续启动视觉 CDC0 与导航 CDC1，直接启动导航节点可执行文件以便退出时回收进程；按 Ctrl+C 或任一路退出时关闭两路。视觉工程 `vision_serial_bench` 的参数 `0` 改为无限时长，持续发送零目标角与不开火标志，并消费姿态队列。`nav_serial_bridge` 增加默认关闭的 `force_zero` 参数；脚本启用此参数，使导航端即使收到 ROS 速度指令也只发送零速度与 `nav_state=0`。更新本仓库 `src/README.md` 和视觉工程 `README.MD` 的运行方法。
+- 验证：脚本语法检查通过，导航与视觉台架程序构建通过。真实控制板短跑时视觉 CDC0 写入约 250 Hz、接收约 500 Hz，导航 CDC1 写入约 50 Hz、接收约 500 Hz；主机写入、CRC、失步和视觉姿态队列错误计数均为 0。Ctrl+C 后视觉线程退出，`fuser` 确认 CDC0/CDC1 均释放。虚拟串口测试向导航桥连续发布非零 ROS 指令，收到 154 个 CRC 有效下行帧，均为零速度、`nav_state=0`。未让脚本长时间连续运行，未读取板端接收计数，因此不能计算真实下行丢包率；未在实车上测试。
+
+## 2026-10-10 — 视觉 CDC0 改用独立协议并与导航 CDC1 双路台架测试
+
+- 改动：桌面视觉工程 `/home/mas/桌面/mas_vision` 的 `hardware/serial` 改按控制板 `module_vision` 协议接收 20 字节 `0x5A + mode + q[4] + CRC16` 帧，发送 12 字节 `0xA5 + yaw + pitch + fire_advice + CRC16` 帧；无有效目标时发送零角度且不开火。视觉主进程和构建移除旧 ROS2/UDP 导航中转，并删除 `ros2_comm`、`ros2_thread` 源码和旧 `ros2.yaml`，视觉包不再包含导航字段；CDC0 与导航桥的 CDC1 各自通信。`threads/serial_thread` 改用固定 4 ms 时刻发送并输出三秒频率诊断；新增 `vision_serial_bench` 无相机零目标台架入口，并定期消费姿态队列。视觉 `README.MD` 与本仓库 `src/README.md` 增加双路复测命令和计数解释。
+- 验证：桌面视觉工程 `base`、`vision_serial_bench` 均编译通过；控制板 CDC0 单独读取 1 秒得到 502 个连续、CRC 有效的 20 字节姿态帧。真实控制板 CDC0/CDC1 同时运行 30 秒，视觉十个完整 3 秒窗口累计写入 7501 帧（约 250 Hz）、CRC 有效回传 15004 帧（约 500 Hz），`tx_err=0`、`crc_errors=0`、`dropped_bytes=0`、`queue_dropped=0`；导航六个完整 5 秒窗口累计写入 1503 帧（约 50 Hz）、CRC 有效回传 15022 帧（约 500 Hz），`tx_failed=0`、`rx_crc_bad=0`、`rx_discarded=0`，最大主机写入间隔约 20.31 ms。旧 ROS2 中转源码删除后再次构建通过，源码扫描无旧接口引用，`git diff --check` 通过。未运行完整相机/自瞄流程，未发送非零速度或开火命令；未读取固件接收计数，主机写入数不能证明板端收到每帧，当前协议也不能计算真实端到端丢包率。
+
+## 2026-10-10 — 增加导航 CDC1 频率与链路质量诊断
+
+- 改动：`mas2027_utils/nav_serial_bridge/src/nav_serial_bridge.cpp` 每 5 秒记录主机成功写入帧数、实际频率、写入失败和最大写入间隔，以及板子回传的 CRC 有效帧数、频率、CRC 不符候选帧、总字节和失步丢弃字节。`README.md` 增加仅有控制板时的零速度台架测试方法，并说明现有固件没有下行命令序号/回执，主机写入成功不能等同板子收到，回传计数也不能严格推算上行丢帧。
+- 验证：`nav_serial_bridge` Release 构建通过；真实 CDC1 在无 ROS 运动指令下运行约 32 秒，六个完整 5 秒窗口合计 30.04 秒，主机成功写入 1502 帧（约 50.0 Hz）、写入失败 0、最大写入间隔 20.23 ms；回传 CRC 有效 15011 帧（约 499.7 Hz）、CRC 不符 0、失步丢弃 0、收到 165121 字节，日志存于工作区 `.scratch/nav_serial_board_2026-10-10.log`。测试结束后串口已释放，`git diff --check` 通过。未发送非零速度，未通过固件接收计数或序号回显测量真正的上行/下行丢包率，也未验证更长时间运行或断线重连。
+
+## 2026-10-10 — 导航改用 CDC1 专用串口直发底盘指令
+
+- 改动：移除旧 `mas2027_utils/ros2_comm` UDP 桥及其无消费者的 `RefereeData` 消息，新增 `mas2027_utils/nav_serial_bridge`。新桥订阅 `/nav_executor/chassis_cmd`，以 115200 8N1、50 Hz 向 CDC1 的 `if02` 固定设备路径直接发送 `0xB5 + float vx + float vy + uint8 nav_state + CRC16`；暂不发送 mode 或角速度。无指令、速度为零、速度非有限值或 ROS 指令超过 300 ms 时发送零速度与 `nav_state=0`；断线后按 1 秒间隔重连，并等到新指令才恢复非零输出。接收方向校验并统计 `0x5B` 裁判数据帧，不发布旧 `/referee_data`。bringup 默认改启用 `nav_serial_bridge`，提供 `use_nav_serial`、`nav_serial_device` 参数；更新当前 README、在线导航、区域控制和录包脚本说明。桌面 `/home/mas/桌面/mas_vision/config/serial_config.yaml` 改用视觉接口 `if00`，避免与导航 `if02` 抢占。清理旧包的本地 build/install 产物。
+- 验证：`nav_serial_bridge` 与 `mas2027_nav_bringup` Release 构建通过；协议 GTest 3 项通过，包含现场零速帧、回传 CRC 和非零速度字节序。隔离 ROS 域的虚拟串口节点测试观察到初始停车帧、`vx=1.0/vy=-0.5` 的有效运动帧，以及停止发布约 300 ms 后恢复停车帧；消息带 `mode=7` 时串口帧仍不含 mode。真实 CDC1 接口无运动指令运行 4 秒，接收 1491 帧 CRC 有效、0 帧 CRC 错误；先前手动向同接口发送 100 帧有效零速度、无短写。视觉 `if00` 已能独立打开并收到数据，配置指向该固定路径；`ros2 launch --show-args` 与 `git diff --check` 通过。未在真实底盘发送非零速度、未验证车轮执行、视觉完整进程或断线重连现场行为；当前固件协议不支持区域 mode。
+
+## 2026-10-07 — 按参考 Point-LIO 改造定位批量更新与稠密点云链路
+
+- 改动：`small_point_lio` 将降采样后的定位点按最长 5 ms、最多 128 点分组，并在 IMU 更新前刷新；组内点按预测运动补偿到批末，一次线性化并合并信息矩阵完成单次 ESKF 状态及协方差更新，再把定位点写入有容量上限的 iVox。现有完整点云逐点时间补偿和整帧边界保留。bringup 启用批量更新后的 odom 发布，最小发布间隔 10 ms；完整点云单独设置 50 ms 最小发布间隔，未发布帧不组装 ROS 点云消息。ROGMap 改订阅 `/cloud_registered_full`，`/cloud_registered` 保留兼容输出；录包脚本和在线导航、Foxglove、LIO 文档同步。涉及 Small Point-LIO 滤波器、处理循环、节点与参数，执行器 ROGMap 配置、录包脚本和测试。
+- 验证：`small_point_lio`、`mas2027_nav_executor`、`mas2027_nav_bringup` Release 构建通过；新增批量滤波测试验证两项有效观测合并后的状态、协方差以及无效观测不改变状态，连同既有整帧边界测试 2/2 通过；YAML 解析、ROGMap 订阅话题检查与 `git diff --check` 通过。完整 `colcon test` 的两个 GTest 通过，但该包既有 cpplint、flake8 和 CMake lint 仍失败，未将其算作功能测试失败。未接入真实 MID360、未测量实车 odom/点云频率、CPU 与 ROGMap 丢帧，也未验证高速旋转时的定位精度；100 Hz 是配置上限目标，不是现场实测结果。
+
+## 2026-10-07 — 精简重复依赖与导航地图安装内容
+
+- 改动：移除本仓库没有任何包依赖或引用的 `third_party/common_libs` 包及其重复 `small_gicp` 头文件；`odom_localizer` 继续使用自带的完整 `3rdparty/small_gicp`。`mas2027_nav_bringup/CMakeLists.txt` 从 `config/navigation_map.yaml` 和所选地图 YAML 读取当前 PCD、地图 YAML、PGM 与 terrain msgpack，只把这组资源安装到 share；历史地图仍保留在源码。launch 目录只安装 `.py` 文件，避免复制本地 `__pycache__`。`mas2027_robot_description/package.xml` 移除未被该包使用的 joint state publisher、GUI、RViz 和 xacro 运行依赖；录包脚本的过期 launch 提示改为当前入口，并更新 README 换图说明。离线 `pcd2ele`、`pcd2esdf` 工具保持可用。
+- 验证：bringup 与机器人描述包在当前工作区和隔离临时安装目录均构建通过；`odom_localizer` 与 `map_server` 在不依赖旧 `common_libs` 安装前缀的临时构建中通过。临时安装只含清单选中的四个地图文件，launch 中没有 `.pyc`；bringup share 约 18 MB，源码中整套历史地图约 38 MB。`ros2 launch ... --show-args`、bash 语法检查、launch Python 编译、`package.xml` XML 解析、包发现检查及 `git diff --check` 通过。未启动导航或底盘、未执行完整工作区测试，也未验证仓库外是否有项目依赖已移除的 `common_libs`；旧的增量安装目录可能保留以前复制的地图文件，交付体积以全新安装为准。
+
+## 2026-10-07 — 修复轨迹准入与建图位姿竞争，补强在线地形记忆和性能留档
+
+- 改动：MINCO 优化失败但旧轨迹仍安全时返回规划失败并写 ROS 告警，使 TaskManager 保留既有轨迹准入时间戳；不支持热更新的 `planner.*` 参数现在明确拒绝设置，避免显示值与生效值不一致。ROGMap 的里程计回调只写受锁保护的输入位姿，点云回调复制成对的位姿与接收时间，地图线程独占算法层 `robot_state_`。在线累计地图对特殊地形增加连续 3 帧确认、连续 10 帧完整普通地面纠错，并拒绝同一粗栅格内互相冲突的特殊标签；每 5 秒记录累计图格数、容量和更新耗时。ROGMap 与 MINCO 性能 CSV 在文件名中加入本次启动时间，保留旧运行文件；ROGMap 明细 CSV 路径移至工作区 `.scratch`。涉及执行器规划、累计地图和配置、ROGMap ROS 适配层与性能监视、MINCO 性能监视、在线地图测试及相应说明文档。
+- 验证：`rog_map`、`mas2027_nav_executor` Release 构建通过；两包 CTest 分别 12 项与 72 项，均无失败；新增在线地形测试覆盖单次误标签不确认、连续确认、未知观测保留和完整普通地面纠错。`planner_params.yaml` 解析及 `git diff --check` 通过。未进行实车行驶、真实坡道入口的 mode 提前量测试、线程竞争检测器运行、CSV 实际多次启动留档检查或接近 200 万格的性能基准；B2 累计图任务路线接入与统一导航状态话题仍待后续实施。
+
+## 2026-10-06 — 坡道长边设为全局硬障碍
+
+- 改动：按坡道标签轮廓和上升轴生成坡面两侧一格宽的障碍带，入口与出口端面保持可通行；移除上一版只按行进方向夹角限制侧入的规则。`terrain_semantics.hpp` 为实时和先验地形提供同一障碍生成及线段角点检查逻辑；先验 `TerrainGrid` 将侧边写入 `/planning_constraints`，在线 `OnlineGlobalMap` 将侧边写入累计占据图和距离场。SMAC 全局搜索、在线回退搜索、局部路径与最终轨迹校验均禁止经过侧边障碍。更新 `docs/terrain_semantics.md` 和相关矩形、斜向坡道测试；此前工作区中的其他未提交改动保持原状。
+- 验证：`mas2027_nav_executor`、`map_server` Release 构建通过；执行器 5 个 CTest 套件、ROGMap 1 个套件，以及加载工作区 `install/setup.bash` 后的地图服务 1 个套件通过。测试覆盖先验规划约束格值、坡道侧边阻断、端面放行、斜向坡道、在线累计图侧边持久障碍。`git diff --check` 通过。未做实车坡道、RViz 现场画面或复杂不规则坡道轮廓验证；仅标签的先验图仍无法区分真实上坡方向。
+
+## 2026-10-06 — 在线累计地形、坡道上升轴和侧入约束
+
+- 改动：ROGMap 薄地面高度拟合同时输出坡道标签与指向高度增加的单位向量；`OnlineGlobalMap` 将已观测特殊地形和坡向按 odom 栅格累计，普通/未知观测与局部滑窗移走不会抹除，并发布 `/nav_executor/online_terrain_map`、`/nav_executor/online_terrain_uphill` 与累计彩色标记，RViz 默认显示累计区域。区域模式改读累计图。先验 `map_server` 接受可选的 msgpack `uphill` 数组并发布 `/terrain_uphill_map`；旧的仅标签地图从狭长坡道连通区域推断无符号长轴。`terrain_semantics.hpp` 统一两种来源的坡道边界规则，SMAC 全局搜索、在线回退搜索、局部路径和最终轨迹校验拒绝从坡道侧面穿越；先验和在线模式共用 45° 入口阈值。涉及 ROGMap 投影/快照、地图服务、执行器累计图/地形网格/搜索与轨迹校验、RViz 配置和 `docs/terrain_semantics.md`，未覆盖工作区原有 MINCO 净空优化等未提交改动。
+- 验证：`map_server`、`rog_map`、`mas2027_nav_executor`、`mas2027_nav_bringup` Release 构建通过；前三包 CTest 通过。新增合成测试覆盖上升向量方向、特殊地形离开滑窗后的保留、坡道端面/侧面通行、先验长轴推断及显式向量、SMAC 入口绕行。RViz 和节点 YAML 解析、`git diff --check` 通过。bringup 包 CTest 的 `ament_copyright`/`ament_pep257` 在未改动的 `launch/nav_executor_launch.py` 和 `scripts/measure_lidar_mount.py` 上失败。未做实车坡道、跨进程持久化或现场 CPU 负载验证；ROGMap 目前没有在线识别起伏地形 `7`，没有高程的先验标签图只能推断长轴、无法判断哪端更高，近方形/分叉坡道可能没有可靠方向。
+
+## 2026-09-30 — 在线局部种子净空不足时优选更宽绕行
+
+- 改动：根据现场 259 秒运行的 78 次 MINCO 净空碰撞拒发，`LocalPathProcessor` 在原局部种子仍为自由格、但净空低于轨迹有效阈值时，尝试以现有 MINCO `safe_dist`（当前 0.33 m）作为优选净空搜索滚动窗口内的绕行。候选路径在近场沿用原有豁免口径，近场外的栅格路径及稀疏化线段达到优选净空、且稀疏点不超过 16 个时才替换原种子；无可行更宽绕行时保留原种子，优选搜索最多展开 8000 格以限制计算时间。`MincoPlanner` 将 `safe_dist` 传给局部路径处理器，并提供 `minco_optimizer.clearance_detour_enable` YAML 开关以独立停用该策略。原占用阻断绕行、0.26 m 有效硬校验、运行时监视和制动保持原判据。涉及 `local_path_processor.{hpp,cpp}`、`minco_planner.cpp`、`planner_params.yaml`、在线导航测试。
+- 验证：执行器 Release 构建通过，66 项 CTest 全通过；新增测试覆盖更宽通道可用时采用绕行、目标处无更宽通道时保留原种子、关闭开关时沿用原路径，并逐段抽样验证候选稀疏路径净空。隔离 ROS 域 92 的合成平地及竖直障碍闭环均生成路径、轨迹和运动指令，点云中断后速度指令归零；竖直障碍运行日志确认优选绕行分支被触发。开启逐次计时的该合成场景共 75 次重规划，局部路径处理耗时中位数/95 分位 0.55/1.64 ms，整轮重规划 2.66/6.79 ms，未见紧急停止。`git diff --check` 通过。未重放本次现场点云或同路线实车复测，不能据合成结果断言现场 78 次碰撞拒发会下降。
+
+## 2026-09-30 — 减少在线 ROGMap 二维投影的重复体素索引计算
+
+- 改动：`mas2027_perception/rog_map/src/rog_map/rog_map.cpp` 的投影柱扫描预计算各高度层的哈希偏移和世界坐标高度，每列只做一次地图边界检查与基础哈希；已观测和占用体素复用同一个索引读取更新时间及命中时间。保持原有体素分类、投影判据、碰撞净空阈值和点云超时制动逻辑。
+- 验证：`rog_map`、`mas2027_nav_executor` Release 构建通过；两包 CTest 共 77 项通过。隔离 ROS 域 92 的相同合成平地在线闭环中，修改前 188 帧的投影耗时中位数/95 分位为 24.95/40.47 ms，两次修改后运行分别为 19.37/33.78 ms（189 帧）和 18.04/30.83 ms（188 帧）；地图总更新时间中位数由 55.87 ms 降至 50.98/50.06 ms。两次均产生全局路径、MINCO 轨迹和运动指令，点云中断后指令归零；另一次带竖直障碍的 188 帧合成运行均识别到占用格，继续生成路径和轨迹并在点云中断后停止。未做相同实车点云的前后对比，也未验证长期运行或现场 CPU 负载下的收益。
+
+## 2026-09-30 — 开启在线规划逐次耗时记录
+
+- 改动：`mas2027_nav_executor/config/planner_params.yaml` 开启 MINCO 性能记录，将每轮全局搜索、局部搜索、优化和总重规划耗时写入工作区 `.scratch/minco_perf_detailed.csv`；保留控制循环打印关闭。供下一次正常 online 往返后定位实际计算瓶颈，不改变规划参数或安全判据。
+- 验证：核对性能参数名与 `PlannerPerformanceMonitor` 的 CSV 列定义，解析 YAML 并检查输出目录可写，`git diff --check` 通过。尚未重启现场导航，未产生实车计时样本；性能 CSV 会在每次导航进程启动时重新写入。
+
+## 2026-09-30 — 在线 MINCO 按地图分辨率加密障碍代价采样
+
+- 改动：针对 15:04 在线日志中全局路线可用、局部种子接近 0.26 m 硬阈值，而平滑轨迹出现 0.209–0.259 m 净空并反复被 `COLLISION` 拒发的问题，修复优化器固定每段 16 个积分点可能漏掉窄距离场低谷的采样缺口。MINCO 每段障碍代价积分改为按段时长、局部速度上限及实时 ROGMap 分辨率自适应加密，最多 256 点；配置的 `integral_res` 仍为下限。最终轨迹硬校验、运行时制动和 0.26 m 有效净空阈值未改。涉及 `minco_optimizer.{hpp,cpp}` 和在线回归测试；工作区原有 `node.map_source: prior` 改动保留。
+- 验证：执行器 Release 构建通过；执行器 CTest 共 64 项全通过，新增用例用仅 2 点基础积分数验证首轮优化确实采样到窄在线障碍；`git diff --check` 通过。隔离 ROS 域 92 的 1 m/s 合成平地闭环发布 81 条轨迹，前进约 9.38 m，点云中断后最终速度指令为零；该次 74 次 MINCO 优化中位 1.68 ms、95 分位 2.92 ms、最大 3.32 ms，未见 `COLLISION` 拒发。未取得 15:04 实车点云/距离场快照，不能离线重放同一障碍；未做实车窄道、动态障碍或 3–4 m/s 下的实时性能与急停频率复测。
+
+## 2026-09-30 — 回退墙体分类并对比在线与先验模式轨迹告警
+
+- 改动：按要求撤回尚未提交的墙体几何分类、墙体/临时障碍分层、持久墙体查询、累计图任务搜索接线及其专用参数、RViz 图层、测试和说明，使这些组件恢复到已提交的 `6491a71` 状态。保留已有累计地图、地面过滤和规划净空检查；不覆盖工作区另行设置的 `node.map_source: prior`。先前 2026-09-29 墙体实验记录作为历史保留，本条明确其代码已撤回。主要涉及执行器 environment/PathPlanner/MINCO、ROGMap、规划配置、RViz 与相关文档。
+- 验证：`rog_map`、`mas2027_nav_executor`、`mas2027_nav_bringup` 三包 Release 重新构建通过；执行器 5 个和 ROGMap 1 个 CTest 套件全部通过；源码检索确认墙体分类器、记忆查询及 `/nav_executor/persistent_walls` 接线已移除，`git diff --check` 通过。对比 2026-09-30 15:04 在线运行（2 个目标均到达：10 次 MINCO 轨迹因碰撞未发布、4 次紧急停止、6 次执行侧制动）与 15:08 先验运行（3 个目标均到达：分别 1、2、1 次），先验模式告警明显较少，但仍有轨迹净空低于 0.26 m 的拒绝。两次目标和地图源不同，日志不能单独证明墙体分类是差异原因；先验运行本身不启用墙体分类。未在回退后的程序上进行实车行驶或同路线 A/B 复测，也未改变 0.26 m 碰撞净空阈值和安全制动逻辑。
+
+## 2026-09-29 — 墙体分层记忆、临时障碍清除与累计地图任务搜索
+
+- 改动：新增 `WallDetector`，根据真实近期占用柱的高度、竖直比例、连续长度与沿线覆盖率识别墙面几何，RANSAC/PCA 仅标记实际支持格、不填补门洞。`OnlineGlobalMap` 默认使用墙体与临时障碍分层：同一 odom 格至少 6 次不同真实命中且稳定至少 3 秒后确认墙体，离开局部窗口仍保留；其他障碍立即阻断，完整新鲜自由观测立即清除或最后真实命中 3 秒后过期，恢复已知自由或未知。ROGMap 新增真实 ray miss 时间与竖直自由支持元数据，命中/观测时间使用 double 保留 epoch 子秒精度；删除确认墙体要求连续 8 次完整新鲜竖直自由证据，概率衰减、重复快照及仅地面回波不能误删。新增 `WallMemoryQuery`，局部优化及指令安全查询结合实时图与确认墙体，实时查询失败与点云超时仍拒绝；任务搜索接入不可变累计快照，每次搜索固定版本，局部轨迹继续受实时窗口约束。新增 `/nav_executor/persistent_walls`、YAML 参数、RViz 默认关闭的墙体诊断显示，更新 README 与在线导航说明；关闭墙体模式保留旧累计证据与局部搜索行为。主要涉及执行器 environment/PathPlanner/MINCO 上下文、ROGMap 概率图/投影/快照、配置、测试及文档。
+- 验证：rog_map、mas2027_nav_executor、mas2027_nav_bringup Release 构建通过，仍有原 PCL/fmt 告警；最终执行器 6 套件 58 项、ROGMap 11 项全部通过（新增墙体相关 19 项及时间精度回归），覆盖几何区分、稳定确认、重复/过期证据、窗口外保留、临时障碍清除、真实自由纠错、实时超时、墙体边界净空、命令制动和窗口外全局路线。域 105 的 25 秒实际节点合成验证：紧凑静止人体形状先阻断再清除、未记为墙体，21 格墙体经历仅地面回波与离开窗口后仍保留；域 106 的理想底盘闭环最大速度约 1.0 m/s，推进 x≈8.638 m，累计图 82×84→164×84，历史自由格保留，点云中断后地图过期制动、最终指令为零。日志/夹具在工作区 `.scratch/wall-memory/`，未连接硬件、未修改用户运行进程。YAML/RViz 解析、安装参数一致性及 `git diff --check` 通过。未验证真实人体/墙面、家具误分类、稀疏/弯曲/短墙识别、实车制动、定位漂移或大面积密集累计图性能；本功能识别墙面形状而非人体语义，记忆只在本次会话内保留。
+
 ## 2026-09-29 — 修复在线回退路径净空检查与 SMAC 拒绝诊断
 
 - 改动：针对 17:40–17:46 运行日志中的大量 SMAC/MINCO 失败，修复 `GlobalPathSearcher` 在线子目标回退只检查终点净空、不检查途经格的问题。启用 SMAC 时，回退的途经格与斜向两侧格共用 SMAC 最低净空，距离场无效或非有限时拒绝；每轮按格缓存判定，仅保留与直接 SMAC 一致的起点已有位置豁免。`planner_params.yaml` 的最低净空由 0.25 提到 0.27 m，比当前轨迹静态有效硬阈值 0.26 m 留 1 cm 余量，不修改碰撞、动态安全或脱困保护。SMAC 目标拒绝区分栅格代价、ESDF 净空不足和查询不可用；端点诊断将 `cost_traversable` 与包含净空的 `smac_traversable` 分开，打印净空、阈值、查询状态及快照/投影/掩码/距离场序号，修正“目标可通行但不可达”的误导文案。`LocalPathProcessor` 起点负净空新增位置、格子代价和快照证据日志，保留原有制动与安全判据。更新在线导航说明，新增 7 项回归用例。

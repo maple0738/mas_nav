@@ -1,6 +1,7 @@
 #include "mas2027_nav_executor/path_planner/path_planner.hpp"
 
 #include <cmath>
+#include <chrono>
 #include <limits>
 #include <stdexcept>
 
@@ -11,6 +12,50 @@
 #include "rog_map_ros/rog_map_ros2.hpp"
 #include "tf2/exceptions.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include "visualization_msgs/msg/marker.hpp"
+
+namespace {
+
+visualization_msgs::msg::MarkerArray terrainMarkers(
+  const nav_msgs::msg::OccupancyGrid & grid)
+{
+  visualization_msgs::msg::MarkerArray result;
+  result.markers.resize(3);
+  for (size_t i = 0; i < result.markers.size(); ++i) {
+    auto & marker = result.markers[i];
+    marker.header = grid.header;
+    marker.ns = "persistent_terrain";
+    marker.id = static_cast<int>(i);
+    marker.type = visualization_msgs::msg::Marker::CUBE_LIST;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+    marker.pose.orientation.w = 1.0;
+    marker.scale.x = grid.info.resolution;
+    marker.scale.y = grid.info.resolution;
+    marker.scale.z = 0.03;
+    marker.color.r = i == 0 ? 1.0F : i == 2 ? 0.95F : 0.0F;
+    marker.color.g = i == 0 ? 0.55F : i == 2 ? 0.85F : 0.85F;
+    marker.color.b = i == 1 ? 1.0F : 0.0F;
+    marker.color.a = 0.8F;
+  }
+  for (size_t index = 0; index < grid.data.size(); ++index) {
+    const int8_t label = grid.data[index];
+    const size_t category = label == 5 ? 0U : label == 6 ? 1U : label == 7 ? 2U : 3U;
+    if (category == 3U) continue;
+    geometry_msgs::msg::Point point;
+    point.x = grid.info.origin.position.x +
+      (static_cast<unsigned int>(index % grid.info.width) + 0.5) * grid.info.resolution;
+    point.y = grid.info.origin.position.y +
+      (static_cast<unsigned int>(index / grid.info.width) + 0.5) * grid.info.resolution;
+    point.z = 0.06;
+    result.markers[category].points.push_back(point);
+  }
+  for (auto & marker : result.markers) {
+    if (marker.points.empty()) marker.action = visualization_msgs::msg::Marker::DELETE;
+  }
+  return result;
+}
+
+}  // namespace
 
 namespace mas2027_nav_executor {
 
@@ -33,6 +78,35 @@ PathPlanner::PathPlanner(std::shared_ptr<TerrainGrid> terrain, double odom_timeo
   // ROGMap supplies live geometry; a non-null terrain adds prior global constraints.
   planner_ = std::make_shared<minco_planner::MincoPlanner>();
   planner_->setMap(rog_map_->queryInterface());
+  // Declare startup-only map settings before MincoPlanner installs its runtime
+  // parameter callback. ROS invokes that callback while declaring parameters.
+  rcl_interfaces::msg::ParameterDescriptor global_map_descriptor;
+  global_map_descriptor.read_only = true;
+  global_map_descriptor.description = "Online global map setting selected at startup";
+  const bool accumulate = node_->declare_parameter<bool>("planner.online_global_map.enabled", true, global_map_descriptor);
+  OnlineGlobalMapConfig global_config;
+  double rate = 0.0;
+  if (!terrain_ && accumulate) {
+    global_config.resolution = node_->declare_parameter<double>("planner.online_global_map.resolution", 0.1, global_map_descriptor);
+    const auto max_cells = node_->declare_parameter<int64_t>("planner.online_global_map.max_cells", 2000000, global_map_descriptor);
+    if (max_cells < 25) throw std::invalid_argument("online_global_map.max_cells must be >= 25");
+    global_config.max_cells = static_cast<size_t>(max_cells);
+    global_config.occupied_increment = node_->declare_parameter<int>("planner.online_global_map.occupied_increment", 3, global_map_descriptor);
+    global_config.free_decrement = node_->declare_parameter<int>("planner.online_global_map.free_decrement", 1, global_map_descriptor);
+    global_config.evidence_limit = node_->declare_parameter<int>("planner.online_global_map.evidence_limit", 5, global_map_descriptor);
+    global_config.occupied_confirmations = node_->declare_parameter<int>("planner.online_global_map.occupied_confirmations", 2, global_map_descriptor);
+    global_config.confirmation_max_gap_s = node_->declare_parameter<double>("planner.online_global_map.confirmation_max_gap_s", 1.5, global_map_descriptor);
+    global_config.terrain_confirmations = node_->declare_parameter<int>("planner.online_global_map.terrain_confirmations", 3, global_map_descriptor);
+    global_config.terrain_clear_confirmations = node_->declare_parameter<int>("planner.online_global_map.terrain_clear_confirmations", 10, global_map_descriptor);
+    rate = node_->declare_parameter<double>("planner.online_global_map.update_rate_hz", 2.0, global_map_descriptor);
+    if (!std::isfinite(rate) || rate <= 0 || rate > 20 ||
+      global_config.resolution < config.resolution ||
+      global_config.resolution / config.resolution > 32 ||
+      std::abs(global_config.resolution / config.resolution -
+        std::round(global_config.resolution / config.resolution)) > 1e-6) {
+      throw std::invalid_argument("invalid online global map rate or resolution (must be an integer ROGMap multiple)");
+    }
+  }
   planner_->configure(node_, "planner", tf_buffer_);
   std::string planning_frame;
   node_->get_parameter("planner.frames.rog_frame", planning_frame);
@@ -46,44 +120,46 @@ PathPlanner::PathPlanner(std::shared_ptr<TerrainGrid> terrain, double odom_timeo
     throw std::invalid_argument("online navigation requires exploration.unknown_as_occupied=true");
   }
   planner_->setTerrainGrid(terrain_);
-  rcl_interfaces::msg::ParameterDescriptor global_map_descriptor;
-  global_map_descriptor.read_only = true;
-  global_map_descriptor.description = "Online global map setting selected at startup";
-  const bool accumulate = node_->declare_parameter<bool>("planner.online_global_map.enabled", true, global_map_descriptor);
   if (!terrain_ && accumulate) {
-    OnlineGlobalMapConfig global_config;
-    global_config.resolution = node_->declare_parameter<double>("planner.online_global_map.resolution", 0.1, global_map_descriptor);
-    const auto max_cells = node_->declare_parameter<int64_t>("planner.online_global_map.max_cells", 2000000, global_map_descriptor);
-    if (max_cells < 25) throw std::invalid_argument("online_global_map.max_cells must be >= 25");
-    global_config.max_cells = static_cast<size_t>(max_cells);
-    global_config.occupied_increment = node_->declare_parameter<int>("planner.online_global_map.occupied_increment", 3, global_map_descriptor);
-    global_config.free_decrement = node_->declare_parameter<int>("planner.online_global_map.free_decrement", 1, global_map_descriptor);
-    global_config.evidence_limit = node_->declare_parameter<int>("planner.online_global_map.evidence_limit", 5, global_map_descriptor);
-    global_config.occupied_confirmations = node_->declare_parameter<int>("planner.online_global_map.occupied_confirmations", 2, global_map_descriptor);
-    global_config.confirmation_max_gap_s = node_->declare_parameter<double>("planner.online_global_map.confirmation_max_gap_s", 1.5, global_map_descriptor);
-    const double rate = node_->declare_parameter<double>("planner.online_global_map.update_rate_hz", 2.0, global_map_descriptor);
-    if (!std::isfinite(rate) || rate <= 0 || rate > 20 ||
-      global_config.resolution < config.resolution ||
-      global_config.resolution / config.resolution > 32 ||
-      std::abs(global_config.resolution / config.resolution -
-        std::round(global_config.resolution / config.resolution)) > 1e-6) {
-      throw std::invalid_argument("invalid online global map rate or resolution (must be an integer ROGMap multiple)");
-    }
-    online_global_map_ = std::make_unique<OnlineGlobalMap>(global_config, odom_frame);
+    online_global_map_ = std::make_shared<OnlineGlobalMap>(global_config, odom_frame);
+    planner_->setOnlineTerrainMap(online_global_map_);
     global_map_pub_ = rclcpp::create_publisher<nav_msgs::msg::OccupancyGrid>(
       *node_,
       "/nav_executor/online_global_map", rclcpp::QoS(1).reliable().transient_local());
+    global_terrain_pub_ = rclcpp::create_publisher<nav_msgs::msg::OccupancyGrid>(
+      *node_, "/nav_executor/online_terrain_map",
+      rclcpp::QoS(1).reliable().transient_local());
+    global_uphill_pub_ = rclcpp::create_publisher<sensor_msgs::msg::Image>(
+      *node_, "/nav_executor/online_terrain_uphill",
+      rclcpp::QoS(1).reliable().transient_local());
+    global_terrain_markers_pub_ = rclcpp::create_publisher<visualization_msgs::msg::MarkerArray>(
+      *node_, "/nav_executor/online_terrain_markers",
+      rclcpp::QoS(1).reliable().transient_local());
     const auto adapter = std::dynamic_pointer_cast<rog_map::QueryAdapter>(rog_map_->queryInterface());
     if (!adapter) throw std::runtime_error("ROGMap snapshot adapter unavailable for global accumulation");
     global_map_callback_group_ = node_->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     global_map_timer_ = node_->create_wall_timer(std::chrono::duration<double>(1.0 / rate),
-      [this, adapter]() {
+      [this, adapter, max_cells = global_config.max_cells]() {
         const auto source = adapter->snapshot();
         if (!source || !std::isfinite(source->stamp) ||
           std::abs(node_->now().seconds() - source->stamp) > rog_map_timeout_s_) return;
+        const auto update_started = std::chrono::steady_clock::now();
         const auto result = online_global_map_->update(*source);
+        const double update_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - update_started).count();
         if (result == OnlineGlobalMap::UpdateResult::UPDATED) {
-          if (const auto snapshot = online_global_map_->snapshot()) global_map_pub_->publish(snapshot->grid());
+          if (const auto snapshot = online_global_map_->snapshot()) {
+            const auto cells = static_cast<size_t>(snapshot->sizeX()) * snapshot->sizeY();
+            RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+              "Online global map: cells=%zu/%zu revision=%llu update=%.1f ms",
+              cells, max_cells,
+              static_cast<unsigned long long>(snapshot->revision()), update_ms);
+            global_map_pub_->publish(snapshot->grid());
+            const auto terrain_grid = snapshot->terrainGrid();
+            global_terrain_pub_->publish(terrain_grid);
+            global_uphill_pub_->publish(snapshot->uphillImage());
+            global_terrain_markers_pub_->publish(terrainMarkers(terrain_grid));
+          }
         } else if (result == OnlineGlobalMap::UpdateResult::CELL_LIMIT) {
           RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
             "Online global map reached cell limit; preserving existing history without further growth");

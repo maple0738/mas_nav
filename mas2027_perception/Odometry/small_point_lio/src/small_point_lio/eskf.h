@@ -124,21 +124,48 @@ namespace small_point_lio {
             }
         }
 
-        inline bool update_point() {
-            point_measurement_result measurement_result;
-            h_point(x, measurement_result);
-            if (!measurement_result.valid) {
-                return false;
+        // Linearize all points against one state and apply one covariance update.
+        // The selector supplies the next lidar point to the measurement model.
+        inline std::size_t update_point_batch(std::size_t count,
+                                              const std::function<void(std::size_t)> &select_point) {
+            using Scalar = state::value_type;
+            Eigen::Matrix<Scalar, 12, 12> information = Eigen::Matrix<Scalar, 12, 12>::Zero();
+            Eigen::Matrix<Scalar, 12, 1> residual = Eigen::Matrix<Scalar, 12, 1>::Zero();
+            std::size_t valid_count = 0;
+            for (std::size_t i = 0; i < count; ++i) {
+                select_point(i);
+                point_measurement_result measurement{};
+                h_point(x, measurement);
+                if (!measurement.valid || !std::isfinite(measurement.z) ||
+                    !std::isfinite(measurement.laser_point_cov) || measurement.laser_point_cov <= 0.0 ||
+                    !measurement.H.allFinite()) {
+                    continue;
+                }
+                const Scalar inverse_variance = Scalar(1) / measurement.laser_point_cov;
+                information.noalias() += inverse_variance * measurement.H.transpose() * measurement.H;
+                residual.noalias() += inverse_variance * measurement.H.transpose() * measurement.z;
+                ++valid_count;
             }
-            Eigen::Matrix<state::value_type, state::DIM, 1> PHT = P.template block<state::DIM, 12>(0, 0) * measurement_result.H.transpose();
-            state::value_type temp = measurement_result.H * PHT.topRows(12) + measurement_result.laser_point_cov;
-            if (temp == 0) [[unlikely]] {
-                temp = 1e-6;
+            if (valid_count == 0) {
+                return 0;
             }
-            Eigen::Matrix<state::value_type, state::DIM, 1> K = PHT / temp;
-            x.plus(K * measurement_result.z);
-            P = P - K * measurement_result.H * P.template block<12, state::DIM>(0, 0);
-            return true;
+
+            const Eigen::Matrix<Scalar, 12, 12> system =
+                Eigen::Matrix<Scalar, 12, 12>::Identity() + information * P.template topLeftCorner<12, 12>();
+            Eigen::FullPivLU<Eigen::Matrix<Scalar, 12, 12>> solver(system);
+            if (!solver.isInvertible()) {
+                return 0;
+            }
+            const auto prior_cross = P.template leftCols<12>().eval();
+            const Eigen::Matrix<Scalar, state::DIM, 1> correction = prior_cross * solver.solve(residual);
+            const Eigen::Matrix<Scalar, state::DIM, state::DIM> updated_covariance =
+                P - prior_cross * solver.solve(information * P.template topRows<12>());
+            if (!correction.allFinite() || !updated_covariance.allFinite()) {
+                return 0;
+            }
+            x.plus(correction);
+            P = Scalar(0.5) * (updated_covariance + updated_covariance.transpose()).eval();
+            return valid_count;
         }
 
         inline bool update_imu() {

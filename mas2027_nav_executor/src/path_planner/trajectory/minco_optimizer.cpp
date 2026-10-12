@@ -279,17 +279,35 @@ void MincoOptimizer::constraintsFunctional(const VecDf & T,
   const auto & piece_num = T.size();
 
   // 2. Setup piece-wise sampling
-  const double integralFrac = 1.0 / integral_res;
   VecDf max_pena(4);
   max_pena.setZero();
 
   // 3. Loop over pieces and samples
   for (int i = 0; i < piece_num; i++) {
     const Mat63f & c = coeffs.block<6, 3>(i * 6, 0);
-    const auto & step = T(i) * integralFrac;
     const auto & local_vmax = local_magnitudes(i);
     const auto & local_vmaxSqr = local_vmax * local_vmax;
-    for (int j = 0; j <= integral_res; j++) {
+    // A fixed number of samples per polynomial misses narrow ESDF dips on long
+    // segments. Bound the nominal distance between obstacle-cost samples by a
+    // live map cell, while keeping an upper limit on replan work. The final
+    // trajectory check remains the authority if a segment exceeds this limit.
+    int samples = std::max(1, integral_res);
+    if (map && std::isfinite(T(i)) && T(i) > 0.0 &&
+        std::isfinite(local_vmax) && local_vmax > 0.0 &&
+        std::isfinite(map->resolution()) && map->resolution() > 0.0) {
+      constexpr int kMaxAdaptiveSamples = 256;
+      const double nominal_samples =
+        T(i) * local_vmax / map->resolution();
+      if (std::isfinite(nominal_samples)) {
+        samples = std::max(samples, static_cast<int>(std::ceil(
+          std::min(nominal_samples, static_cast<double>(kMaxAdaptiveSamples)))));
+      } else {
+        samples = std::max(samples, kMaxAdaptiveSamples);
+      }
+    }
+    const double integralFrac = 1.0 / static_cast<double>(samples);
+    const double step = T(i) * integralFrac;
+    for (int j = 0; j <= samples; j++) {
       double s1 = j * step;
       double s2 = s1 * s1;
       double s3 = s2 * s1;
@@ -374,7 +392,7 @@ void MincoOptimizer::constraintsFunctional(const VecDf & T,
 
       // For attract point cost
       if (weightAtt > 0.0) {
-        const auto is_end = ((j == integral_res) && (i != piece_num - 1));
+        const auto is_end = ((j == samples) && (i != piece_num - 1));
         const auto idx = is_end ? i + 1 : i;
         if (is_end) {
           Vec3f p_a = pos - waypoint_attractor.col(idx);
@@ -393,7 +411,7 @@ void MincoOptimizer::constraintsFunctional(const VecDf & T,
         }
       }
 
-      const auto node = (j == 0 || j == integral_res) ? 0.5 : 1.0;
+      const auto node = (j == 0 || j == samples) ? 0.5 : 1.0;
       const double alpha = j * integralFrac;
       partialGradByCoeffs.block<6, 3>(i * 6, 0) +=
         (beta0 * gradPos.transpose() + beta1 * gradVel.transpose() + beta2 * gradAcc.transpose()) * node *

@@ -85,7 +85,7 @@ CellType classifyCell(
 
 }  // namespace
 
-std::vector<uint8_t> ProjectionLayer::terrainLabels() const
+TerrainGeometry ProjectionLayer::terrainGeometry() const
 {
   constexpr uint8_t kUnknown = 255U;
   constexpr uint8_t kFlat = 0U;
@@ -96,9 +96,13 @@ std::vector<uint8_t> ProjectionLayer::terrainLabels() const
   constexpr double kMaxSlope = 0.70;  // tan(35 degrees)
   constexpr double kMaxPlaneRms = 0.04;
   const size_t count = static_cast<size_t>(width_) * static_cast<size_t>(height_);
-  std::vector<uint8_t> labels(count, kUnknown);
+  TerrainGeometry geometry;
+  auto & labels = geometry.labels;
+  labels.assign(count, kUnknown);
+  geometry.uphill_x.assign(count, 0.0f);
+  geometry.uphill_y.assign(count, 0.0f);
   if (cells_.size() != count || width_ <= 0 || height_ <= 0 || resolution_ <= 0.0) {
-    return labels;
+    return geometry;
   }
 
   const auto thinGround = [](const CellData & cell) {
@@ -191,10 +195,19 @@ std::vector<uint8_t> ProjectionLayer::terrainLabels() const
       const double slope = plane.head<2>().norm();
       if (!plane.allFinite() || slope < kMinSlope || slope > kMaxSlope) continue;
       const double squared_error = std::max(0.0, sum_zz - plane.dot(rhs));
-      if (std::sqrt(squared_error / samples) <= kMaxPlaneRms) labels[index] = kSlope;
+      if (std::sqrt(squared_error / samples) <= kMaxPlaneRms) {
+        labels[index] = kSlope;
+        geometry.uphill_x[index] = static_cast<float>(plane.x() / slope);
+        geometry.uphill_y[index] = static_cast<float>(plane.y() / slope);
+      }
     }
   }
-  return labels;
+  return geometry;
+}
+
+std::vector<uint8_t> ProjectionLayer::terrainLabels() const
+{
+  return terrainGeometry().labels;
 }
 
 ProjectionSlideResult ProjectionLayer::syncSlidingWindow(int width,

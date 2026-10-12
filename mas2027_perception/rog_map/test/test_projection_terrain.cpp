@@ -47,6 +47,22 @@ TEST(ProjectionTerrain, ContinuousInclineIsSlope)
   EXPECT_EQ(labels[10 * kSize + 10], 5U);
 }
 
+TEST(ProjectionTerrain, UphillVectorFollowsHeightGradient)
+{
+  rog_map::ProjectionLayer layer;
+  rog_map::ProjectionLayerConfig config;
+  config.min_observed_voxels = 1;
+  config.hysteresis_en = false;
+  config.mask_filter_en = false;
+  layer.updateFull(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 1.0,
+    config, [](int x, int y) { return ground(1.0 + (0.24 * x - 0.18 * y) * kResolution); });
+  const auto geometry = layer.terrainGeometry();
+  const size_t center = 10 * kSize + 10;
+  ASSERT_EQ(geometry.labels[center], 5U);
+  EXPECT_NEAR(geometry.uphill_x[center], 0.8, 0.05);
+  EXPECT_NEAR(geometry.uphill_y[center], -0.6, 0.05);
+}
+
 TEST(ProjectionTerrain, ObservedGapWithNeighborSupportIsTunnel)
 {
   const auto labels = labelsFor([](int, int) {

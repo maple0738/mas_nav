@@ -54,6 +54,9 @@
         # 0.33 留 0.07 余量，降到 0.30 时只剩 4 cm，窄处罚项梯度变小、轨迹不再被推回通道中心，
         # 表现为起步/前进一顿一顿；再动这一项必须单变量并同时看急停频率与 COLLISION 占比。
         safe_dist: 0.33
+        # 原局部路径仍可通行但净空偏小时，优选满足 safe_dist 的绕行种子；
+        # 找不到则继续使用原路径。关闭仅停用这一优选步骤，安全校验阈值不变。
+        clearance_detour_enable: true
         # 有效硬阈值 = collision_dist − kMonitorClearanceTolerance(0.02) = 0.26 m，略小于车体
         # 外接圆半径 0.306 m，靠 ROGMap 读数偏保守（0.05 m 格子整格即判占据，小 2~5 cm）对上。
         # 不要再下调：0.27 会把有效阈值压到 0.25，等于重新允许蹭墙；窄道通过性应由降低感知
@@ -126,8 +129,13 @@
         recovery_window_sec: 3.0
         escape_speed: 0.5
       performance:
-        enable: false
+        # 现场性能采样：逐次记录全局搜索、局部搜索、MINCO 优化及整轮重规划耗时。
+        # 只写 CSV，不在控制循环打印；用于下一次 online 往返的瓶颈分析。
+        enable: true
         print_enable: false
+        detailed_csv_enable: true
+        # 运行时在扩展名前加启动时间，保留每次导航的独立 CSV。
+        minco_csv_path: "/home/mas/mas_nav_2027_native/.scratch/minco_perf_detailed.csv"
         odom_sub_debug_enable: false
       # B1: session-wide odom map accumulated from observed ROGMap types.
       # Local navigation still uses the live rolling map. Restart to change these settings.
@@ -143,6 +151,9 @@
         # pending cells are unknown/blocked. Live local safety stays immediate.
         occupied_confirmations: 2
         confirmation_max_gap_s: 1.5
+        # 特殊地形需连续新快照确认；仅完整观测为普通地面的格子可连续纠错。
+        terrain_confirmations: 3
+        terrain_clear_confirmations: 10
       rog_map:
         frame_id: odom
         resolution: 0.05
@@ -163,7 +174,7 @@
           threshold: 0.2
         ros_callback:
           enable: true
-          cloud_topic: /cloud_registered
+          cloud_topic: /cloud_registered_full
           odom_topic: /Odometry
           odom_timeout: 0.08
           update_period_ms: 20
@@ -237,12 +248,14 @@
           summary_csv_enable: true
           # 路径必须落在工作区内：写到 /tmp 时排障侧读不到（实车运行在用户自己的 shell 里，
           # 与工具的临时目录不是同一处）。该目录已存在，换机器请确认路径可写。
+          # 运行时在扩展名前加启动时间，避免新启动覆盖上一轮实车数据。
           summary_csv_path: "/home/mas/mas_nav_2027_native/.scratch/rog_map_perf_summary.csv"
           summary_rate: 1.0
           # 打开后每次地图更新写一行，用于拆分单次更新的耗时构成（prob_update / decay /
           # query_refresh / update_unaccounted_ms / last_viz_time_ms / full_reason_* 是否静默
           # 退回全量）。约 20 行/s，开销可忽略，定位完即可改回 false。
           detailed_csv_enable: true
+          detailed_csv_path: "/home/mas/mas_nav_2027_native/.scratch/rog_map_perf_detailed.csv"
           print_enable: false
           # 只处理脏列的增量投影。默认全量：每帧重算整张 200×200 二维窗口约 43 ms，更新耗时
           # 超过点云帧周期（约 35% 的帧被丢）。脏列超过 dirty_full_ratio 时自动回退全量，

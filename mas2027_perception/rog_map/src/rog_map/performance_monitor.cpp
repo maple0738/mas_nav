@@ -40,6 +40,15 @@ std::string num(double value)
   return ss.str();
 }
 
+std::string runCsvPath(const std::string & path, long long run_stamp_us)
+{
+  const size_t slash = path.find_last_of('/');
+  const size_t dot = path.find_last_of('.');
+  const size_t split = dot != std::string::npos &&
+    (slash == std::string::npos || dot > slash) ? dot : path.size();
+  return path.substr(0, split) + "-" + std::to_string(run_stamp_us) + path.substr(split);
+}
+
 void writeCsvLine(std::ofstream & stream, const std::vector<std::string> & fields)
 {
   for (size_t i = 0; i < fields.size(); ++i) {
@@ -88,21 +97,27 @@ void PerformanceMonitor::configure(const PerformanceConfig & config)
   if (!config_.enable) {
     return;
   }
+  const auto run_stamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
   if (detailedCsvEnabled()) {
-    detailed_csv_.open(config_.detailed_csv_path, std::ios::out | std::ios::trunc);
+    config_.detailed_csv_path = runCsvPath(config_.detailed_csv_path, run_stamp_us);
+    detailed_csv_.open(config_.detailed_csv_path, std::ios::out | std::ios::app);
     if (!detailed_csv_.is_open()) {
       std::cerr << "[ROGMapPerf] failed to open detailed_csv_path: " << config_.detailed_csv_path
                 << std::endl;
     } else {
+      std::cout << "[ROGMapPerf] detailed CSV: " << config_.detailed_csv_path << std::endl;
       writeDetailedHeader();
     }
   }
   if (summaryCsvEnabled()) {
-    summary_csv_.open(config_.summary_csv_path, std::ios::out | std::ios::trunc);
+    config_.summary_csv_path = runCsvPath(config_.summary_csv_path, run_stamp_us);
+    summary_csv_.open(config_.summary_csv_path, std::ios::out | std::ios::app);
     if (!summary_csv_.is_open()) {
       std::cerr << "[ROGMapPerf] failed to open summary_csv_path: " << config_.summary_csv_path
                 << std::endl;
     } else {
+      std::cout << "[ROGMapPerf] summary CSV: " << config_.summary_csv_path << std::endl;
       writeSummaryHeader();
     }
   }

@@ -20,6 +20,7 @@ namespace small_point_lio {
         Preprocess preprocess;
         Estimator estimator;
         double time_current = 0.0;
+        double last_odom_publish_time = -std::numeric_limits<double>::infinity();
         std::vector<Eigen::Vector3f> pointcloud_odom_frame;
         std::function<void(const std::vector<Eigen::Vector3f> &pointcloud, double stamp)> pointcloud_callback;
         std::function<void(const common::Odometry &odometry)> odometry_callback;

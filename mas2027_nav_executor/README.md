@@ -21,7 +21,7 @@ RViz/Foxglove ── /goal_pose ────────────────
                                                       ↓
                         /cmd_vel + /nav_executor/chassis_cmd
                                                       ↓
-                                    ros2_comm → mas_vision → 下位机
+                                    nav_serial_bridge → CDC1 → 下位机
 ```
 
 可以把它分成两个持续运行的循环：`PathPlanner` 中的 `TaskManager` 每 50 ms 检查目标与重规划；顶层节点以 `node.control_rate_hz`（默认 20 Hz）执行一次控制和发布。节点使用 `MultiThreadedExecutor` 同时管理顶层 `nav_executor` 和内部的生命周期节点 `nav_executor_planner`；后者承载 ROGMap、MINCO 和任务定时器。两个循环不是“规划一次、执行到底”：局部轨迹会按安全性、有效期和强制重规划周期更新。
@@ -46,7 +46,7 @@ RViz/Foxglove ── /goal_pose ────────────────
 4. `MincoPlanner::ReplanLocal()` 从全局路线取得局部引导路径，处理稀疏点、生成安全走廊、分配速度，再做 MINCO 优化并检查轨迹安全性。成功后发布 `/opt_path`（`interfaces/MpcPositionCommand`）。`/nav_executor/minco_path` 和调试 Marker 用于查看优化结果。
 5. 顶层节点在收到 `/opt_path` 时，沿**最终轨迹**采样地形 label，形成 `RegionPlan`。运行时 `RegionController` 用当前位置在路径上的进度决定区域阶段、请求的 mode 和速度/加速度上限；普通路段也走同一控制循环。
 6. `PathExecutor::computeCommand()` 检查运动许可、轨迹/里程计时效，把轨迹转为执行坐标系，构造 MPC 参考并求解；区域 profile 收紧平移速度和加速度约束。随后 `checkCommandSafety()` 用静态地形规则与在线 ROGMap 检查下一段指令。
-7. 顶层节点每周期发布 `/cmd_vel`，并把同周期的 `vx`、`vy`、`mode` 打包为 `/nav_executor/chassis_cmd`。`ros2_comm` 消费后者，经 `mas_vision` 发给下位机；`/cmd_vel` 仍可用于观察，但不是本链路的模式传输入口。
+7. 顶层节点每周期发布 `/cmd_vel`，并把同周期的 `vx`、`vy`、`mode` 打包为 `/nav_executor/chassis_cmd`。`nav_serial_bridge` 消费后者，经 CDC1 直接发送 `vx`、`vy`、`nav_state` 给下位机；当前串口协议不含 mode。`/cmd_vel` 仍可用于观察。
 
 跟随期间，`TaskManager` 会检查当前轨迹是否安全、是否过期以及是否到了局部重规划周期。路径变得不安全时先撤销运动许可并发布紧急停止轨迹，再重新规划；局部重规划失败但旧轨迹仍有效时可以继续使用旧轨迹。目标到达且平移速度足够低后回到 `IDLE`。贴近障碍且重规划失败时，代码中还有受限逃逸 `RECOVERING` 分支；它不是常态导航路径。
 
@@ -81,20 +81,20 @@ RViz/Foxglove ── /goal_pose ────────────────
 | `/nav_executor/minco_path` | 输出 | MINCO 局部轨迹可视化。 |
 | `/planning_constraints` | 输出 | RViz 中的静态规划约束栅格。 |
 | `/cmd_vel` | 输出 | 当前计算出的速度，包含 `angular.z` 供观察。 |
-| `/nav_executor/chassis_cmd` | 输出至 `ros2_comm` | 同一条消息里的 `vx`、`vy`、`mode`；当前桥接不转发 `omega`。 |
+| `/nav_executor/chassis_cmd` | 输出至 `nav_serial_bridge` | 同一条消息里的 `vx`、`vy`、`mode`；串口只发 `vx`、`vy`、`nav_state`。 |
 | `/nav_executor/region_status` | 诊断输出 | 请求的 label、mode、阶段、轨迹进度与速度上限；不是底盘确认回执。 |
 
 ## 区域控制在总链路中的位置
 
-本车关注上坡 `label=mode=5`、隧道 `label=mode=6`、起伏路 `label=mode=7`。三类区域各有最大速度、最大加速度以及进入前准备/激活/提交、离开后释放距离。MINCO 先按区域下调路径速度；最终轨迹标注后，执行器按路径进度切模式并平滑过渡 MPC 约束。下位机依据 mode 停止自转；导航侧暂不通过 `omega` 管理这项功能。
+本车关注上坡 `label=mode=5`、隧道 `label=mode=6`、起伏路 `label=mode=7`。三类区域各有最大速度、最大加速度以及进入前准备/激活/提交、离开后释放距离。MINCO 先按区域调整路径速度；最终轨迹标注后，执行器按路径进度切换内部模式并平滑过渡 MPC 约束。当前 mode 不发给下位机，底盘自转行为不会随这些区域状态改变。
 
-完整的阶段、label、协议边界和参数说明见[区域控制说明](docs/region_control.md)。当前配置为普通路段 `mode=4`、坡道 `5`、隧道 `6`、起伏路 `7`。`ros2_comm` 与桌面 `mas_vision` 已按 `vx, vy, mode, nav_state` 的顺序传递独立 `uint8 mode`；下位机必须同步按新版串口包解析。当前没有模式生效回执，因此不要仅凭 `/nav_executor/region_status` 判断底盘已经切换。
+完整的阶段、label、协议边界和参数说明见[区域控制说明](docs/region_control.md)。当前配置为普通路段 `mode=4`、坡道 `5`、隧道 `6`、起伏路 `7`。当前 CDC1 接收协议没有 mode 字段，因此底盘不会随导航的区域状态切换模式；`/nav_executor/region_status` 只表示导航内部状态。
 
 ## 零速、安全与排障
 
 `PathExecutor` 在无运动许可、缺轨迹/里程计、数据过期、参考无法转换、MPC 求解失败或指令安全门拒绝时返回默认零速度。安全门会检查地形与 TF、ROGMap 时效，以及局部障碍净空；顶层控制循环仍按周期发布命令，避免只发一次停机。这里的“零速度”指导航平移/命令输出；底盘自身的自转行为仍由下位机的模式解释决定。
 
-排查时建议按数据流顺序看：目标是否被接纳 → `/nav_executor/global_plan` 是否出现 → `/opt_path` 是否持续更新 → `/Odometry`、ROGMap 与 TF 是否新鲜 → `/nav_executor/region_status` 的 label/阶段/mode → `/nav_executor/chassis_cmd` 的速度和 mode → `ros2_comm`、`mas_vision` 和下位机的协议版本。`/cmd_vel` 有值而底盘 mode 不变时，先查新版报文是否部署到各端，不要从 MPC 角速度推断模式已传下去。
+排查时建议按数据流顺序看：目标是否被接纳 → `/nav_executor/global_plan` 是否出现 → `/opt_path` 是否持续更新 → `/Odometry`、ROGMap 与 TF 是否新鲜 → `/nav_executor/chassis_cmd` 的速度 → `nav_serial_bridge` 的连接和收发日志 → 下位机 `minipc_nav` 在线状态。底盘 mode 当前不经 CDC1 发送。
 
 ## 配置与启动
 
@@ -105,7 +105,7 @@ RViz/Foxglove ── /goal_pose ────────────────
 | [`config/mpc_params.yaml`](config/mpc_params.yaml) | MPC 步长、预测时域、速度/加速度/角速度边界与权重。 |
 | [`config/region_control.yaml`](config/region_control.yaml) | 三类区域的 mode、速度/加速度及路径阶段距离。 |
 
-整套导航的启动文件不在本包，而在 `mas2027_nav_bringup/launch/nav_executor_launch.py`。它加载本包 `config/*.yaml`，并启动地图、定位相关组件；默认也启动 `ros2_comm`。仅需观察导航而不向硬件桥发送时，使用 `use_ros2_comm:=False`。模式传输固定为新版独立字段，具体协议见区域控制说明。
+整套导航的启动文件不在本包，而在 `mas2027_nav_bringup/launch/nav_executor_launch.py`。它加载本包 `config/*.yaml`，并启动地图、定位相关组件；默认也启动 `nav_serial_bridge`。仅需观察导航而不向硬件发送时，使用 `use_nav_serial:=False`。当前 CDC1 协议与区域控制的关系见区域控制说明。
 
 
 ### 无先验地图模式

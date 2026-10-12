@@ -92,8 +92,11 @@ public:
     const auto cost_map_topic = declare_parameter<std::string>("node.topics.terrain_cost_sub", "/cost_map");
     const auto label_map_topic = declare_parameter<std::string>(
       "node.topics.terrain_label_sub", "/terrain_label_map");
+    const auto uphill_map_topic = declare_parameter<std::string>(
+      "node.topics.terrain_uphill_sub", "/terrain_uphill_map");
     const auto online_label_topic = declare_parameter<std::string>(
-      "node.topics.online_terrain_label_sub", "/rog_map/terrain_label");
+      "node.topics.online_terrain_label_sub", "/nav_executor/online_terrain_map");
+    persistent_online_terrain_ = online_label_topic == "/nav_executor/online_terrain_map";
     online_label_timeout_s_ = declare_parameter<double>(
       "node.online_terrain_label_timeout_s", 0.8);
     if (!std::isfinite(online_label_timeout_s_) || online_label_timeout_s_ <= 0.0) {
@@ -252,9 +255,14 @@ public:
           terrain_grid_->updateLabels(*msg);
           refresh_region_plan();
         });
+      terrain_uphill_sub_ = create_subscription<sensor_msgs::msg::Image>(
+        uphill_map_topic, map_qos, [this](sensor_msgs::msg::Image::ConstSharedPtr msg) {
+          terrain_grid_->updateDirections(*msg);
+          publish_planning_constraints();
+        });
     }
     online_terrain_label_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
-      online_label_topic, rclcpp::SensorDataQoS(),
+      online_label_topic, map_qos,
       [this](nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg) {
         {
           std::lock_guard<std::mutex> lock(data_mutex_);
@@ -512,6 +520,11 @@ private:
   bool online_labels_fresh(
     const nav_msgs::msg::OccupancyGrid & labels, double received_s, double current_s) const
   {
+    if (persistent_online_terrain_) {
+      return !labels.header.frame_id.empty() && labels.info.width > 0 &&
+        labels.info.height > 0 &&
+        labels.data.size() == static_cast<size_t>(labels.info.width) * labels.info.height;
+    }
     const double stamp_s = rclcpp::Time(labels.header.stamp).seconds();
     const double stamp_age = current_s - stamp_s;
     const double receive_age = current_s - received_s;
@@ -647,10 +660,12 @@ private:
   double online_label_timeout_s_{0.8};
   bool online_plan_active_{false};
   double online_terrain_labels_received_s_{0.0};
+  bool persistent_online_terrain_{false};
   nav_msgs::msg::OccupancyGrid::ConstSharedPtr online_terrain_labels_;
   // 地图输入接口层：静态代价和 label 地图；动态 ROGMap 由 PathPlanner 内部维护。
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr terrain_cost_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr terrain_label_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr terrain_uphill_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr online_terrain_label_sub_;
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;

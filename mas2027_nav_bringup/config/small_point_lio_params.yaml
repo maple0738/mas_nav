@@ -76,6 +76,9 @@ small_point_lio:
     # 局部地图
     map_resolution: 0.5                               # SmallIVox 地图分辨率，单位米
     init_map_size: 10                                 # 初始化地图所需的最少点数
+    ivox_capacity: 1000000                            # iVox 最大体素数，避免地图无限增长
+    point_update_batch_interval_s: 0.005              # 定位点在最多 5 ms 窗口内合并为一次 ESKF 更新
+    point_update_batch_max_points: 128                # 每批定位点上限；IMU 更新前也会强制刷新
 
     # LiDAR 到 IMU 的外参
     extrinsic_est_en: false                           # 是否在线估计雷达与 IMU 外参
@@ -99,4 +102,6 @@ small_point_lio:
     match_sqaured: 81.0                               # 点面匹配阈值，越小越严格
 
     # 数据发布
-    publish_odometry_without_downsample: false        # 是否发布未降采样的高频里程计，会增加计算开销
+    publish_odometry_without_downsample: true         # 每次批量定位更新后可发布 odom
+    odom_publish_interval_s: 0.01                     # odom 发布至少间隔 10 ms，目标上限 100 Hz
+    full_cloud_publish_interval_s: 0.05               # 完整点云独立限速，当前目标约 20 Hz

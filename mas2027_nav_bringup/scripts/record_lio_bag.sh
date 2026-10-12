@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Record Small Point-LIO topics with QoS that matches the publishers.
-# /cloud_registered is SensorDataQoS (best_effort, keep_last 1). A default
+# /cloud_registered_full is SensorDataQoS (best_effort, keep_last 1). A default
 # rosbag2 subscription is reliable and will record zero clouds.
 set -euo pipefail
 
@@ -15,9 +15,9 @@ fi
 
 echo "Recording to ${OUT}"
 echo "Start LIO first, in another terminal:"
-echo "  ros2 launch mas2027_nav_bringup rm_navigation_small_point_lio_launch.py use_nav2:=False use_rviz:=True"
+echo "  ros2 launch mas2027_nav_bringup nav_executor_launch.py use_nav_serial:=False use_rviz:=True"
 echo "Ctrl-C stops the bag."
 
 exec ros2 bag record -s mcap -o "${OUT}" \
   --qos-profile-overrides-path "${QOS}" \
-  /cloud_registered /Odometry /tf /tf_static
+  /cloud_registered_full /cloud_registered /Odometry /tf /tf_static

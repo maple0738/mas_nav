@@ -22,6 +22,8 @@ struct TerrainMapData {
     int height;
     double resolution;
     std::vector<uint8_t> terrain;
+    // Optional [uphill_x, uphill_y] for each cell, row major.
+    std::vector<float> uphill;
 };
 
 struct MapInflationParams {
@@ -47,6 +49,7 @@ struct NavigationMapData {
     double resolution;
     cv::Mat cost_map;
     cv::Mat terrain_label_map;
+    cv::Mat uphill_map;
 };
 
 TerrainMapData load_terrain_msgpack(const std::string& path);

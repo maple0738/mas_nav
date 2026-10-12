@@ -488,39 +488,55 @@ void ROGMap::refreshLayers()
   runtime_stats_.projection_dirty_over_ratio = dirty_over_ratio ? 1.0 : 0.0;
 
   const auto projection_start = std::chrono::steady_clock::now();
-  auto rawGridType = [this](const Vec3i & id_g) -> GridType {
-    if (!insideLocalMap(id_g)) {
-      return GridType::OUT_OF_MAP;
+  std::vector<double> z_positions;
+  std::vector<int> z_hash_deltas;
+  if (z_range_valid) {
+    // The sliding-map hash is the sum of independent x, y and z terms.
+    // Cache the z term once; each column then needs only one bounds check and hash.
+    z_positions.reserve(z_max - z_min + 1);
+    z_hash_deltas.reserve(z_max - z_min + 1);
+    const int base_z_hash = getHashIndexFromGlobalIndex(Vec3i(0, 0, z_min));
+    for (int gz = z_min; gz <= z_max; ++gz) {
+      Vec3f pos;
+      globalIndexToPos(Vec3i(0, 0, gz), pos);
+      z_positions.push_back(pos.z());
+      z_hash_deltas.push_back(
+        getHashIndexFromGlobalIndex(Vec3i(0, 0, gz)) - base_z_hash);
     }
-    const int hash_id = getHashIndexFromGlobalIndex(id_g);
-    if (hash_id < 0 || hash_id >= static_cast<int>(occupancy_buffer_.size())) {
-      return GridType::OUT_OF_MAP;
-    }
-    const double ret = occupancy_buffer_[hash_id];
-    if (isKnownFree(ret)) {
-      return GridType::KNOWN_FREE;
-    }
-    if (isOccupied(ret)) {
-      return GridType::OCCUPIED;
-    }
-    return GridType::UNKNOWN;
-  };
+  }
 
-  auto scanner = [this, min_id, z_min, z_max, z_range_valid, rawGridType](int mx, int my) {
+  auto scanner = [this, min_id, z_min, z_max, z_range_valid, &z_positions, &z_hash_deltas](
+    int mx, int my) {
     ColumnStats stats;
     if (!z_range_valid) {
       return stats;
     }
     const int gx = min_id.x() + mx;
     const int gy = min_id.y() + my;
+    const Vec3i column_start(gx, gy, z_min);
+    if (!insideLocalMap(column_start)) {
+      return stats;
+    }
+    const int column_hash = getHashIndexFromGlobalIndex(column_start);
     int free_since_occupied = 0;
     bool seen_occupied = false;
     for (int gz = z_min; gz <= z_max; ++gz) {
-      Vec3i id_g(gx, gy, gz);
-      GridType gt = rawGridType(id_g);
+      const int z_offset = gz - z_min;
+      const int hash_id = column_hash + z_hash_deltas[z_offset];
+      GridType gt = GridType::OUT_OF_MAP;
+      if (hash_id >= 0 && hash_id < static_cast<int>(occupancy_buffer_.size())) {
+        const double occupancy = occupancy_buffer_[hash_id];
+        if (isKnownFree(occupancy)) {
+          gt = GridType::KNOWN_FREE;
+        } else if (isOccupied(occupancy)) {
+          gt = GridType::OCCUPIED;
+        } else {
+          gt = GridType::UNKNOWN;
+        }
+      }
       if (gt == GridType::OCCUPIED || gt == GridType::KNOWN_FREE) {
         ++stats.observed_count;
-        stats.last_update_time = std::max(stats.last_update_time, cellLastUpdateTime(id_g));
+        stats.last_update_time = std::max(stats.last_update_time, last_update_time_[hash_id]);
       }
       if (gt == GridType::OCCUPIED) {
         if (seen_occupied) stats.free_between_occupied_count += free_since_occupied;
@@ -529,11 +545,10 @@ void ROGMap::refreshLayers()
         ++stats.occupied_count;
         stats.occupied_z_index_min = std::min(stats.occupied_z_index_min, gz);
         stats.occupied_z_index_max = std::max(stats.occupied_z_index_max, gz);
-        Vec3f pos;
-        globalIndexToPos(id_g, pos);
-        stats.occupied_z_min_abs = std::min(stats.occupied_z_min_abs, static_cast<double>(pos.z()));
-        stats.occupied_z_max_abs = std::max(stats.occupied_z_max_abs, static_cast<double>(pos.z()));
-        stats.last_hit_time = std::max(stats.last_hit_time, cellLastHitTime(id_g));
+        const double z_position = z_positions[z_offset];
+        stats.occupied_z_min_abs = std::min(stats.occupied_z_min_abs, z_position);
+        stats.occupied_z_max_abs = std::max(stats.occupied_z_max_abs, z_position);
+        stats.last_hit_time = std::max(stats.last_hit_time, last_hit_time_[hash_id]);
       } else if (seen_occupied && gt == GridType::KNOWN_FREE) {
         ++free_since_occupied;
       }
@@ -878,6 +893,10 @@ void ROGMap::refreshQuery()
     snapshot->height_deltas[i] = layer_->cells()[i].height_delta;
     snapshot->confidence[i] = layer_->cells()[i].confidence;
   }
+  auto terrain = layer_->terrainGeometry();
+  snapshot->terrain_labels = std::move(terrain.labels);
+  snapshot->uphill_x = std::move(terrain.uphill_x);
+  snapshot->uphill_y = std::move(terrain.uphill_y);
   runtime_stats_.query_copy_types_height_delta_confidence_time = elapsedMs(meta_start);
   const bool field_valid =
     field_ && field_->isValid() &&

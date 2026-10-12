@@ -1,6 +1,9 @@
 #include "mas2027_nav_executor/common/environment/region_control.hpp"
+#include "mas2027_nav_executor/common/environment/terrain_semantics.hpp"
 
 #include <gtest/gtest.h>
+
+#include <cstring>
 
 #include <rclcpp/clock.hpp>
 
@@ -74,6 +77,76 @@ TEST(RegionOnlinePriority, OnlineSpecialLabelOverridesStatic)
   ASSERT_TRUE(plan);
   ASSERT_EQ(plan->segments.size(), 1U);
   EXPECT_EQ(plan->segments.front().label, 6U);
+}
+
+TEST(RegionOnlinePriority, RememberedUndulatingLabelIsApplied)
+{
+  tf2_ros::Buffer buffer(std::make_shared<rclcpp::Clock>(RCL_SYSTEM_TIME));
+  const auto terrain = staticTerrain(0);
+  const auto remembered = onlineTerrain(7);
+  const auto plan = annotateRegions(trajectory(), terrain, buffer, rules(), "map", &remembered);
+  ASSERT_TRUE(plan);
+  ASSERT_EQ(plan->segments.size(), 1U);
+  EXPECT_EQ(plan->segments.front().label, 7U);
+}
+
+TEST(TerrainGrid, PriorSlopeDirectionBlocksSideBoundary)
+{
+  auto terrain = staticTerrain(0);
+  terrain.directions.header.frame_id = "map";
+  terrain.directions.width = 20;
+  terrain.directions.height = 20;
+  terrain.directions.step = 20 * 2 * sizeof(float);
+  terrain.directions.encoding = "32FC2";
+  terrain.directions.data.assign(static_cast<size_t>(terrain.directions.step) * 20, 0U);
+  for (int y = 4; y <= 6; ++y) for (int x = 4; x <= 6; ++x) {
+    terrain.labels.data[static_cast<size_t>(y) * 20 + x] = 5U;
+    const float uphill_x = 1.0F;
+    std::memcpy(terrain.directions.data.data() +
+      static_cast<size_t>(y) * terrain.directions.step + x * 2 * sizeof(float),
+      &uphill_x, sizeof(float));
+  }
+  std::vector<float> uphill_x(400, 0.0F), uphill_y(400, 0.0F);
+  for (int y = 4; y <= 6; ++y) for (int x = 4; x <= 6; ++x) {
+    uphill_x[static_cast<size_t>(y) * 20 + x] = 1.0F;
+  }
+  terrain.slope_side_mask = mas2027_nav_executor::buildSlopeSideMask(
+    20, 20, terrain.labels.data, uphill_x, uphill_y);
+  EXPECT_TRUE(terrain.transition({0.35, 0.45}, {0.45, 0.45}));
+  EXPECT_FALSE(terrain.transition({0.45, 0.35}, {0.45, 0.45}));
+  EXPECT_FALSE(terrain.traversable({0.45, 0.35}));
+  EXPECT_FALSE(terrain.transition({0.45, 0.35}, {0.55, 0.35}));
+  EXPECT_TRUE(terrain.transition({0.65, 0.45}, {0.75, 0.45}));
+
+  TerrainGrid grid;
+  grid.updateDirections(terrain.directions);
+  grid.updateCost(terrain.cost);
+  grid.updateLabels(terrain.labels);
+  const auto constraints = grid.planningConstraints();
+  ASSERT_TRUE(constraints);
+  EXPECT_EQ(constraints->data[3 * 20 + 4], 100);
+  EXPECT_EQ(constraints->data[4 * 20 + 3], 0);
+}
+
+TEST(TerrainGrid, RotatedSlopeBlocksLongSideAndKeepsEndOpen)
+{
+  constexpr int width = 25;
+  std::vector<uint8_t> labels(width * width, 0U);
+  std::vector<float> uphill_x(labels.size(), 0.0F), uphill_y(labels.size(), 0.0F);
+  for (int y = 0; y < width; ++y) for (int x = 0; x < width; ++x) {
+    if (std::abs(x + y - 20) > 8 || std::abs(y - x) > 2) continue;
+    const size_t index = static_cast<size_t>(y) * width + x;
+    labels[index] = 5U;
+    uphill_x[index] = uphill_y[index] = 0.70710678F;
+  }
+  const auto sides = mas2027_nav_executor::buildSlopeSideMask(
+    width, width, labels, uphill_x, uphill_y);
+  EXPECT_EQ(sides[static_cast<size_t>(12) * width + 9], 1U);
+  EXPECT_EQ(sides[static_cast<size_t>(6) * width + 5], 0U);
+  EXPECT_FALSE(mas2027_nav_executor::terrainSideTransitionAllowed(
+    width, width, 0.1, 0.0, 0.0, sides, 0.95, 1.25, 0.95, 1.25, true));
+  EXPECT_TRUE(mas2027_nav_executor::terrainSideTransitionAllowed(
+    width, width, 0.1, 0.0, 0.0, sides, 0.55, 0.65, 0.65, 0.65, true));
 }
 
 TEST(RegionOnlinePriority, UnknownAndOrdinaryOnlineCellsFallBackToStatic)

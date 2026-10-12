@@ -18,7 +18,7 @@ ros2 launch mas2027_nav_bringup nav_executor_launch.py \
   use_nav_serial:=False
 ```
 
-需要底盘执行时使用 `use_nav_serial:=True`（默认）；导航桥默认按 USB 接口字符串 `PCCOMM-NAV` 查找串口，`nav_serial_device` 可显式指定路径。没有显示器时增加 `use_rviz:=False`。切回先验地图模式时，将上述 YAML 中的 `map_source` 改为 `prior`。
+需要底盘执行时使用 `use_nav_serial:=True`（默认）；导航桥默认按 USB 接口字符串 `PCCOMM-NAV` 查找串口，`nav_serial_device` 可显式指定路径。RViz 默认关闭；需要窗口时使用 `use_rviz:=True` 并确保 `DISPLAY` 或 `WAYLAND_DISPLAY` 可用。切回先验地图模式时，将上述 YAML 中的 `map_source` 改为 `prior`。
 
 `map_source` 是启动时选择，切换模式需要重启。在线模式即使 `use_odom_localizer` 保持默认 `True`，也不会启动先验定位器。
 
@@ -40,7 +40,7 @@ ros2 topic pub --once /goal_pose geometry_msgs/msg/PoseStamped \
 ## 在线规划行为
 
 ```text
-/Odometry + /cloud_registered
+/Odometry + /cloud_registered_full
           ↓
 ROGMap：10×10 m 滚动地图、二维投影、距离场
           ↓
@@ -105,7 +105,7 @@ RViz 默认关闭 `ROGMap` 组中的 `Layer Type` 诊断栅格，显示累计图
 
 ```bash
 ros2 param get /nav_executor node.map_source
-ros2 topic hz /cloud_registered
+ros2 topic hz /cloud_registered_full
 ros2 topic echo /nav_executor/global_plan --once
 ros2 topic echo /opt_path --once
 ros2 run tf2_ros tf2_echo odom base_link
@@ -130,8 +130,10 @@ RViz 可查看在线 ROGMap、`/nav_executor/global_plan` 和 MINCO 轨迹；在
 | `evidence_limit` | `5` | 证据绝对值上限；自由格要求证据小于零 |
 | `occupied_confirmations` | `2` | 新累计障碍需要的连续观测次数；待确认格按未知阻断 |
 | `confirmation_max_gap_s` | `1.5` | 连续确认允许的最大时间间隔，超时重新计数 |
+| `terrain_confirmations` | `3` | 特殊地形连续新快照确认次数；确认前不写入累计标签或侧边障碍 |
+| `terrain_clear_confirmations` | `10` | 已确认标签被完整普通地面连续观测后清除的次数 |
 
-粗栅格内任一有原始观测依据的障碍会触发确认；连续两份新的观测支持后才写成累计占用，待确认期间该格为未知、不可通行。实时局部图仍立即阻断障碍。全部细栅格都观测为可通行时，才计入一次自由观测。未知区、投影滤波填充及局部保持生成的障碍不会作为新的累计障碍证据；它们也不会被直接当成自由区。旧障碍需要多次不同时间、不同序号的完整自由观测才能清除；重复快照不会增加证据。确认必须连续，未知观测中断或时间间隔超限后重新计数。此机制减少短暂地面误判被记成障碍；若原始局部投影持续误判地面，仍需现场核查高度跨度、点云重影与地面分类，累计确认不能代替地面识别。达到容量上限的扩展整次拒绝，并保留上一份地图。该实现使用密集矩形栅格，长距离或大面积运行需要评估内存和更新耗时。
+粗栅格内任一有原始观测依据的障碍会触发确认；连续两份新的观测支持后才写成累计占用，待确认期间该格为未知、不可通行。实时局部图仍立即阻断障碍。全部细栅格都观测为可通行时，才计入一次自由观测。未知区、投影滤波填充及局部保持生成的障碍不会作为新的累计障碍证据；它们也不会被直接当成自由区。旧障碍需要多次不同时间、不同序号的完整自由观测才能清除；重复快照不会增加证据。确认必须连续，未知观测中断或时间间隔超限后重新计数。此机制减少短暂地面误判被记成障碍；若原始局部投影持续误判地面，仍需现场核查高度跨度、点云重影与地面分类，累计确认不能代替地面识别。特殊地形标签同样需要连续确认；离开窗口和未知观测不会清除已确认标签，完整普通地面连续观测可纠正误标签。累计确认可能使坡道 mode 晚于实时识别，入口处识别距离须现场验收。达到容量上限的扩展整次拒绝，并保留上一份地图。该实现使用密集矩形栅格，长距离或大面积运行需要评估内存和更新耗时；节点每 5 秒记录当前格数、容量和单次累计更新耗时。
 
 发布话题为 `/nav_executor/online_global_map`，类型为 `nav_msgs/msg/OccupancyGrid`，值为未知 `-1`、自由 `0`、占用 `100`，采用 reliable、transient local、深度 1。时间戳对应最近接受的源观测。RViz 配置已加入 **Online Global Map** 显示；可单独查看：
 

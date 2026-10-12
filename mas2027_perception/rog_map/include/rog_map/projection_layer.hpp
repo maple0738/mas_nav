@@ -110,6 +110,14 @@ struct ProjectionSlideResult
   std::vector<int> dirty_columns;
 };
 
+struct TerrainGeometry
+{
+  std::vector<uint8_t> labels;
+  // Unit vector toward increasing ground height; zero outside a fitted slope.
+  std::vector<float> uphill_x;
+  std::vector<float> uphill_y;
+};
+
 class ProjectionLayer : protected SlidingMap
 {
 public:
@@ -166,6 +174,7 @@ public:
   // Diagnostic labels: 0=flat/ordinary, 5=slope, 6=tunnel candidate, 255=unknown.
   // These labels do not change the collision mask or chassis mode.
   std::vector<uint8_t> terrainLabels() const;
+  TerrainGeometry terrainGeometry() const;
   bool empty() const { return values_.empty(); }
   size_t storageCapacity() const { return cell_buffer_.size(); }
 

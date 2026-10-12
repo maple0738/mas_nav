@@ -64,7 +64,7 @@ std::optional<uint8_t> onlineLabelAt(
   const int8_t value = grid.data[y * info.width + x];
   // An ordinary observation is not enough to erase a manually marked
   // special region; only positively identified online regions take priority.
-  if (value != 5 && value != 6) return std::nullopt;
+  if (value != 5 && value != 6 && value != 7) return std::nullopt;
   return static_cast<uint8_t>(value);
 }
 

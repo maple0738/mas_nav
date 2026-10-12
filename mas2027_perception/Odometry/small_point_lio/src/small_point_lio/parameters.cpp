@@ -43,6 +43,16 @@ namespace small_point_lio {
         // 地图
         map_resolution = node.declare_parameter<float>("map_resolution");
         init_map_size = static_cast<size_t>(node.declare_parameter<long>("init_map_size"));
+        const auto configured_capacity = node.declare_parameter<long>("ivox_capacity", 1000000);
+        const auto configured_batch_points = node.declare_parameter<long>("point_update_batch_max_points", 128);
+        point_update_batch_interval_s = node.declare_parameter<double>("point_update_batch_interval_s", 0.005);
+        if (configured_capacity < 5 || configured_batch_points < 1 || configured_batch_points > 4096 ||
+            !std::isfinite(point_update_batch_interval_s) || point_update_batch_interval_s <= 0.0 ||
+            point_update_batch_interval_s > 0.1) {
+            throw std::invalid_argument("invalid iVox capacity or point update batch parameters");
+        }
+        ivox_capacity = static_cast<size_t>(configured_capacity);
+        point_update_batch_max_points = static_cast<size_t>(configured_batch_points);
 
         // 雷达与IMU相对位姿
         extrinsic_est_en = node.declare_parameter<bool>("extrinsic_est_en");
@@ -67,6 +77,10 @@ namespace small_point_lio {
 
         // 数据发布
         publish_odometry_without_downsample = node.declare_parameter<bool>("publish_odometry_without_downsample");
+        odom_publish_interval_s = node.declare_parameter<double>("odom_publish_interval_s", 0.01);
+        if (!std::isfinite(odom_publish_interval_s) || odom_publish_interval_s < 0.0) {
+            throw std::invalid_argument("odom_publish_interval_s must be finite and nonnegative");
+        }
     }
 
 }// namespace small_point_lio

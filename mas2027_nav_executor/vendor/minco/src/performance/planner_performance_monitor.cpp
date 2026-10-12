@@ -8,6 +8,19 @@
 
 namespace minco_planner {
 
+namespace {
+std::string runCsvPath(const std::string & path)
+{
+  const auto stamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+  const size_t slash = path.find_last_of('/');
+  const size_t dot = path.find_last_of('.');
+  const size_t split = dot != std::string::npos &&
+    (slash == std::string::npos || dot > slash) ? dot : path.size();
+  return path.substr(0, split) + "-" + std::to_string(stamp_us) + path.substr(split);
+}
+}  // namespace
+
 PlannerPerformanceMonitor::~PlannerPerformanceMonitor()
 {
   close();
@@ -25,12 +38,15 @@ void PlannerPerformanceMonitor::configure(const PlannerPerformanceConfig & confi
     return;
   }
 
-  detailed_csv_.open(config_.detailed_csv_path, std::ios::out | std::ios::trunc);
+  config_.detailed_csv_path = runCsvPath(config_.detailed_csv_path);
+  detailed_csv_.open(config_.detailed_csv_path, std::ios::out | std::ios::app);
   if (!detailed_csv_.is_open()) {
     RCLCPP_ERROR(logger_, "[MincoPlanner] Failed to open minco perf CSV: %s", config_.detailed_csv_path.c_str());
     config_.detailed_csv_enable = false;
     return;
   }
+
+  RCLCPP_INFO(logger_, "[MincoPlanner] Performance CSV: %s", config_.detailed_csv_path.c_str());
 
   writeDetailedHeader();
 }

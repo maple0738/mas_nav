@@ -223,6 +223,11 @@ class ROGMapROS : public ROGMap
     int unfinished_frame_cnt{0};
     /// 与 pc 配对的位姿，取的是「点云回调时刻」的最近 odom，而非点云自带时间戳。
     Pose pc_pose;
+    /// Only the ROS callbacks access this input pose, under updete_lock.
+    /// The base class robot_state_ belongs to the map update worker.
+    Pose latest_odom_pose;
+    double latest_odom_received_s{0.0};
+    bool has_latest_odom{false};
     PointCloud pc;
     /// 点云回调时刻的 odom 年龄（毫秒），用于性能统计判断里程计是否滞后。
     double pc_odom_age_ms{0.0};
@@ -285,20 +290,21 @@ class ROGMapROS : public ROGMap
   /// update_unaccounted_ms（真实周期 − 自报耗时）的主要来源之一。
   double last_viz_time_ms_{0.0};
 
-  /// 里程计回调：只更新机器人状态（位置/姿态/接收时刻），不做任何地图计算。
-  /// 持 rc_.updete_lock 是因为 cloudCallback 会同时读 robot_state_ 来配对位姿。
+  /// 里程计回调只更新供点云配对的输入位姿；地图状态由更新线程独占。
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom_msg)
   {
     if (performance_monitor_) {
       performance_monitor_->recordOdom(now().seconds());
     }
     std::lock_guard<std::mutex> lk(rc_.updete_lock);
-    updateRobotState(std::make_pair(
+    rc_.latest_odom_pose = std::make_pair(
       Vec3f(odom_msg->pose.pose.position.x, odom_msg->pose.pose.position.y, odom_msg->pose.pose.position.z),
       Quatf(odom_msg->pose.pose.orientation.w,
         odom_msg->pose.pose.orientation.x,
         odom_msg->pose.pose.orientation.y,
-        odom_msg->pose.pose.orientation.z)));
+        odom_msg->pose.pose.orientation.z));
+    rc_.latest_odom_received_s = now().seconds();
+    rc_.has_latest_odom = true;
   }
 
   /// 点云回调：只做四件事——校验、转换、入槽、唤醒工作线程。
@@ -322,8 +328,20 @@ class ROGMapROS : public ROGMap
       }
       return;
     }
+    // Copy one consistent odom sample before the potentially slow conversion.
+    Pose paired_pose;
+    double paired_odom_received_s = 0.0;
+    bool has_paired_odom = false;
+    {
+      std::lock_guard<std::mutex> lk(rc_.updete_lock);
+      has_paired_odom = rc_.has_latest_odom;
+      if (has_paired_odom) {
+        paired_pose = rc_.latest_odom_pose;
+        paired_odom_received_s = rc_.latest_odom_received_s;
+      }
+    }
     // 没有里程计就无法把点云插入地图（ROGMap 需要位姿做 raycast 起点）。
-    if (!robot_state_.rcv) {
+    if (!has_paired_odom) {
       if (performance_monitor_) {
         performance_monitor_->recordCloudDropNoOdom();
       }
@@ -331,7 +349,7 @@ class ROGMapROS : public ROGMap
       return;
     }
     // odom 超时同样跳过：宁可丢帧，也不要用过期位姿把点云写到错误位置。
-    if (cbk_t - robot_state_.rcv_time > cfg_.odom_timeout) {
+    if (cbk_t - paired_odom_received_s > cfg_.odom_timeout) {
       if (performance_monitor_) {
         performance_monitor_->recordCloudDropOdomTimeout();
       }
@@ -354,13 +372,14 @@ class ROGMapROS : public ROGMap
       return;
     }
     // 入槽：整体替换上一帧未处理的数据，并记录与点云配对的那一帧 odom 的时间新鲜度。
-    rc_.updete_lock.lock();
-    rc_.pc = temp_pc;
-    rc_.pc_pose = std::make_pair(robot_state_.p, robot_state_.q);
-    rc_.pc_odom_age_ms = std::max(0.0, cbk_t - robot_state_.rcv_time) * 1000.0;
-    rc_.unfinished_frame_cnt++;
-    map_empty_ = false;
-    rc_.updete_lock.unlock();
+    {
+      std::lock_guard<std::mutex> lk(rc_.updete_lock);
+      rc_.pc = std::move(temp_pc);
+      rc_.pc_pose = paired_pose;
+      rc_.pc_odom_age_ms = std::max(0.0, cbk_t - paired_odom_received_s) * 1000.0;
+      rc_.unfinished_frame_cnt++;
+      map_empty_ = false;
+    }
     rc_.cv.notify_one();
   }
 
@@ -566,7 +585,10 @@ class ROGMapROS : public ROGMap
       const bool want_terrain_markers = vm_.terrain_markers_pub &&
         vm_.terrain_markers_pub->get_subscription_count() >= 1;
       if (want_terrain_grid || want_terrain_markers) {
-        const auto labels = layer_->terrainLabels();
+        const auto snapshot = query_ ? query_->snapshot() : nullptr;
+        const auto labels = snapshot && snapshot->terrain_labels.size() ==
+          static_cast<size_t>(layer_->width()) * layer_->height() ?
+          snapshot->terrain_labels : layer_->terrainLabels();
         if (want_terrain_grid) {
           fillLayerGrid(labels, frame->terrain_label);
           frame->has_terrain_label = true;

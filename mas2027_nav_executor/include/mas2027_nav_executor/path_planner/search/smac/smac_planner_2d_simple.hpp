@@ -87,6 +87,8 @@ public:
 
   void setMap(const std::shared_ptr<rog_map::MapQueryInterface> & map);
   void setESDFQuery(const std::shared_ptr<rog_map::MapQueryInterface> & query);
+  using EdgeFilter = std::function<bool(unsigned int, unsigned int, unsigned int, unsigned int)>;
+  void setEdgeFilter(EdgeFilter filter) { edge_filter_ = std::move(filter); }
 
   /**
    * @brief Create a path from start to goal
@@ -142,6 +144,7 @@ private:
   // Costmap
   std::shared_ptr<rog_map::MapQueryInterface> map_;
   std::shared_ptr<rog_map::MapQueryInterface> esdf_query_;
+  EdgeFilter edge_filter_;
   unsigned int size_x_;
   unsigned int size_y_;
 

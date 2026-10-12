@@ -59,13 +59,14 @@ std::string classifySeedReject(const SeedRejectInfo &info,
 
 void LocalPathProcessor::configure(double lookahead_dist, double max_vel,
                                    double max_acc, double traj_goal_tolerance,
-                                   double collision_dist,
+                                   double collision_dist, double preferred_clearance,
                                    rclcpp::Logger logger) {
   lookahead_dist_ = lookahead_dist;
   max_vel_ = max_vel;
   max_acc_ = max_acc;
   traj_goal_tolerance_ = traj_goal_tolerance;
   collision_dist_ = std::max(0.0, collision_dist);
+  preferred_clearance_ = std::max(fullClearanceRequirement(), preferred_clearance);
   logger_ = logger;
 }
 
@@ -256,6 +257,41 @@ LocalPathSeed LocalPathProcessor::buildSeed(
   seed.valid = seed.sparse_waypoints.size() >= 2U &&
                pathClear(seed.sparse_waypoints, cur_pos, query, start_clearance,
                          start_clearance_ok, terrain_segment_free);
+  if (clearance_detour_enabled_ && seed.valid && dense_reject.valid && dense_reject.clearance_only &&
+      !seed.stop_at_local_end && preferred_clearance_ > fullClearanceRequirement()) {
+    // A tight but free seed can pass the occupancy gate yet leave MINCO no
+    // room to smooth. Try a wider grid route only as an improvement: if the
+    // route or its sparse chords miss the soft clearance target, keep the
+    // original seed and let the unchanged trajectory check decide.
+    std::vector<Eigen::Vector3d> wider_path;
+    if (searchDynamicDetour(cur_pos, seed.dense_path.back(), query,
+                            start_clearance, start_clearance_ok,
+                            terrain_segment_free, wider_path, nullptr,
+                            preferred_clearance_)) {
+      auto wider_sparse = utils::getSparseWaypoints(
+        wider_path, max_vel_, max_acc_, seed.local_end_is_goal,
+        [this, &mode_context, &terrain_segment_free, &cur_pos, start_clearance,
+         start_clearance_ok](const Eigen::Vector3d &a, const Eigen::Vector3d &b) {
+          return segmentClear(mode_context.sparsifyQuery(), a, b, cur_pos,
+                              start_clearance, start_clearance_ok,
+                              terrain_segment_free, nullptr, true,
+                              preferred_clearance_);
+        });
+      if (wider_sparse.size() >= 2U && wider_sparse.size() <= 16U &&
+          pathClear(wider_sparse, cur_pos, query, start_clearance,
+                    start_clearance_ok, terrain_segment_free, nullptr,
+                    preferred_clearance_)) {
+        seed.dense_path = std::move(wider_path);
+        seed.sparse_waypoints = std::move(wider_sparse);
+        seed.used_dynamic_detour = true;
+        seed.used_clearance_detour = true;
+        RCLCPP_INFO_THROTTLE(
+          logger_, *rclcpp::Clock::make_shared(), 2000,
+          "[MincoPlanner] Replaced a tight local seed with a %.3f m clearance detour.",
+          preferred_clearance_);
+      }
+    }
+  }
   if (!seed.valid) {
     // 修复看似成功后种子仍可能不可用：sparse=0 表示稀疏化整体否决，sparse>=2 表示稀疏点没过复核。
     if (seed.used_dynamic_detour || seed.stop_at_local_end) {
@@ -290,7 +326,8 @@ bool LocalPathProcessor::segmentClear(
     bool start_clearance_ok,
     const std::function<bool(const Eigen::Vector3d &, const Eigen::Vector3d &)>
         &terrain_segment_free,
-    SeedRejectInfo *reject_info, bool enforce_clearance) const {
+    SeedRejectInfo *reject_info, bool enforce_clearance,
+    double preferred_clearance) const {
   // 只记整条路径上最早的失败点（reject_info 非空时写第一次）；例外的硬否决可覆盖"只差净空"。
   const auto note_reject = [reject_info, &planning_start](
       const Eigen::Vector3d &point, double clearance, double required,
@@ -349,6 +386,9 @@ bool LocalPathProcessor::segmentClear(
         (point - planning_start).head<2>().norm() <= collision_dist_) {
       required = std::max(0.0, start_clearance - kNearFieldSlack);
       relaxed = true;
+    } else if (preferred_clearance > 0.0 &&
+               (point - planning_start).head<2>().norm() > collision_dist_) {
+      required = std::max(required, preferred_clearance);
     }
     if (clearance.distance <= required) {
       note_reject(point, clearance.distance, required, relaxed, false, true);
@@ -368,14 +408,14 @@ bool LocalPathProcessor::pathClear(
     double start_clearance, bool start_clearance_ok,
     const std::function<bool(const Eigen::Vector3d &, const Eigen::Vector3d &)>
         &terrain_segment_free,
-    SeedRejectInfo *reject_info) const {
+    SeedRejectInfo *reject_info, double preferred_clearance) const {
   if (path.size() < 2U) {
     return false;
   }
   for (size_t i = 1U; i < path.size(); ++i) {
     if (!segmentClear(query, path[i - 1U], path[i], planning_start,
-                      start_clearance, start_clearance_ok,
-                      terrain_segment_free, reject_info)) {
+                      start_clearance, start_clearance_ok, terrain_segment_free,
+                      reject_info, preferred_clearance > 0.0, preferred_clearance)) {
       return false;
     }
   }
@@ -389,7 +429,7 @@ bool LocalPathProcessor::searchDynamicDetour(
     const std::function<bool(const Eigen::Vector3d &, const Eigen::Vector3d &)>
         &terrain_segment_free,
     std::vector<Eigen::Vector3d> &detour,
-    SeedRejectInfo *reject_info) const {
+    SeedRejectInfo *reject_info, double preferred_clearance) const {
   detour.clear();
   if (!query || query->sizeX() == 0U || query->sizeY() == 0U) {
     return false;
@@ -430,6 +470,9 @@ bool LocalPathProcessor::searchDynamicDetour(
       if (start_clearance_ok && start_clearance < collision_dist_ &&
           (point - start).head<2>().norm() <= collision_dist_) {
         required = std::max(0.0, start_clearance - kNearFieldSlack);
+      } else if (preferred_clearance > 0.0 &&
+                 (point - start).head<2>().norm() > collision_dist_) {
+        required = std::max(required, preferred_clearance);
       }
       safe = result.ok && std::isfinite(result.distance) &&
              result.distance > required;
@@ -467,11 +510,18 @@ bool LocalPathProcessor::searchDynamicDetour(
   constexpr std::array<std::pair<int, int>, 8> neighbors{
       {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}}};
 
+  size_t expanded = 0U;
   while (!open.empty()) {
     const size_t current = open.top().index;
     open.pop();
     if (closed[current]) {
       continue;
+    }
+    // The optional clearance improvement must not monopolize a replan cycle.
+    // The original seed remains available if the preferred corridor is costly
+    // or impossible to find; normal obstacle detours keep their old behavior.
+    if (preferred_clearance > 0.0 && ++expanded > 8000U) {
+      return false;
     }
     closed[current] = 1U;
     if (current == target) {
@@ -535,7 +585,7 @@ bool LocalPathProcessor::searchDynamicDetour(
   detour.front() = start;
   detour.back() = goal;
   return pathClear(detour, start, query, start_clearance, start_clearance_ok,
-                   terrain_segment_free, reject_info);
+                   terrain_segment_free, reject_info, preferred_clearance);
 }
 
 bool LocalPathProcessor::buildSafeStoppingPrefix(
