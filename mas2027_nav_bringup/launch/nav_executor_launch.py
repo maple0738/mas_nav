@@ -70,7 +70,8 @@ def _launch_setup(context):
 
     use_sim_time = LaunchConfiguration("use_sim_time")
     use_rviz = LaunchConfiguration("use_rviz")
-    use_ros2_comm = LaunchConfiguration("use_ros2_comm")
+    use_nav_serial = LaunchConfiguration("use_nav_serial")
+    nav_serial_device = LaunchConfiguration("nav_serial_device")
     use_odom_localizer = LaunchConfiguration("use_odom_localizer")
     use_foxglove = LaunchConfiguration("use_foxglove")
     foxglove_address = LaunchConfiguration("foxglove_address")
@@ -175,14 +176,14 @@ def _launch_setup(context):
             ("terrain_label_map", "/terrain_label_map"),
         ],
     )
-    ros2_comm = Node(
-        package="ros2_comm",
-        executable="ros2_comm_node",
-        name="ros2_comm_node",
+    nav_serial_bridge = Node(
+        package="nav_serial_bridge",
+        executable="nav_serial_bridge_node",
+        name="nav_serial_bridge",
         output="screen",
         emulate_tty=True,
-        condition=IfCondition(use_ros2_comm),
-        parameters=[{"normal_mode": normal_mode_parameter}],
+        condition=IfCondition(use_nav_serial),
+        parameters=[{"device": nav_serial_device}],
     )
     rviz = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(launch_dir, "rviz_launch.py")),
@@ -213,7 +214,7 @@ def _launch_setup(context):
     )
 
     actions = [robot_state_publisher, mid360_driver, small_point_lio, tf_maintainer,
-        nav_executor, ros2_comm, rviz, foxglove_bridge]
+        nav_executor, nav_serial_bridge, rviz, foxglove_bridge]
     if not online:
         actions[3:3] = [odom_localizer, terrain_map_server]
     return actions
@@ -224,10 +225,10 @@ def generate_launch_description():
         DeclareLaunchArgument("use_sim_time", default_value="False"),
         # 无显示器/SSH 时用 use_rviz:=False。
         DeclareLaunchArgument("use_rviz", default_value="true"),
-        # 底盘转发桥默认开启，消费速度与模式组成的 /nav_executor/chassis_cmd。
-        # 下行固定为 vx/vy/mode/nav_state 10 字节；需配套新版 mas_vision 与底盘协议。
-        # 上机前确认底盘上电与急停状态；只想看导航不发车时用 use_ros2_comm:=False 关掉。
-        DeclareLaunchArgument("use_ros2_comm", default_value="True"),
+        # CDC1 直接发送 vx/vy/nav_state；该固件协议没有 mode 字段。
+        # 只观察导航时用 use_nav_serial:=False 关掉硬件输出。
+        DeclareLaunchArgument("use_nav_serial", default_value="True"),
+        DeclareLaunchArgument("nav_serial_device", default_value=""),
         DeclareLaunchArgument("use_odom_localizer", default_value="True"),
         DeclareLaunchArgument("use_foxglove", default_value="True"),
         DeclareLaunchArgument("foxglove_address", default_value="127.0.0.1"),

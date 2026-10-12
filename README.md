@@ -14,7 +14,7 @@ ROS 2 Jazzy，运行链路统一为独立 `nav_executor`：不依赖 Nav2 server
 | `tf_maintainer` | 唯一动态 TF 发布者：`map→odom`、`odom→base_link` |
 | `terrain_map_server` | 静态地形服务 → `/cost_map`、`/terrain_label_map` |
 | `nav_executor` | TaskManager + ROGMap + 全局搜索 + MINCO + MPC + 区域控制 → `/opt_path`、`/cmd_vel`、`/nav_executor/chassis_cmd` |
-| `ros2_comm`（可选） | 消费 `/nav_executor/chassis_cmd` → UDP 底盘协议 |
+| `nav_serial_bridge`（可选） | 消费 `/nav_executor/chassis_cmd` → CDC1 导航专用串口 |
 | `robot_state_publisher` | URDF → 车体 / 雷达外参 |
 
 `ROGMap` 在 `nav_executor` 进程内（`nav_executor_planner`），无独立节点，参数在 `planner.rog_map.*`；
@@ -151,15 +151,60 @@ source /home/mas/mas_nav_2027_native/install/setup.bash
 ros2 launch mas2027_nav_bringup nav_executor_launch.py
 ```
 
-常用启动参数：`use_rviz`、`use_odom_localizer`、`use_ros2_comm`、`output_topic`。
+常用启动参数：`use_rviz`、`use_odom_localizer`、`use_nav_serial`、`nav_serial_device`、`output_topic`。
 启动模式仅由 `mas2027_nav_executor/config/node_params.yaml` 中的 `node.map_source` 选择，修改后重启生效。
 设为 `prior` 时，先验地图文件统一在 `mas2027_nav_bringup/config/navigation_map.yaml` 中选择。
 设为 `online` 时使用无先验模式：不读取地图文件、不启动 GICP 定位器和静态地图服务，
 使用 `odom` 下的 LIO 与在线 ROGMap 分段推进；速度与加速度采用规划器、MPC 和区域控制 YAML，未知区域作为障碍。
 在线模式默认启用 B1 累计地图，在 `/nav_executor/online_global_map` 保留本次启动内的历史观测，并提供固定版本的全局查询接口；当前任务搜索仍使用 A 方案，后续 B2 接入累计地图路线。
 具体启动、目标坐标和能力范围见 [无先验地图导航](docs/online_navigation.md)。
-`use_ros2_comm` 默认 `True`——它消费 `/nav_executor/chassis_cmd`，不开会「指令一直有值但车不动」；
-只想看导航时置 `False` 并确认底盘与急停状态。RViz 的 2D Goal Pose 发到 `/goal_pose`。
+`use_nav_serial` 默认 `True`，通过 CDC1 直接发送 `vx`、`vy`、`nav_state`；只想观察导航时置
+`False`。导航桥默认读取 USB 接口自身的 `iInterface`，仅连接字符串为 `PCCOMM-NAV` 的
+CDC 串口，不依赖 `/dev/ttyACM*` 编号、`if02` 顺序或设备产品名称；
+`nav_serial_device` 可显式指定串口路径。RViz 的 2D Goal Pose 发到 `/goal_pose`。
+
+### 只有控制板时检查串口频率
+
+不要同时启动整套导航和独立串口桥。确认导航接口对应的串口没有其他占用后，按上面的方式加载
+ROS 环境，单独运行 `ros2 run nav_serial_bridge nav_serial_bridge_node`，保持约 30 秒再按 Ctrl+C。
+没有 ROS 底盘命令时，桥只发送零速度与 `nav_state=0`。每 5 秒的 `CDC1` 日志给出：
+
+- `tx_ok` 和括号内的 Hz：主机成功写入串口的帧数与平均频率，目标约 50 Hz；
+  `tx_failed` 为短写或系统调用失败数，`max_tx_gap` 为相邻成功写入调用的最大间隔。
+- `rx_valid` 和 Hz：通过 CRC 的下位机回传帧数与平均频率，当前板子约 500 Hz；
+  `rx_crc_bad` 为 CRC 不符的候选帧数，`rx_discarded` 为同步时丢弃的字节数。
+
+这些数字能检查本机定时器、串口写入和回传帧质量。当前固件回传帧没有下行命令的序号或确认计数，
+所以 `tx_ok` **不能证明板子收到了每一帧**，`rx_valid` 也无法严格统计板子发出后在上行丢失的帧。
+要测真实端到端丢包率，需要在固件接收侧计数，或给下行加序号并在上行回显；改协议时上位机和固件须同时更新。
+
+### 同时检查视觉 CDC0 与导航 CDC1
+
+控制板单独接 USB 时，可手动在两个终端同时运行。先在视觉工程 `/home/mas/桌面/mas_vision`
+执行 `cmake --build build --target vision_serial_bench -j4`。导航桥默认查找
+`PCCOMM-NAV` 接口；视觉程序的端口配置需另行确认。
+
+终端一从本导航工作区运行：
+
+```bash
+source install/setup.bash
+ros2 run nav_serial_bridge nav_serial_bridge_node
+```
+
+终端二从视觉工程运行：
+
+```bash
+cd /home/mas/桌面/mas_vision/build
+./vision_serial_bench 30
+```
+
+视觉台架入口不启动相机，只在 CDC0 发送零目标角、`fire_advice=0`。导航桥只接收
+`/nav_executor/chassis_cmd` 的导航系统指令；没有新指令或指令超过 300 ms 时在 CDC1
+发送零速度、`nav_state=0`。不要同时运行视觉 `./base` 或第二个
+导航桥。视觉每 3 秒的 `[serial-rate]` 目标为发送约 250 Hz、接收约 500 Hz，
+`tx_err`、`crc_errors`、`dropped_bytes`、`queue_dropped` 应为 0；导航每 5 秒的
+`CDC1` 目标为发送约 50 Hz、接收约 500 Hz，写入和 CRC 错误应为 0。
+这些是主机串口写入与有效回传计数；板端收到多少下行帧仍需固件接收计数或序号回显确认。
 
 ## 核心配置
 

@@ -22,7 +22,7 @@
   <exec_depend>tf_maintainer</exec_depend>
   <exec_depend>mas2027_nav_executor</exec_depend>
   <exec_depend>interfaces</exec_depend>
-  <exec_depend>ros2_comm</exec_depend>
+  <exec_depend>nav_serial_bridge</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>foxglove_bridge</exec_depend>
 

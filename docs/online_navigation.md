@@ -9,16 +9,16 @@
 ```bash
 cd /home/mas/mas_nav_2027_native
 source /opt/ros/jazzy/setup.bash
-colcon build --symlink-install --packages-select mas2027_nav_executor mas2027_nav_bringup \
+colcon build --symlink-install --packages-select nav_serial_bridge mas2027_nav_executor mas2027_nav_bringup \
   --parallel-workers 2 --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 
-# 观察在线导航，关闭底盘通信桥。
+# 观察在线导航，关闭底盘串口输出。
 ros2 launch mas2027_nav_bringup nav_executor_launch.py \
-  use_ros2_comm:=False
+  use_nav_serial:=False
 ```
 
-需要底盘执行时使用 `use_ros2_comm:=True`。没有显示器时增加 `use_rviz:=False`。切回先验地图模式时，将上述 YAML 中的 `map_source` 改为 `prior`。
+需要底盘执行时使用 `use_nav_serial:=True`（默认）；导航桥默认按 USB 接口字符串 `PCCOMM-NAV` 查找串口，`nav_serial_device` 可显式指定路径。没有显示器时增加 `use_rviz:=False`。切回先验地图模式时，将上述 YAML 中的 `map_source` 改为 `prior`。
 
 `map_source` 是启动时选择，切换模式需要重启。在线模式即使 `use_odom_localizer` 保持默认 `True`，也不会启动先验定位器。
 
