@@ -34,12 +34,12 @@ public:
     command_sub_ = create_subscription<interfaces::msg::ChassisCommand>(
       "/nav_executor/chassis_cmd", rclcpp::QoS(1),
       [this](interfaces::msg::ChassisCommand::ConstSharedPtr msg) {
-        if (!std::isfinite(msg->vx) || !std::isfinite(msg->vy)) {
+        if (!std::isfinite(msg->vx) || !std::isfinite(msg->vy) || !std::isfinite(msg->w)) {
           vx_ = 0.0f;
           vy_ = 0.0f;
           has_command_ = false;
           RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-                               "Non-finite chassis command; sending stop");
+                               "Non-finite chassis command; zeroing translation");
           return;
         }
         vx_ = msg->vx;
@@ -55,10 +55,10 @@ public:
   ~NavSerialBridge() override
   {
     if (fd_ >= 0) {
-      const auto stop = nav_serial_bridge::make_command(0.0f, 0.0f, 0);
+      const auto stop = nav_serial_bridge::make_command(0.0f, 0.0f);
       const ssize_t written = ::write(fd_, stop.data(), stop.size());
       if (written != static_cast<ssize_t>(stop.size())) {
-        RCLCPP_WARN(get_logger(), "Could not send final navigation stop frame");
+        RCLCPP_WARN(get_logger(), "Could not send final zero-translation frame");
       }
       ::close(fd_);
     }
@@ -177,8 +177,7 @@ private:
     const bool fresh = has_command_ && now - last_command_ <= kCommandTimeout;
     const float vx = fresh ? vx_ : 0.0f;
     const float vy = fresh ? vy_ : 0.0f;
-    const uint8_t nav_state = (vx != 0.0f || vy != 0.0f) ? 1 : 0;
-    const auto frame = nav_serial_bridge::make_command(vx, vy, nav_state);
+    const auto frame = nav_serial_bridge::make_command(vx, vy);
     const ssize_t written = ::write(fd_, frame.data(), frame.size());
     if (written != static_cast<ssize_t>(frame.size())) {
       ++failed_tx_frames_;
@@ -195,7 +194,7 @@ private:
     last_tx_time_ = now;
     if (has_command_ && !fresh) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-                           "Chassis command timed out; sending zero velocity");
+                           "Chassis command timed out; zeroing translation");
     }
     if (now - last_diag_time_ >= kDiagnosticsPeriod) {
       const double seconds = std::chrono::duration<double>(now - last_diag_time_).count();

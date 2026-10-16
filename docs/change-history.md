@@ -2,6 +2,26 @@
 
 本文件记录由开发任务产生的代码、配置、脚本、资源和文档变更。新记录追加在最上方，不改写旧记录。
 
+## 2026-10-16 — 角速度改为始终 +4 rad/s
+
+- 改动：`mas2027_nav_executor/src/nav_executor_node.cpp` 将每周期 `/cmd_vel.angular.z` 与 `/nav_executor/chassis_cmd.w` 固定为 `+4 rad/s`，移除行进正弦和到达目标后切换状态；`vx/vy` 仍按原有运动许可与安全检查输出。`nav_serial_bridge` 的 `protocol.hpp` 固定每个 CDC1 下行帧的 `w=+4 rad/s`、`nav_state=1`，包括无有效指令、超时及退出前最后一帧；这些情形仅清零 `vx/vy`。更新协议测试和项目、区域控制说明。
+- 验证：`mas2027_nav_executor`、`nav_serial_bridge` Release 构建通过；两包 CTest 分别 5/5 与 2/2 通过，协议测试覆盖零线速度及非零线速度帧的 `w=4`、`nav_state=1` 和 CRC；节点 YAML 解析与 `git diff --check` 通过。未进行虚拟串口端到端采样或真实底盘转动测试。
+
+## 2026-10-16 — 导航状态常为 1，行进正弦角速度与到达后旋转
+
+- 改动：`nav_serial_bridge` 的 CDC1 常规发送帧和退出前零速度帧固定使用 `nav_state=1`；无有效指令、超时或速度无效时仍清零 `vx/vy/w`。`TaskManager` 记录目标到达状态并在接收新目标时清除，`PathPlanner` 将其传给 `nav_executor_node`。执行器在有效行进期间输出峰值 ±3 rad/s、默认 0.5 Hz 的正弦 `w`，到达目标后将线速度清零并持续输出 `+4 rad/s`，其他停车和控制失败时输出零角速度；`/cmd_vel.angular.z` 与 `/nav_executor/chassis_cmd.w` 保持一致。更新节点参数、启动注释和使用说明。
+- 验证：`mas2027_nav_executor`、`nav_serial_bridge` Release 构建通过；两包 CTest 分别 5/5 与 2/2 通过，节点 YAML 解析、启动脚本 Python 编译和 `git diff --check` 通过。未做虚拟串口端到端采样或真实底盘试车；正弦频率、±3 rad/s 峰值和到达后的持续 +4 rad/s 尚未在底盘上标定。
+
+## 2026-10-13 — 自动导航暂用固定角速度
+
+- 改动：`mas2027_nav_executor/src/nav_executor_node.cpp` 在执行器本轮通过运动许可和安全检查时，将最终 `/cmd_vel.angular.z` 与 `/nav_executor/chassis_cmd.w` 同步设为启动参数 `node.fixed_w`；停车、输入失效或控制失败时仍设零，不改变 `vx/vy`。`config/node_params.yaml` 默认值暂为 `0.1 rad/s`，按板间 0.1 rad/s 分辨率选择；参数只读且必须落在 MPC 角速度限制内。更新项目与区域控制说明。
+- 验证：`mas2027_nav_executor` Release 构建、节点 YAML 解析与 `git diff --check` 通过。未做真实底盘转动或有效导航轨迹下的端到端指令测试；固定值和方向尚待现场确认，前一条记录所述 16 字节协议字段顺序也仍待与固件 `modules/NAV/NAV.MD` 核对。
+
+## 2026-10-13 — 导航 CDC1 下发角速度 w
+
+- 改动：`ChassisCommand.msg` 增加 `w`，`nav_executor_node.cpp` 将同周期 `/cmd_vel.angular.z` 放入底盘命令；`nav_serial_bridge` 检查三个速度的有限性，超时或无效时清零三路，且仅 `w` 非零也设置 `nav_state=1`。`protocol.hpp` 将下行帧扩为 16 字节，暂按 `0xB5 + float32 vx + float32 vy + float32 w + uint8 nav_state + CRC16` 的顺序编码，CRC 覆盖帧头与数据字段；上行 11 字节解析保持原状。更新执行器和项目说明。这里接通的是现有 MPC 角速度输出，尚未实现利用云台相对底盘角度 `δ` 的特殊地形朝向闭环。
+- 验证：`interfaces`、`mas2027_nav_executor`、`nav_serial_bridge` Release 构建通过；`nav_serial_bridge` 测试共 7 项无失败，覆盖 16 字节零/非零帧、CRC、仅 `w` 非零的 `nav_state`；隔离 ROS 域的虚拟串口观察到 56 帧仅 `w=0.3 rad/s` 的运动帧，停止发布后 10 帧三路零速度、`nav_state=0` 的帧；`git diff --check` 通过。未找到固件说明 `modules/NAV/NAV.MD`，尚需核对字段顺序与 CRC 范围；未接实板、未验证板间 0.1 rad/s 量化、实际转动或特殊地形对正。
+
 ## 2026-10-12 — 导航串口按 USB 接口字符串识别
 
 - 改动：`nav_serial_bridge` 默认扫描 Linux CDC ACM 串口，读取各端口所属 USB 接口的 sysfs `interface` 属性，仅在唯一匹配 `PCCOMM-NAV` 时连接；每次重连重新查找，不使用 `ttyACM` 编号、接口序号或 USB 产品名称。`nav_serial_device` 仍可显式指定路径，bringup 默认改为空值以启用自动识别。更新导航说明；发送和接收帧格式、CRC 实现未改动。视觉工程未修改。

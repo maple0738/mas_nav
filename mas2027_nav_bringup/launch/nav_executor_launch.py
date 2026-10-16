@@ -225,7 +225,7 @@ def generate_launch_description():
         DeclareLaunchArgument("use_sim_time", default_value="False"),
         # RViz 默认关闭，需要图形窗口时显式传 use_rviz:=True。
         DeclareLaunchArgument("use_rviz", default_value="false"),
-        # CDC1 直接发送 vx/vy/nav_state；该固件协议没有 mode 字段。
+        # CDC1 直接发送 vx/vy/w/nav_state；该固件协议没有 mode 字段。
         # 只观察导航时用 use_nav_serial:=False 关掉硬件输出。
         DeclareLaunchArgument("use_nav_serial", default_value="True"),
         DeclareLaunchArgument(

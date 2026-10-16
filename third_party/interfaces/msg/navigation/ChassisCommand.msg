@@ -2,4 +2,5 @@
 std_msgs/Header header
 float32 vx
 float32 vy
+float32 w
 uint8 mode

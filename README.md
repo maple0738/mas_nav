@@ -96,11 +96,12 @@ required(v) = collision_dist + max(v * replan_react_time, monitor_margin)
 - ROGMap 订阅 `/cloud_registered` + `/Odometry`；RViz `ROGMAP` 分组默认显示紫色 `Occupied`（0.05 m）
   与 `2D Distance Field`。先验图融合关闭，`Static Layer Value` 不代表地形图；投影高度、地面/墙体
   阈值与 `node.rog_map_clearance` 需在静止实车上标定。已移除目标跟踪与未来预测（防振动误判）。
-- MPC 仍为全向模型（`linear.x/y`、`angular.z`，±2 rad/s、±4 rad/s²，需按底盘标定）。
-  区域控制沿最终轨迹标注坡道、隧道和起伏路，以 `/nav_executor/chassis_cmd` 同步下发速度与
-  mode；`/cmd_vel` 保留供观测。`nav_serial_bridge` 从同一消息提取 `vx`/`vy`，
-  通过导航专用 CDC1 串口直接发送；当前固件包没有 `mode` 和 `angular.z` 字段。
-  区域 mode 只在导航内部生效，底盘模式切换仍需后续扩展固件协议。
+- MPC 仍为全向模型（`linear.x/y`、`angular.z`，内部角速度限制 ±2 rad/s、角加速度限制 ±4 rad/s²，需按底盘标定）；最终 `w` 由下面的角速度配置覆盖。
+  区域控制沿最终轨迹标注坡道、隧道和起伏路，以 `/nav_executor/chassis_cmd` 同步发布速度与
+  mode；`/cmd_vel` 保留供观测。`nav_serial_bridge` 从同一消息提取 `vx`、`vy`、`w`，
+  通过导航专用 CDC1 串口直接发送；当前固件包没有 `mode` 字段。
+  最终 `w` 始终为 `+4 rad/s`，包括行进、到达目标和线速度停车期间；不按正弦变化。
+  区域 mode 只在导航内部生效；特殊地形的底盘朝向闭环尚需相对角度 `δ` 反馈。
 - `lab3_terrain.msgpack` 只有平地/障碍，无坡道台阶与方向数据；方向层实测全 0，逐边方向约束只在
   `validateTrajectory` 的 `terrain->transition()`（失败记 `TERRAIN_COLLISION`）。
 - **折线与轨迹是两条线**：粗青线 = 搜索想怎么绕，细彩线 = 车准备怎么走，明显不重合时问题在 MINCO
@@ -158,7 +159,7 @@ ros2 launch mas2027_nav_bringup nav_executor_launch.py
 使用 `odom` 下的 LIO 与在线 ROGMap 分段推进；速度与加速度采用规划器、MPC 和区域控制 YAML，未知区域作为障碍。
 在线模式默认启用 B1 累计地图，在 `/nav_executor/online_global_map` 保留本次启动内的历史观测，并提供固定版本的全局查询接口；当前任务搜索仍使用 A 方案，后续 B2 接入累计地图路线。
 具体启动、目标坐标和能力范围见 [无先验地图导航](docs/online_navigation.md)。
-`use_nav_serial` 默认 `True`，通过 CDC1 直接发送 `vx`、`vy`、`nav_state`；只想观察导航时置
+`use_nav_serial` 默认 `True`，通过 CDC1 直接发送 `vx`、`vy`、`w`、`nav_state`；只想观察导航时置
 `False`。导航桥默认读取 USB 接口自身的 `iInterface`，仅连接字符串为 `PCCOMM-NAV` 的
 CDC 串口，不依赖 `/dev/ttyACM*` 编号、`if02` 顺序或设备产品名称；
 `nav_serial_device` 可显式指定串口路径。RViz 的 2D Goal Pose 发到 `/goal_pose`。
@@ -167,7 +168,7 @@ CDC 串口，不依赖 `/dev/ttyACM*` 编号、`if02` 顺序或设备产品名�
 
 不要同时启动整套导航和独立串口桥。确认导航接口对应的串口没有其他占用后，按上面的方式加载
 ROS 环境，单独运行 `ros2 run nav_serial_bridge nav_serial_bridge_node`，保持约 30 秒再按 Ctrl+C。
-没有 ROS 底盘命令时，桥只发送零速度与 `nav_state=0`。每 5 秒的 `CDC1` 日志给出：
+没有 ROS 底盘命令时，桥发送 `vx=vy=0`、`w=+4 rad/s`、`nav_state=1`。每 5 秒的 `CDC1` 日志给出：
 
 - `tx_ok` 和括号内的 Hz：主机成功写入串口的帧数与平均频率，目标约 50 Hz；
   `tx_failed` 为短写或系统调用失败数，`max_tx_gap` 为相邻成功写入调用的最大间隔。
@@ -200,7 +201,7 @@ cd /home/mas/桌面/mas_vision/build
 
 视觉台架入口不启动相机，只在 CDC0 发送零目标角、`fire_advice=0`。导航桥只接收
 `/nav_executor/chassis_cmd` 的导航系统指令；没有新指令或指令超过 300 ms 时在 CDC1
-发送零速度、`nav_state=0`。不要同时运行视觉 `./base` 或第二个
+发送零线速度、`w=+4 rad/s`、`nav_state=1`。不要同时运行视觉 `./base` 或第二个
 导航桥。视觉每 3 秒的 `[serial-rate]` 目标为发送约 250 Hz、接收约 500 Hz，
 `tx_err`、`crc_errors`、`dropped_bytes`、`queue_dropped` 应为 0；导航每 5 秒的
 `CDC1` 目标为发送约 50 Hz、接收约 500 Hz，写入和 CRC 错误应为 0。

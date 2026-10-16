@@ -1,6 +1,6 @@
 # 区域控制：隧道、坡道、起伏路
 
-本文解释当前导航侧的区域控制实现。导航内部沿规划轨迹切换区域速度参数和 `mode` 状态；当前 CDC1 串口协议只接收速度与 `nav_state`，尚不能把 `mode` 传给底盘。底盘自转行为由下位机自身决定。导航侧也不向底盘传 `omega`。
+本文解释当前导航侧的区域控制实现。导航内部沿规划轨迹切换区域速度参数和 `mode` 状态；CDC1 串口下发 `vx`、`vy`、`w` 与 `nav_state`，仍不下发 `mode`。`w` 始终为 +4 rad/s；特殊地形的底盘朝向闭环尚未接入相对角度 `δ`。
 
 ## 1. 数据流
 
@@ -15,11 +15,11 @@ terrain msgpack → map_server: /cost_map + /terrain_label_map
   → RegionPlan / RegionSegment
   → RegionController（按路径进度切换阶段与 mode）
   → PathExecutor（区域速度、加速度约束下的 MPC）
-  → /nav_executor/chassis_cmd（同一消息内的 vx、vy、mode）
+  → /nav_executor/chassis_cmd（同一消息内的 vx、vy、w、mode）
   → nav_serial_bridge → CDC1 导航专用串口 → 下位机
 ```
 
-`/cmd_vel` 仍发布，供现有工具观察速度；`nav_serial_bridge` 实际消费的是 `/nav_executor/chassis_cmd`，只取 `vx`、`vy`。区域控制的状态另发到 `/nav_executor/region_status`，但其中的 mode 不出串口。
+`/cmd_vel` 仍发布，供现有工具观察速度；`nav_serial_bridge` 实际消费的是 `/nav_executor/chassis_cmd`，取 `vx`、`vy`、`w`。区域控制的状态另发到 `/nav_executor/region_status`，但其中的 mode 不出串口。
 
 ## 2. 地图如何表示区域
 
@@ -95,18 +95,20 @@ terrain msgpack → map_server: /cost_map + /terrain_label_map
 | `speed_blend_rate` | 最大速度上限每秒允许变化的量 |
 | `acceleration_blend_rate` | 加速度上限每秒允许变化的量 |
 
-MINCO 在稀疏路径上读取原始区域标签，为坡道影响窗提供更高的分段速度上限，并对隧道、起伏路按各自上限约束，再做速度传播和轨迹优化。最终轨迹进入执行器后，`PathExecutor` 还会按当前区域 profile 更新 MPC 的 `vx/vy`、`ax/ay` 约束，并对最终平移合速度做上限校验。进入坡道时，上限在导航内部请求坡道 mode 后按 `speed_blend_rate`、`acceleration_blend_rate` 逐步提高；坡道外立即受普通路段上限约束。当前串口既不发送 mode，也不发送 `omega`。
+MINCO 在稀疏路径上读取原始区域标签，为坡道影响窗提供更高的分段速度上限，并对隧道、起伏路按各自上限约束，再做速度传播和轨迹优化。最终轨迹进入执行器后，`PathExecutor` 还会按当前区域 profile 更新 MPC 的 `vx/vy`、`ax/ay` 约束，并对最终平移合速度做上限校验。进入坡道时，上限在导航内部请求坡道 mode 后按 `speed_blend_rate`、`acceleration_blend_rate` 逐步提高；坡道外立即受普通路段上限约束。当前串口发送固定 `w`，不发送 mode，也未按坡面或隧道方向单独生成 `w`。
 
 当前映射为普通路段 `mode=4`、上坡 `label=mode=5`、隧道 `label=mode=6`、起伏路 `label=mode=7`，均为 `uint8`；特殊区域若配置了与标签不同的 mode，导航节点会拒绝启动。普通路段上限为 `3.0 m/s`、`4.0 m/s²`；坡道上限为 `4.0 m/s`、`5.0 m/s²`，隧道及起伏路仍为普通路段上限。MINCO 和 MPC 的总上限允许坡道值，普通路段由 `normal_max_speed`、`normal_max_acceleration` 约束；MINCO 按静态标签使用坡道速度窗口，执行器还可按在线标签切换 mode 和约束。坡道准备、请求 mode、提交距离分别为 0.3/0.2/0.1 m；较高上限仅在请求坡道 mode 后逐步生效。实际速度仍由轨迹曲率、障碍净空、控制器与底盘能力决定；阶段距离仍需实车标定。
 
 ## 6. 导航专用 CDC1 协议
 
-导航节点发布的 `interfaces/ChassisCommand` 仍把 `vx`、`vy`、`mode` 放在同一条 ROS 消息中。`nav_serial_bridge` 只取速度，向下位机 CDC1 接口发送 12 字节帧：`0xB5`、小端 `float vx`、小端 `float vy`、`uint8 nav_state`、小端 CRC16。CRC 使用 `crc_rm` 的初值 `0xFFFF`、反射多项式 `0x8408`。速度非零且指令新鲜时 `nav_state=1`；速度为零、没有指令或超过 300 ms 未收到新指令时发送零速度与 `nav_state=0`。发送周期 20 ms，串口为 115200 8N1。
+导航节点发布的 `interfaces/ChassisCommand` 把 `vx`、`vy`、`w`、`mode` 放在同一条 ROS 消息中。`nav_serial_bridge` 向下位机 CDC1 接口发送 16 字节帧：`0xB5`、小端 `float vx`、小端 `float vy`、小端 `float w`、`uint8 nav_state`、小端 CRC16。CRC 使用 `crc_rm` 的初值 `0xFFFF`、反射多项式 `0x8408`。每帧固定 `w=+4 rad/s`、`nav_state=1`，包括没有有效指令、指令超过 300 ms 和退出前的最后一帧；这些情形仅将 `vx/vy` 清零。发送周期 20 ms，串口为 115200 8N1。板间执行分辨率为 0.1 rad/s，上位机不预先量化。
 
-下位机回传为 11 字节帧：`0x5B`、8 字节 `NavSendPacket` 裁判数据、CRC16。桥目前校验并统计回传帧，没有将它转成 ROS 消息。当前接收结构 `NavReceivePacket` 只有速度与 `nav_state`，没有 mode；原视觉 UDP/串口转发不参与这条链路。
+执行器每个控制周期都输出 `w=+4 rad/s`，不依赖目标或控制状态；线速度仍由运动许可、轨迹、里程计、MPC 与安全门决定。该覆盖值独立于 MPC 的 ±2 rad/s 角速度限制。`/cmd_vel.angular.z` 和 `/nav_executor/chassis_cmd.w` 发布同一个最终值。
+
+下位机回传仍按现有 11 字节帧解析：`0x5B`、8 字节 `NavSendPacket` 裁判数据、CRC16。桥目前校验并统计回传帧，没有将它转成 ROS 消息。下行帧没有 mode；原视觉 UDP/串口转发不参与这条链路。
 
 `normal_mode` 是 `mas2027_nav_bringup/launch/nav_executor_launch.py` 的导航内部启动参数，默认 4；三类区域的 mode 和速度参数在 `config/region_control.yaml`。两处的普通 mode 编号必须一致，但当前都不作为串口字段发送。
 
 ## 7. 当前验证与限制
 
-CDC1 的零速度报文与回传 CRC 已在硬件接口上测试；非零速度仍需先通过虚拟串口校验，再做实车联调。底盘不会收到 mode，所以在下位机协议扩展前，区域 `COMMITTED` 不能用于底盘模式确认。地图仍需标注区域，速度与距离参数仍需标定。
+新 16 字节下行帧已做本地编码测试，仍需按控制板 `modules/NAV/NAV.MD` 核对字段顺序，并做实板收发与非零 `w` 联调。底盘不会收到 mode，所以区域 `COMMITTED` 不能用于底盘模式确认。上位机尚未收到大 yaw 相对底盘的角度 `δ`；因此目前不能宣称已实现底盘对正坡面或隧道的闭环。地图仍需标注区域，速度与距离参数仍需标定。

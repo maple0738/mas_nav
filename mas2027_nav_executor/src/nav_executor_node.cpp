@@ -310,7 +310,7 @@ public:
       goal_topic_, rclcpp::QoS(1),
       [this](const geometry_msgs::msg::PoseStamped::SharedPtr goal) { accept_goal(goal); });
 
-    // ── 实时命令输出层：/cmd_vel 用于 ROS 速度接口；ChassisCommand 将 vx/vy/mode 同周期交给底盘桥。
+    // ── 实时命令输出层：/cmd_vel 用于 ROS 速度接口；ChassisCommand 将 vx/vy/w/mode 同周期交给底盘桥。
     command_pub_ = create_publisher<geometry_msgs::msg::Twist>(output_topic_, rclcpp::QoS(1));
     chassis_command_pub_ = create_publisher<interfaces::msg::ChassisCommand>(
       chassis_cmd_topic_, rclcpp::QoS(1));
@@ -614,12 +614,15 @@ private:
     input.region_acceleration_limit = region_controller_->accelerationLimit();
 
     ExecutorOutput output = path_executor_->computeCommand(input);
+    // Keep chassis yaw at +4 rad/s even when translation is stopped.
+    output.command.angular.z = 4.0;
     command_pub_->publish(output.command);
     interfaces::msg::ChassisCommand chassis_command;
     chassis_command.header.stamp = input.stamp;
     chassis_command.header.frame_id = "base_link";
     chassis_command.vx = static_cast<float>(output.command.linear.x);
     chassis_command.vy = static_cast<float>(output.command.linear.y);
+    chassis_command.w = static_cast<float>(output.command.angular.z);
     chassis_command.mode = region_controller_->mode();
     chassis_command_pub_->publish(chassis_command);
     interfaces::msg::RegionStatus region_status;
