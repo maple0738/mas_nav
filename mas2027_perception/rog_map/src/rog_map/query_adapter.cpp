@@ -316,8 +316,11 @@ QueryResult QueryAdapter::query(const Eigen::Vector3d & pos) const
     return recorded(makeResult(*snap, QueryStatus::FIELD_UNINITIALIZED));
   }
 
-  const double px = (pos.x() - snap->origin_x) / snap->resolution;
-  const double py = (pos.y() - snap->origin_y) / snap->resolution;
+  // EDT samples belong to cell centers, matching mapToWorld(). Without the
+  // half-cell offset a query at a cell center interpolates its neighbors and
+  // can report free clearance for an occupied cell (or reject a safe cell).
+  const double px = (pos.x() - snap->origin_x) / snap->resolution - 0.5;
+  const double py = (pos.y() - snap->origin_y) / snap->resolution - 0.5;
   const int ix = static_cast<int>(std::floor(px));
   const int iy = static_cast<int>(std::floor(py));
   if (ix < 0 || iy < 0 || ix >= snap->width - 1 || iy >= snap->height - 1) {

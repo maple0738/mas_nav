@@ -61,6 +61,79 @@ bool projectStartToFreeCell(
   return false;
 }
 
+bool cellHasSearchClearance(
+  const std::shared_ptr<rog_map::MapQueryInterface> & map,
+  unsigned int mx,
+  unsigned int my,
+  double required_clearance)
+{
+  if (!map || !(required_clearance > 0.0)) {
+    return true;
+  }
+  double wx = 0.0;
+  double wy = 0.0;
+  map->mapToWorld(mx, my, wx, wy);
+  const auto field = map->query({wx, wy, 0.0});
+  return field.ok && std::isfinite(field.distance) &&
+    static_cast<float>(field.distance) >= static_cast<float>(required_clearance);
+}
+
+// USTC's planner ejects both start and goal from the obstacle before search.
+// The existing projectStartToFreeCell() only looks at cost; a start cell that
+// is free but within the search ESDF threshold still makes SMAC reject with
+// iterations=1. Search outward for a nearby cell that satisfies both cost and
+// clearance, but keep the shift bounded so the global path stays attached to
+// the robot. The local planner still starts from the actual measured pose.
+bool projectStartToSearchableCell(
+  const std::shared_ptr<rog_map::MapQueryInterface> & map,
+  unsigned int & mx,
+  unsigned int & my,
+  double required_clearance,
+  double max_shift)
+{
+  if (!map || !(required_clearance > 0.0) || !(max_shift > 0.0)) {
+    return true;
+  }
+  if (map->isFree(mx, my) && cellHasSearchClearance(map, mx, my, required_clearance)) {
+    return true;
+  }
+  const double resolution = map->resolution();
+  if (!std::isfinite(resolution) || resolution <= 1.0e-6) {
+    return false;
+  }
+  const int max_radius = std::max(1, static_cast<int>(std::ceil(max_shift / resolution)));
+  const int nx = static_cast<int>(map->sizeX());
+  const int ny = static_cast<int>(map->sizeY());
+  for (int radius = 1; radius <= max_radius; ++radius) {
+    for (int dy = -radius; dy <= radius; ++dy) {
+      for (int dx = -radius; dx <= radius; ++dx) {
+        if (std::abs(dx) != radius && std::abs(dy) != radius) {
+          continue;
+        }
+        if (std::hypot(static_cast<double>(dx) * resolution,
+            static_cast<double>(dy) * resolution) > max_shift + 1.0e-9) {
+          continue;
+        }
+        const int cx = static_cast<int>(mx) + dx;
+        const int cy = static_cast<int>(my) + dy;
+        if (cx < 0 || cy < 0 || cx >= nx || cy >= ny) {
+          continue;
+        }
+        const auto ux = static_cast<unsigned int>(cx);
+        const auto uy = static_cast<unsigned int>(cy);
+        if (!map->isFree(ux, uy) ||
+            !cellHasSearchClearance(map, ux, uy, required_clearance)) {
+          continue;
+        }
+        mx = ux;
+        my = uy;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 const char * cellCostLabel(const unsigned char cost)
 {
   if (cost == kUnknownCost) {
@@ -81,6 +154,226 @@ bool smacTraversableCost(const unsigned char cost, const bool allow_unknown)
     return allow_unknown;
   }
   return cost < kInscribedCost;
+}
+
+// 目标格本身不可通行或净空不足时，沿 start→goal 的方向从目标往后退，
+// 找最近一个满足搜索净空的可通行格作为接近点。搜索路径仍然经过完整
+// SMAC/MINCO 安全和地形校验；这里只避免整个目标因为最后一格被直接拒掉。
+bool findGoalApproach(
+  const std::shared_ptr<rog_map::MapQueryInterface> & query,
+  const geometry_msgs::msg::Pose & start,
+  const geometry_msgs::msg::Pose & goal,
+  double required_clearance,
+  bool allow_unknown,
+  double max_shorten,
+  geometry_msgs::msg::Pose & approach,
+  double & shorten_distance)
+{
+  if (!query || !(required_clearance > 0.0) || !(max_shorten > 0.0) ||
+    !std::isfinite(start.position.x) || !std::isfinite(start.position.y) ||
+    !std::isfinite(goal.position.x) || !std::isfinite(goal.position.y)) {
+    return false;
+  }
+
+  unsigned int sx = 0U;
+  unsigned int sy = 0U;
+  unsigned int gx = 0U;
+  unsigned int gy = 0U;
+  if (!query->worldToMap(start.position.x, start.position.y, sx, sy) ||
+    !query->worldToMap(goal.position.x, goal.position.y, gx, gy)) {
+    return false;
+  }
+
+  const double dx = start.position.x - goal.position.x;
+  const double dy = start.position.y - goal.position.y;
+  const double length = std::hypot(dx, dy);
+  if (!std::isfinite(length) || length <= 1e-6) {
+    return false;
+  }
+  const double ux = dx / length;
+  const double uy = dy / length;
+  const double resolution = query->resolution();
+  const double step = (std::isfinite(resolution) && resolution > 1e-6) ?
+    std::max(0.05, resolution) : 0.05;
+
+  for (double distance = step; distance <= max_shorten + 1e-9 && distance < length;
+    distance += step) {
+    const double wx = goal.position.x + ux * distance;
+    const double wy = goal.position.y + uy * distance;
+    unsigned int mx = 0U;
+    unsigned int my = 0U;
+    if (!query->worldToMap(wx, wy, mx, my)) {
+      continue;
+    }
+    // A zero-length approach path is not useful: if the robot is already on the
+    // only safe cell, let the normal fallback/recovery path handle the blockage.
+    if (mx == sx && my == sy) {
+      continue;
+    }
+    if (!smacTraversableCost(query->value(mx, my), allow_unknown)) {
+      continue;
+    }
+    // SMAC checks the ESDF at the cell center, not at the arbitrary point on
+    // the ray. Query and command the cell center so the approach endpoint is
+    // exactly the cell the search will accept.
+    double cx = 0.0;
+    double cy = 0.0;
+    query->mapToWorld(mx, my, cx, cy);
+    const auto clearance = query->query({cx, cy, 0.0});
+    if (!clearance.ok || !std::isfinite(clearance.distance) ||
+      static_cast<float>(clearance.distance) < static_cast<float>(required_clearance)) {
+      continue;
+    }
+    approach = goal;
+    approach.position.x = cx;
+    approach.position.y = cy;
+    shorten_distance = std::hypot(cx - goal.position.x, cy - goal.position.y);
+    return true;
+  }
+  return false;
+}
+
+// 在目标格被占据、且沿 start→goal 的直线接近点也找不到时，退化为在目标周围
+// 的环带内寻找最近的可通行格。只接受朝机器人一侧的候选，避免把目标“弹出”
+// 到墙的另一面；如果目标周围只有远侧自由格，仍交给子目标回退处理。
+bool findGoalEjection(
+  const std::shared_ptr<rog_map::MapQueryInterface> & query,
+  const geometry_msgs::msg::Pose & start,
+  const geometry_msgs::msg::Pose & goal,
+  double required_clearance,
+  bool allow_unknown,
+  double max_shift,
+  geometry_msgs::msg::Pose & ejected,
+  double & shift_distance,
+  bool & used_radial)
+{
+  used_radial = false;
+  if (!query || !(required_clearance > 0.0) || !(max_shift > 0.0) ||
+    !std::isfinite(start.position.x) || !std::isfinite(start.position.y) ||
+    !std::isfinite(goal.position.x) || !std::isfinite(goal.position.y)) {
+    return false;
+  }
+  unsigned int sx = 0U;
+  unsigned int sy = 0U;
+  unsigned int gx = 0U;
+  unsigned int gy = 0U;
+  if (!query->worldToMap(start.position.x, start.position.y, sx, sy) ||
+    !query->worldToMap(goal.position.x, goal.position.y, gx, gy)) {
+    return false;
+  }
+  const double resolution = query->resolution();
+  if (!std::isfinite(resolution) || resolution <= 1.0e-6) {
+    return false;
+  }
+  const Eigen::Vector2d goal_xy(goal.position.x, goal.position.y);
+  const Eigen::Vector2d start_xy(start.position.x, start.position.y);
+  const Eigen::Vector2d toward_start = start_xy - goal_xy;
+  const double toward_start_norm = toward_start.norm();
+  if (!(toward_start_norm > 1.0e-6)) {
+    return false;
+  }
+  const Eigen::Vector2d toward_start_unit = toward_start / toward_start_norm;
+  const int max_radius = std::max(1, static_cast<int>(std::ceil(max_shift / resolution)));
+  const int nx = static_cast<int>(query->sizeX());
+  const int ny = static_cast<int>(query->sizeY());
+
+  double best_score = std::numeric_limits<double>::infinity();
+  for (int radius = 1; radius <= max_radius; ++radius) {
+    for (int dy = -radius; dy <= radius; ++dy) {
+      for (int dx = -radius; dx <= radius; ++dx) {
+        if (std::abs(dx) != radius && std::abs(dy) != radius) {
+          continue;
+        }
+        const int cx = static_cast<int>(gx) + dx;
+        const int cy = static_cast<int>(gy) + dy;
+        if (cx < 0 || cy < 0 || cx >= nx || cy >= ny) {
+          continue;
+        }
+        if (cx == static_cast<int>(sx) && cy == static_cast<int>(sy)) {
+          continue;
+        }
+        double wx = 0.0;
+        double wy = 0.0;
+        query->mapToWorld(static_cast<unsigned int>(cx), static_cast<unsigned int>(cy), wx, wy);
+        const double shift = std::hypot(wx - goal.position.x, wy - goal.position.y);
+        if (shift > max_shift + 1.0e-9) {
+          continue;
+        }
+        // Keep the ejection on the robot side of the goal. This is what
+        // distinguishes a valid approach point from a free cell behind the wall.
+        const double side = Eigen::Vector2d(wx - goal.position.x, wy - goal.position.y)
+          .dot(toward_start_unit);
+        if (side < -0.05) {
+          continue;
+        }
+        const auto ux = static_cast<unsigned int>(cx);
+        const auto uy = static_cast<unsigned int>(cy);
+        if (!smacTraversableCost(query->value(ux, uy), allow_unknown)) {
+          continue;
+        }
+        const auto field = query->query({wx, wy, 0.0});
+        if (!field.ok || !std::isfinite(field.distance) ||
+          static_cast<float>(field.distance) < static_cast<float>(required_clearance)) {
+          continue;
+        }
+        // Among candidates on the same ring, prefer the one closest to the
+        // robot; that is the shortest detour around the blocked goal.
+        const double score = shift + 0.05 * std::hypot(wx - start.position.x, wy - start.position.y);
+        if (score < best_score) {
+          best_score = score;
+          ejected = goal;
+          ejected.position.x = wx;
+          ejected.position.y = wy;
+          shift_distance = shift;
+          used_radial = true;
+        }
+      }
+    }
+    if (used_radial) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool knownBlockedWithoutEjection(
+  const std::shared_ptr<rog_map::MapQueryInterface> & query,
+  const geometry_msgs::msg::Pose & start,
+  const geometry_msgs::msg::Pose & goal,
+  double required_clearance,
+  bool allow_unknown,
+  double max_shorten)
+{
+  if (!query || !(required_clearance > 0.0) || !(max_shorten > 0.0)) return false;
+  unsigned int gx = 0U, gy = 0U;
+  if (!query->worldToMap(goal.position.x, goal.position.y, gx, gy) ||
+    smacTraversableCost(query->value(gx, gy), allow_unknown)) {
+    return false;
+  }
+  geometry_msgs::msg::Pose approach;
+  double shorten_distance = 0.0;
+  bool radial = false;
+  return !findGoalApproach(query, start, goal, required_clearance,
+      allow_unknown, max_shorten, approach, shorten_distance) &&
+    !findGoalEjection(query, start, goal, required_clearance,
+      allow_unknown, max_shorten, approach, shorten_distance, radial);
+}
+
+bool hasCompleteApproachWindow(
+  const std::shared_ptr<rog_map::MapQueryInterface> & query,
+  const geometry_msgs::msg::Pose & goal,
+  double max_shorten)
+{
+  if (!query || !(max_shorten > 0.0)) return false;
+  unsigned int gx = 0U, gy = 0U;
+  const double x = goal.position.x, y = goal.position.y;
+  if (!query->worldToMap(x, y, gx, gy)) return false;
+  const double margin = max_shorten + query->resolution();
+  const double left = x - query->originX();
+  const double bottom = y - query->originY();
+  const double right = query->sizeX() * query->resolution() - left;
+  const double top = query->sizeY() * query->resolution() - bottom;
+  return std::min({left, bottom, right, top}) > margin;
 }
 
 void logCellDiagnostics(const rclcpp::Logger & logger,
@@ -251,11 +544,47 @@ bool GlobalPathSearcher::normalizePoseToFrame(const geometry_msgs::msg::PoseStam
   }
 }
 
+bool GlobalPathSearcher::goalKnownInvalid(
+  const geometry_msgs::msg::PoseStamped & start,
+  const geometry_msgs::msg::PoseStamped & goal,
+  const PlannerModeContext & mode_context) const
+{
+  std::lock_guard<std::mutex> lock(search_mutex_);
+  if (terrain_ || !use_smac_ || !smac_ || !online_terrain_) return false;
+  const auto query = mode_context.globalQuery();
+  const auto remembered = online_terrain_->snapshot();
+  if (!query || !remembered) return false;
+
+  geometry_msgs::msg::PoseStamped start_rog, goal_rog;
+  if (!normalizePoseToFrame(start, mode_context.rogFrame(), mode_context.rogFrame(),
+      "goal admission start", start_rog) ||
+    !normalizePoseToFrame(goal, mode_context.rogFrame(), mode_context.rogFrame(),
+      "goal admission goal", goal_rog)) {
+    return false;
+  }
+  unsigned int gx = 0U, gy = 0U, hx = 0U, hy = 0U;
+  const double x = goal_rog.pose.position.x;
+  const double y = goal_rog.pose.position.y;
+  if (!query->worldToMap(x, y, gx, gy) ||
+    !remembered->worldToMap(x, y, hx, hy) || remembered->value(hx, hy) != 254U) {
+    return false;
+  }
+  // A missing approach candidate near the rolling-window edge is not proof
+  // that no candidate exists. Defer such goals to normal online exploration.
+  if (!hasCompleteApproachWindow(query, goal_rog.pose, goal_approach_max_shorten_)) return false;
+  const double primary = smac_->minimumClearance();
+  const double relaxed = relaxed_minimum_clearance_ > 0.0 &&
+    relaxed_minimum_clearance_ < primary ? relaxed_minimum_clearance_ : primary;
+  return knownBlockedWithoutEjection(query, start_rog.pose, goal_rog.pose,
+    relaxed, allow_unknown_, goal_approach_max_shorten_);
+}
+
 bool GlobalPathSearcher::plan(const geometry_msgs::msg::PoseStamped & start,
   const geometry_msgs::msg::PoseStamped & goal,
   const PlannerModeContext & mode_context,
   std::vector<geometry_msgs::msg::PoseStamped> & latest_global_path)
 {
+  std::lock_guard<std::mutex> lock(search_mutex_);
   return planExploration(start, goal, mode_context, latest_global_path);
 }
 
@@ -264,6 +593,9 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
   const PlannerModeContext & mode_context,
   std::vector<geometry_msgs::msg::PoseStamped> & latest_global_path)
 {
+  last_goal_invalid_ = false;
+  last_goal_blocked_retryable_ = false;
+  last_goal_shifted_ = false;
   const auto query = mode_context.globalQuery();
   if (!astar_ || !query) {
     RCLCPP_ERROR(logger_, "[MincoPlanner] ROGMap global search query is unavailable.");
@@ -337,6 +669,10 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
   }
 
   // Online-only mode searches the rolling ROGMap and advances using observed subgoals.
+  const auto adapter = std::dynamic_pointer_cast<rog_map::QueryAdapter>(query);
+  const auto semantic = adapter ? adapter->snapshot() : nullptr;
+  const auto remembered = online_terrain_ ? online_terrain_->snapshot() : nullptr;
+
   unsigned int sx = 0;
   unsigned int sy = 0;
   if (!query->worldToMap(start_rog.pose.position.x, start_rog.pose.position.y, sx, sy)) {
@@ -350,9 +686,6 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
   unsigned int gx = 0;
   unsigned int gy = 0;
   const bool goal_inside = query->worldToMap(goal_rog.pose.position.x, goal_rog.pose.position.y, gx, gy);
-  const auto adapter = std::dynamic_pointer_cast<rog_map::QueryAdapter>(query);
-  const auto semantic = adapter ? adapter->snapshot() : nullptr;
-  const auto remembered = online_terrain_ ? online_terrain_->snapshot() : nullptr;
   const auto live_sides = semantic && semantic->width == static_cast<int>(query->sizeX()) &&
       semantic->height == static_cast<int>(query->sizeY()) ?
     std::make_shared<const std::vector<uint8_t>>(
@@ -377,15 +710,29 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
     }
     return true;
   };
-  bool goal_traversable = false;
-  if (goal_inside) {
-    const unsigned char goal_cost = query->value(gx, gy);
-    goal_traversable = goal_cost == kUnknownCost
-                         ? !mode_context.explorationUnknownAsOccupied()
-                         : goal_cost < kInscribedCost;
-    goal_traversable = goal_traversable && online_edge(gx, gy, gx, gy);
+  const double goal_distance = std::hypot(
+    goal_rog.pose.position.x - start_rog.pose.position.x,
+    goal_rog.pose.position.y - start_rog.pose.position.y);
+  bool defer_direct_goal = false;
+  if (goal_inside && remembered &&
+    goal_distance > goal_approach_max_shorten_) {
+    unsigned int hx = 0U, hy = 0U;
+    defer_direct_goal = remembered->worldToMap(
+      goal_rog.pose.position.x, goal_rog.pose.position.y, hx, hy) &&
+      remembered->isFree(hx, hy) &&
+      !smacTraversableCost(query->value(gx, gy), allow_unknown_);
   }
-  if (goal_traversable) {
+  // A remembered-free destination can be temporarily occupied in the live
+  // rolling window. Plan a reachable observed subgoal until the robot nears
+  // it; do not promote a distant, transient ejection to the mission endpoint.
+  // The live map remains authoritative for every planned local segment.
+  if (defer_direct_goal) {
+    RCLCPP_WARN_THROTTLE(logger_, *rclcpp::Clock::make_shared(), 2000,
+      "[MincoPlanner] Goal (%.2f,%.2f) is free in the accumulated map but "
+      "blocked in the live window; deferring endpoint ejection until closer.",
+      goal_rog.pose.position.x, goal_rog.pose.position.y);
+  }
+  if (goal_inside && !defer_direct_goal) {
     nav_msgs::msg::Path direct_plan;
     direct_plan.header.stamp = rclcpp::Clock().now();
     direct_plan.header.frame_id = mode_context.outputFrame();
@@ -402,9 +749,47 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
       return true;
     }
     RCLCPP_WARN(logger_,
-      "[MincoPlanner] Exploration goal passes the grid-cost check but direct search failed; "
-      "see cost/ESDF diagnostics above; fallback to a reachable observed subgoal.");
+      "[MincoPlanner] Exploration goal direct search failed; "
+      "see endpoint diagnostics above; fallback to a reachable observed subgoal.");
+
+    // Direct search also tries the line approach and radial ejection. If the
+    // live goal is blocked and neither exists, the fallback search must not
+    // keep driving toward that obstacle. B1 confirmation distinguishes a
+    // terminally invalid goal from a transient blockage that should be retried.
+    if (use_smac_ && smac_) {
+      const unsigned char requested_goal_cost = query->value(gx, gy);
+      if (!smacTraversableCost(requested_goal_cost, allow_unknown_)) {
+        const double primary = smac_->minimumClearance();
+        const double relaxed = relaxed_minimum_clearance_ > 0.0 &&
+          relaxed_minimum_clearance_ < primary ? relaxed_minimum_clearance_ : primary;
+        if (hasCompleteApproachWindow(query, goal_rog.pose, goal_approach_max_shorten_) &&
+          knownBlockedWithoutEjection(query, start_rog.pose, goal_rog.pose,
+            relaxed, allow_unknown_, goal_approach_max_shorten_)) {
+          unsigned int hx = 0U, hy = 0U;
+          const bool confirmed = remembered &&
+            remembered->worldToMap(goal_rog.pose.position.x, goal_rog.pose.position.y, hx, hy) &&
+            remembered->value(hx, hy) == 254U;
+          last_goal_invalid_ = confirmed;
+          last_goal_blocked_retryable_ = !confirmed;
+          RCLCPP_WARN_THROTTLE(logger_, *rclcpp::Clock::make_shared(), 2000,
+            "[MincoPlanner] Requested goal (%.2f,%.2f) is blocked in the live map "
+            "(cost=%u, clearance=%.3f), with no safe approach/ejection within %.2f m; "
+            "%s instead of exploring toward the obstacle.",
+            goal_rog.pose.position.x, goal_rog.pose.position.y,
+            static_cast<unsigned int>(requested_goal_cost),
+            query->query({goal_rog.pose.position.x, goal_rog.pose.position.y, 0.0}).distance,
+            goal_approach_max_shorten_,
+            confirmed ? "declaring the confirmed goal invalid" : "stopping and retrying");
+          return false;
+        }
+      }
+    }
   }
+
+  // Direct goal search failed. The fallback path below is a rolling subgoal,
+  // not a replacement for the mission goal, so it must not inherit the direct
+  // approach/ejection endpoint flag.
+  last_goal_shifted_ = false;
 
   const unsigned int nx = query->sizeX();
   const unsigned int ny = query->sizeY();
@@ -596,6 +981,7 @@ bool GlobalPathSearcher::makePlan(const geometry_msgs::msg::Pose & start,
   std::function<bool()> cancel_checker,
   nav_msgs::msg::Path & plan)
 {
+  std::lock_guard<std::mutex> lock(search_mutex_);
   std::vector<geometry_msgs::msg::PoseStamped> ignored_path;
   return makePlanOnQuery(start,
     goal,
@@ -617,8 +1003,19 @@ bool GlobalPathSearcher::makePlanOnQuery(const geometry_msgs::msg::Pose & start,
   std::function<bool()> cancel_checker,
   nav_msgs::msg::Path & plan,
   std::vector<geometry_msgs::msg::PoseStamped> & latest_global_path,
-  mas2027_nav_executor::smac::SmacPlanner2DSimple::EdgeFilter edge_filter)
+  mas2027_nav_executor::smac::SmacPlanner2DSimple::EdgeFilter edge_filter,
+  bool relaxed_search)
 {
+  if (relaxed_search) {
+    RCLCPP_WARN(logger_,
+      "[MincoPlanner] %s primary global search failed; retrying with relaxed "
+      "minimum clearance %.3f m. Local trajectory gates remain unchanged.",
+      failure_source.c_str(),
+      smac_ ? smac_->minimumClearance() : 0.0);
+  } else {
+    last_goal_shifted_ = false;
+  }
+  bool goal_shifted = false;
   plan.poses.clear();
   plan.header.stamp = rclcpp::Clock().now();
   plan.header.frame_id = output_frame;
@@ -660,6 +1057,46 @@ bool GlobalPathSearcher::makePlanOnQuery(const geometry_msgs::msg::Pose & start,
     return false;
   }
 
+  // The cost-projected start can still be inside SMAC's ESDF exclusion band.
+  // Move it to a nearby searchable cell before invoking SMAC; otherwise the
+  // search logs a misleading "open set exhausted" with iterations=1.
+  const double start_clearance_required =
+    (use_smac_ && smac_) ? static_cast<double>(smac_->minimumClearance()) : 0.0;
+  constexpr double kStartSearchShiftMax = 0.6;  // metres; local planner keeps the real pose
+  const unsigned int cost_projected_mx_start = mx_start;
+  const unsigned int cost_projected_my_start = my_start;
+  if (start_clearance_required > 0.0 &&
+      !projectStartToSearchableCell(
+        query, mx_start, my_start, start_clearance_required, kStartSearchShiftMax)) {
+    RCLCPP_WARN(logger_,
+      "%s start cell=(%u,%u) has insufficient search clearance at %.3f m and no "
+      "searchable cell exists within %.2f m; leaving the start to the local escape path.",
+      failure_source.c_str(),
+      mx_start,
+      my_start,
+      start_clearance_required,
+      kStartSearchShiftMax);
+    mx_start = cost_projected_mx_start;
+    my_start = cost_projected_my_start;
+  } else if (mx_start != cost_projected_mx_start || my_start != cost_projected_my_start) {
+    double raw_x = 0.0;
+    double raw_y = 0.0;
+    double used_x = 0.0;
+    double used_y = 0.0;
+    query->mapToWorld(cost_projected_mx_start, cost_projected_my_start, raw_x, raw_y);
+    query->mapToWorld(mx_start, my_start, used_x, used_y);
+    RCLCPP_WARN(logger_,
+      "%s start cell=(%u,%u) is below search clearance %.3f m; using nearby "
+      "start cell=(%u,%u) shifted %.3f m.",
+      failure_source.c_str(),
+      cost_projected_mx_start,
+      cost_projected_my_start,
+      start_clearance_required,
+      mx_start,
+      my_start,
+      std::hypot(used_x - raw_x, used_y - raw_y));
+  }
+
   wx = goal.position.x;
   wy = goal.position.y;
   unsigned int mx_goal = 0;
@@ -679,6 +1116,76 @@ bool GlobalPathSearcher::makePlanOnQuery(const geometry_msgs::msg::Pose & start,
       output_frame.c_str());
     return false;
   }
+  // If the requested goal cell is blocked or has insufficient search clearance, keep
+  // the same search/validation chain but move the endpoint to a nearby cell that the
+  // search can actually accept. First retreat along the start->goal line; if the
+  // whole line is blocked, search a ring around the goal on the robot side. This is
+  // still an approach endpoint, not a relaxed safety gate.
+  geometry_msgs::msg::Pose search_goal = goal;
+  const double goal_clearance_required = (use_smac_ && smac_) ? smac_->minimumClearance() : 0.0;
+  if (goal_clearance_required > 0.0) {
+    const unsigned char requested_goal_cost = query->value(mx_goal, my_goal);
+    // SMAC samples ESDF at the goal cell center. Use that same position and
+    // float comparison here; querying the original pose can approve a cell
+    // that SMAC immediately rejects, especially near an ESDF grid boundary.
+    double goal_cell_x = 0.0;
+    double goal_cell_y = 0.0;
+    query->mapToWorld(mx_goal, my_goal, goal_cell_x, goal_cell_y);
+    const auto requested_goal_field = query->query({goal_cell_x, goal_cell_y, 0.0});
+    const bool requested_goal_ok = smacTraversableCost(requested_goal_cost, allow_unknown_) &&
+      requested_goal_field.ok && std::isfinite(requested_goal_field.distance) &&
+      static_cast<float>(requested_goal_field.distance) >=
+        static_cast<float>(goal_clearance_required);
+    if (!requested_goal_ok) {
+      geometry_msgs::msg::Pose line_approach;
+      double line_shorten = std::numeric_limits<double>::infinity();
+      const bool line_ok = findGoalApproach(
+        query, start, goal, goal_clearance_required, allow_unknown_,
+        goal_approach_max_shorten_, line_approach, line_shorten);
+      geometry_msgs::msg::Pose radial_approach;
+      double radial_shorten = std::numeric_limits<double>::infinity();
+      bool radial_used = false;
+      const bool radial_ok = findGoalEjection(
+        query, start, goal, goal_clearance_required, allow_unknown_,
+        goal_approach_max_shorten_, radial_approach, radial_shorten, radial_used);
+      // Prefer the closer safe endpoint. The line approach preserves the
+      // requested direction; radial ejection is the fallback for goals inside
+      // a wall or behind a blocked strip.
+      const bool use_radial = radial_used && radial_ok &&
+        (!line_ok || radial_shorten < line_shorten);
+      const bool have_approach = use_radial || line_ok;
+      if (have_approach) {
+        const geometry_msgs::msg::Pose & approach =
+          use_radial ? radial_approach : line_approach;
+        const double shorten_distance = use_radial ? radial_shorten : line_shorten;
+        unsigned int ax = 0U;
+        unsigned int ay = 0U;
+        if (query->worldToMap(
+            approach.position.x, approach.position.y, ax, ay)) {
+          search_goal = approach;
+          mx_goal = ax;
+          my_goal = ay;
+          goal_shifted = true;
+          RCLCPP_WARN(logger_,
+            "[MincoPlanner] %s requested goal (%.2f,%.2f) cost=%u(%s) clearance=%.3f "
+            "is not traversable at %.3f m; using %s point (%.2f,%.2f), %.2f m from goal.",
+            failure_source.c_str(),
+            goal.position.x,
+            goal.position.y,
+            static_cast<unsigned int>(requested_goal_cost),
+            cellCostLabel(requested_goal_cost),
+            requested_goal_field.ok ? requested_goal_field.distance :
+              std::numeric_limits<double>::quiet_NaN(),
+            goal_clearance_required,
+            use_radial ? "ejected" : "approach",
+            search_goal.position.x,
+            search_goal.position.y,
+            shorten_distance);
+        }
+      }
+    }
+  }
+
   unsigned int nx = query->sizeX();
   unsigned int ny = query->sizeY();
   const unsigned char start_cost = query->value(mx_start, my_start);
@@ -705,8 +1212,8 @@ bool GlobalPathSearcher::makePlanOnQuery(const geometry_msgs::msg::Pose & start,
     my_start,
     static_cast<unsigned int>(start_cost),
     cellCostLabel(start_cost),
-    goal.position.x,
-    goal.position.y,
+    search_goal.position.x,
+    search_goal.position.y,
     mx_goal,
     my_goal,
     static_cast<unsigned int>(goal_cost),
@@ -724,7 +1231,6 @@ bool GlobalPathSearcher::makePlanOnQuery(const geometry_msgs::msg::Pose & start,
       smac_->createPath(mx_start, my_start, mx_goal, my_goal, smac_path, cancel_checker);
 
     if (!smac_success || smac_path.size() < 2) {
-      // SMAC 失败即失败，不退回 Astar：否则一次失败会产生两条搜索路径与两套日志，无法判断来源。
       RCLCPP_ERROR(logger_,
         "%s SMAC 2D failed to find path (success=%s, path_size=%zu). See endpoint diagnostics below.",
         failure_source.c_str(),
@@ -739,6 +1245,27 @@ bool GlobalPathSearcher::makePlanOnQuery(const geometry_msgs::msg::Pose & start,
         allow_unknown_, smac_->minimumClearance());
       logCellDiagnostics(logger_, query, failure_source, "goal", mx_goal, my_goal,
         allow_unknown_, smac_->minimumClearance());
+      const double primary_clearance = smac_->minimumClearance();
+      const double relaxed_clearance = relaxed_minimum_clearance_;
+      if (!relaxed_search && relaxed_clearance > 0.0 &&
+          relaxed_clearance + 1.0e-9 < primary_clearance) {
+        smac_->setMinimumClearance(relaxed_clearance);
+        const bool relaxed_ok = makePlanOnQuery(start, goal, query, output_frame,
+          failure_source, tolerance, cancel_checker, plan, latest_global_path,
+          edge_filter, true);
+        smac_->setMinimumClearance(primary_clearance);
+        if (relaxed_ok) {
+          RCLCPP_WARN(logger_,
+            "[MincoPlanner] %s relaxed global search succeeded at %.3f m "
+            "(primary %.3f m); the local narrow-corridor gate must still accept the path.",
+            failure_source.c_str(), relaxed_clearance, primary_clearance);
+          return true;
+        }
+        RCLCPP_ERROR(logger_,
+          "[MincoPlanner] %s relaxed global search also failed at %.3f m "
+          "(primary %.3f m).",
+          failure_source.c_str(), relaxed_clearance, primary_clearance);
+      }
       return false;
     }
 
@@ -864,17 +1391,21 @@ bool GlobalPathSearcher::makePlanOnQuery(const geometry_msgs::msg::Pose & start,
   }
 
   if (!plan.poses.empty()) {
-    plan.poses.back().pose.position.x = goal.position.x;
-    plan.poses.back().pose.position.y = goal.position.y;
-    plan.poses.back().pose.position.z = goal.position.z;
-    plan.poses.back().pose.orientation = goal.orientation;
-    latest_global_path.back().pose.position.x = goal.position.x;
-    latest_global_path.back().pose.position.y = goal.position.y;
-    latest_global_path.back().pose.position.z = goal.position.z;
-    latest_global_path.back().pose.orientation = goal.orientation;
+    plan.poses.back().pose.position.x = search_goal.position.x;
+    plan.poses.back().pose.position.y = search_goal.position.y;
+    plan.poses.back().pose.position.z = search_goal.position.z;
+    plan.poses.back().pose.orientation = search_goal.orientation;
+    latest_global_path.back().pose.position.x = search_goal.position.x;
+    latest_global_path.back().pose.position.y = search_goal.position.y;
+    latest_global_path.back().pose.position.z = search_goal.position.z;
+    latest_global_path.back().pose.orientation = search_goal.orientation;
   }
 
-  return !plan.poses.empty();
+  const bool success = !plan.poses.empty();
+  if (success) {
+    last_goal_shifted_ = goal_shifted;
+  }
+  return success;
 }
 
 }  // namespace minco_planner

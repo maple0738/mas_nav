@@ -149,6 +149,8 @@ if(BUILD_TESTING)
         find_package(ament_cmake_gtest REQUIRED)
         ament_add_gtest(test_projection_terrain test/test_projection_terrain.cpp)
         target_link_libraries(test_projection_terrain ${library_name})
+        ament_add_gtest(test_query_adapter_cell_centers test/test_query_adapter_cell_centers.cpp)
+        target_link_libraries(test_query_adapter_cell_centers ${library_name})
 endif()
 
 ament_package()

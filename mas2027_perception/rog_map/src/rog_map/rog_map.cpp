@@ -30,6 +30,7 @@
 #include <thread>
 
 #include <rog_map/map_registry.hpp>
+#include <rog_map/body_return_filter.hpp>
 
 using namespace rog_map;
 using namespace super_utils;
@@ -329,7 +330,19 @@ void ROGMap::updateMapInternal(const PointCloud & cloud, const Pose & pose)
   const double update_robot_state_ms = elapsedMs(total_start);
   const double now = getSystemWalltimeNow();
   setUpdateTime(now);
-  updateProbMap(cloud, sensor_pose, map_center_pos);
+  if (cfg_.body_exclusion_radius > 0.0) {
+    const BodyReturnFilter body_filter(sensor_pose, cfg_.body_exclusion_radius);
+    PointCloud environment_cloud;
+    environment_cloud.reserve(cloud.size());
+    for (const auto & point : cloud) {
+      if (!body_filter.contains(point.x, point.y)) {
+        environment_cloud.push_back(point);
+      }
+    }
+    updateProbMap(environment_cloud, sensor_pose, map_center_pos);
+  } else {
+    updateProbMap(cloud, sensor_pose, map_center_pos);
+  }
   runtime_stats_.stamp = update_stamp;
   runtime_stats_.update_seq = static_cast<double>(this_update_sequence);
   runtime_stats_.update_robot_state_time = update_robot_state_ms;
@@ -894,6 +907,18 @@ void ROGMap::refreshQuery()
     snapshot->confidence[i] = layer_->cells()[i].confidence;
   }
   auto terrain = layer_->terrainGeometry();
+  runtime_stats_.terrain_label_flat_count = 0.0;
+  runtime_stats_.terrain_label_slope_count = 0.0;
+  runtime_stats_.terrain_label_tunnel_count = 0.0;
+  for (const uint8_t label : terrain.labels) {
+    if (label == 0U) {
+      runtime_stats_.terrain_label_flat_count += 1.0;
+    } else if (label == 5U) {
+      runtime_stats_.terrain_label_slope_count += 1.0;
+    } else if (label == 6U) {
+      runtime_stats_.terrain_label_tunnel_count += 1.0;
+    }
+  }
   snapshot->terrain_labels = std::move(terrain.labels);
   snapshot->uphill_x = std::move(terrain.uphill_x);
   snapshot->uphill_y = std::move(terrain.uphill_y);

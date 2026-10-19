@@ -7,13 +7,13 @@
   <link name="base_link">
     <visual>
       <geometry>
-        <box size="0.5 0.5 0"/> 
+        <box size="0.4271 0.4271 0"/>
       </geometry>
       <origin xyz="0 0 0" rpy="0 0 0"/>
     </visual>
     <collision>
       <geometry>
-        <box size="0.5 0.5 0"/>
+        <box size="0.4271 0.4271 0"/>
       </geometry>
       <origin xyz="0 0 0" rpy="0 0 0"/>
     </collision>
@@ -55,18 +55,20 @@
   </link>
 
   <!-- 右侧原 MID360（设备 IP 192.168.1.136）：ROS Y- 为右。
-       rpy 的 roll 就是雷达前倾角（0.8389 rad = 48.07°），由静止 IMU 实测得到：
-       scripts/measure_lidar_mount.sh。改这里之后 small_point_lio_params.yaml 的
-       blind_center 和 gravity 要跟着改，脚本会把三行一起算出来。 -->
+       2026-10-18 自旋/静止实测更新：roll 0.8511 rad = 48.77°，
+       xyz = +0.0156 -0.1978 +0.1100。旋转半径由 scripts/measure_lidar_mount.sh
+       测量；改这里之后 small_point_lio_params.yaml 的 merge_extrinsic、
+       blind_center 和 gravity 必须一起更新。 -->
   <joint name="lidar_joint" type="fixed">
     <parent link="base_link"/>
     <child link="lidar_link"/>
-    <origin xyz="0.00 -0.15 0.11" rpy="0.8389 0 0"/>
+    <origin xyz="0.0156 -0.1978 0.1100" rpy="0.8511 0 0"/>
   </joint>
 
-  <!-- 左侧 MID360（设备 IP 192.168.1.193）：与右侧关于 base_link 的 XZ 平面手性对称
-       （Y 取反、roll 取反）。不是两侧同一套 rpy，也不要 yaw=π。
-       相对旋转 R=Rx(-2α)，α=0.8389。只做可视化 / 标定辅助，LIO 仍 lookup lidar_link。
+  <!-- 左侧 MID360（设备 IP 192.168.1.193）：2026-10-18 实测
+       xyz = +0.0176 +0.1867 +0.1100，roll = -0.8952 rad = -51.29°。
+       不再假设左右严格手性对称；两雷达间距实测约 0.3845 m。
+       只做可视化 / 标定辅助，LIO 仍 lookup lidar_link。
        merge_extrinsic_back_to_front 必须等于 T_lidar_link^{-1} * T_lidar_back。 -->
   <link name="lidar_back_link">
     <visual>
@@ -82,7 +84,7 @@
   <joint name="lidar_back_joint" type="fixed">
     <parent link="base_link"/>
     <child link="lidar_back_link"/>
-    <origin xyz="0.00 0.15 0.11" rpy="-0.8389 0 0"/>
+    <origin xyz="0.0176 0.1867 0.1100" rpy="-0.8952 0 0"/>
   </joint>
 
 

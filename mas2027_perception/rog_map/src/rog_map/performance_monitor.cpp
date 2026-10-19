@@ -379,7 +379,10 @@ void PerformanceMonitor::writeDetailedHeader()
       "update_unaccounted_ms",
       "last_viz_time_ms",
       "viz_built_count",
-      "viz_skipped_count"});
+      "viz_skipped_count",
+      "terrain_label_flat",
+      "terrain_label_slope",
+      "terrain_label_tunnel"});
 }
 
 void PerformanceMonitor::writeSummaryHeader()
@@ -414,7 +417,10 @@ void PerformanceMonitor::writeSummaryHeader()
       "last_free_count",
       "last_passable_count",
       "last_occupied_count",
-      "last_unknown_count"});
+      "last_unknown_count",
+      "last_terrain_label_flat",
+      "last_terrain_label_slope",
+      "last_terrain_label_tunnel"});
 }
 
 void PerformanceMonitor::writeDetailedRow(const RuntimeStats & s)
@@ -479,7 +485,10 @@ void PerformanceMonitor::writeDetailedRow(const RuntimeStats & s)
       num(s.update_unaccounted_ms),
       num(s.last_viz_time_ms),
       num(s.viz_built_count),
-      num(s.viz_skipped_count)});
+      num(s.viz_skipped_count),
+      num(s.terrain_label_flat_count),
+      num(s.terrain_label_slope_count),
+      num(s.terrain_label_tunnel_count)});
   flushIfNeeded(detailed_csv_, detailed_csv_rows_);
 }
 
@@ -531,7 +540,10 @@ void PerformanceMonitor::maybeWriteSummary(double stamp)
         num(stats_.free_count),
         num(stats_.passable_count),
         num(stats_.occupied_count),
-        num(stats_.unknown_count)});
+        num(stats_.unknown_count),
+        num(stats_.terrain_label_flat_count),
+        num(stats_.terrain_label_slope_count),
+        num(stats_.terrain_label_tunnel_count)});
     flushIfNeeded(summary_csv_, summary_csv_rows_);
   }
 

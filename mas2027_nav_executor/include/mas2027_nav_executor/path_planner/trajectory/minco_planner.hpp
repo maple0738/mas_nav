@@ -1,6 +1,7 @@
 #ifndef MINCO_PLANNER__MINCO_PLANNER_HPP_
 #define MINCO_PLANNER__MINCO_PLANNER_HPP_
 
+#include "mas2027_nav_executor/common/control/goal_approach.hpp"
 #include "minco_core/header.hpp"
 #include "minco_core/performance/planner_performance_monitor.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
@@ -9,6 +10,7 @@
 #include <array>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace mas2027_nav_executor {
 class FusedMapQuery;
@@ -49,21 +51,21 @@ public:
     std::function<bool()> cancel_checker,
     nav_msgs::msg::Path & plan);
 
-  // === Callbacks ===
-  void safetyTimerCallback();
-
   // === Utility & Helper Functions ===
-  bool checkCollision();
-  bool checkCollision(const geometry_utils::Trajectory & traj);
-
-  /// 净空要求：发布前校验与监视必须共用同一公式，两处阈值不一致会造成「发布通过、
-  /// 监视立刻否决」死循环。required = collision_dist + max(v * replan_react_time, monitor_margin)
-  double requiredClearance(double speed) const;
+  bool checkCollision(
+    const geometry_utils::Trajectory & traj,
+    const std::vector<Eigen::Vector3d> & reference_path);
 
   // Accessors for FSM
-  bool isTrajSafe() const { return is_traj_safe_.load(); }
   RecoverServer::Ptr recoveryServer() const { return recovery_server_; }
   double getForceReplanPeriod() const { return force_replan_period_sec_; }
+  bool lastGoalInvalid() const { return last_goal_invalid_; }
+  bool lastGoalBlockedRetryable() const { return last_goal_blocked_retryable_; }
+  bool goalKnownInvalid(
+    const geometry_msgs::msg::PoseStamped & start,
+    const geometry_msgs::msg::PoseStamped & goal) const;
+  bool lastGoalShifted() const { return last_goal_shifted_; }
+  bool copyLatestGlobalGoal(geometry_msgs::msg::PoseStamped & goal) const;
   double nowSeconds() const;
   bool isTrajectoryTimeExpired(double now_s) const;
   double getLookaheadDist() const { return lookahead_dist_; }
@@ -124,7 +126,10 @@ private:
     VecDf & init_ts,
     VecDf & local_vmaxs) const;
 
-  bool validateTrajectory(const traj_opt::Trajectory & traj, const Eigen::Vector3d & expected_end_pos);
+  bool validateTrajectory(
+    const traj_opt::Trajectory & traj,
+    const Eigen::Vector3d & expected_end_pos,
+    const std::vector<Eigen::Vector3d> & reference_path);
 
   /// 备份（急停）优化器安全盒（SFC）的 RViz 调试 marker；纯可视化，不参与约束构造与规划决策。
   void publishSafeCorridorBox(const PolyhedronH & poly);
@@ -152,7 +157,6 @@ private:
   /// 备份安全盒调试可视化，由 generateBackupTraj() 在每次重规划时刷新。
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr safe_corridor_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-  rclcpp::TimerBase::SharedPtr safety_timer_;
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr on_set_parameters_callback_handle_;
 
   // === TF & Costmap & Frames ===
@@ -173,6 +177,7 @@ private:
   double smac_esdf_decay_{0.8};
   double smac_esdf_max_cost_{0.5};
   double smac_minimum_clearance_{0.0};
+  double smac_relaxed_minimum_clearance_{0.0};
   bool use_yaw_opt_{true};
   bool exploration_unknown_as_occupied_{true};
   bool exploration_prefer_goal_direction_{true};
@@ -183,15 +188,18 @@ private:
   double lookahead_dist_;
   double traj_goal_tolerance_{0.15};
   double collision_dist_{0.30};
+  bool narrow_passage_enable_{true};
+  double narrow_passage_clearance_{0.24};
+  /// 目标接近减速带：用实测刹车能力给"剩余弧长 → 允许速度"封顶，种子与
+  /// 局部速度上限共用；`minco_optimizer.goal_approach.*` 配置。
+  mas2027_nav_executor::GoalApproachParams goal_approach_{};
   double force_replan_period_sec_{0.2};
-  double replan_react_time_{0.35};
-  /// 速度感知净空开关：开启后优化器的位置罚项改用 required(v) 口径（见 MincoOptimizer::Config）。
-  bool speed_aware_clearance_{false};
-  /// 优化器软目标相对硬判据的余量（优化器只能渐近逼近，避免毫米级擦边被否）。
-  double clearance_optimizer_margin_{0.05};
-  double safety_lookahead_time_{1.2};
-  double monitor_margin_{0.20};
+  /// 热启动时只把旧轨迹的一小段作为初值前缀，避免整条旧轨迹拖住新规划。
+  double replan_continuity_time_s_{0.3};
   double last_estop_s_{-1.0};
+  bool last_goal_invalid_{false};
+  bool last_goal_blocked_retryable_{false};
+  bool last_goal_shifted_{false};
   MincoOptimizer::Config minco_config;
   RecoverServer::Config recovery_server_config_{};
   PlannerPerformanceMonitor planner_perf_monitor_;
@@ -229,7 +237,6 @@ private:
   bool has_last_traj_ = false;
   bool has_last_yaw_traj_ = false;
   bool has_latest_odom_{false};
-  std::atomic_bool is_traj_safe_{true};
 
   // === 失败原因统计（排障用）：按计数采样，**不要退回按时间节流**，密集失败会丢现场 ===
   // 前 failure_log_first_n_ 次逐条打印，之后每 failure_log_every_n_ 次采样一条。

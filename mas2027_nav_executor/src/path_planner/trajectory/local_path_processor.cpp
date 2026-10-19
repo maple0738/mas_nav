@@ -41,7 +41,7 @@ std::string classifySeedReject(const SeedRejectInfo &info,
     return "PREFIX_TOO_SHORT";
   }
 
-  // 近场规则：场外取四道门统一后的有效阈值，场内为"不比现在更差 - slack"，用旧阈值会误判更严。
+  // 近场规则：场外取发布/执行两道硬门统一后的有效阈值，场内为"不比现在更差 - slack"。
   const bool in_near_field = info.arc_from_start < collision_dist;
   const double near_rule_required =
       in_near_field ? std::max(0.0, start_clearance - near_field_slack)
@@ -75,6 +75,12 @@ void LocalPathProcessor::updateLimits(double max_vel, double max_acc,
   max_vel_ = max_vel;
   max_acc_ = max_acc;
   traj_goal_tolerance_ = traj_goal_tolerance;
+}
+
+void LocalPathProcessor::setNarrowPassage(bool enable, double minimum_clearance) {
+  narrow_passage_enable_ =
+    enable && std::isfinite(minimum_clearance) && minimum_clearance > 0.0;
+  narrow_passage_clearance_ = narrow_passage_enable_ ? minimum_clearance : 0.0;
 }
 
 void LocalPathProcessor::setEscapeOptions(bool enable, double min_length,
@@ -140,6 +146,47 @@ LocalPathSeed LocalPathProcessor::buildSeed(
       static_cast<unsigned long long>(start_query.projection_sequence),
       static_cast<unsigned long long>(start_query.mask_sequence),
       static_cast<unsigned long long>(start_query.field_sequence), start_query.field_age_ms);
+  }
+
+  // The global search works on cell centers, but straight chords between its
+  // waypoints can cut inside the narrow hard floor even when every waypoint
+  // passes. Sample the whole reference before deciding whether to repair it.
+  // If no such route exists, the trajectory/command gates still reject any
+  // unsafe candidate.
+  bool dense_below_narrow_floor = false;
+  if (narrow_passage_enable_ && narrow_passage_clearance_ > 0.0 &&
+      start_clearance_ok &&
+      start_clearance + mas2027_nav_executor::kClearanceComparisonTolerance >=
+      narrow_passage_clearance_) {
+    Eigen::Vector3d previous = cur_pos;
+    for (const auto &point : seed.dense_path) {
+      SeedRejectInfo reject;
+      if (!segmentClear(query, previous, point, cur_pos, start_clearance,
+                        start_clearance_ok, terrain_segment_free, &reject,
+                        true, 0.0, narrow_passage_clearance_)) {
+        dense_below_narrow_floor = reject.valid && reject.clearance_only;
+        break;
+      }
+      previous = point;
+    }
+  }
+  if (dense_below_narrow_floor) {
+    std::vector<Eigen::Vector3d> repaired;
+    if (searchDynamicDetour(cur_pos, seed.dense_path.back(), query,
+                            start_clearance, start_clearance_ok,
+                            terrain_segment_free, repaired, nullptr, 0.0,
+                            narrow_passage_clearance_)) {
+      seed.dense_path = std::move(repaired);
+      seed.used_narrow_clearance_repair = true;
+      RCLCPP_INFO_THROTTLE(logger_, *rclcpp::Clock::make_shared(), 2000,
+        "[MincoPlanner] Repaired a dense reference below the %.3f m narrow floor "
+        "with a floor-aware local route.", narrow_passage_clearance_);
+    } else {
+      RCLCPP_WARN_THROTTLE(logger_, *rclcpp::Clock::make_shared(), 2000,
+        "[MincoPlanner] No floor-aware route reaches the local endpoint at %.3f m; "
+        "the trajectory gate will reject candidates below that floor.",
+        narrow_passage_clearance_);
+    }
   }
 
   // 安全检查必须包含机器人实测位置：折线起点取最近栅格顶点，不一定等于机器人当前位置。
@@ -250,10 +297,35 @@ LocalPathSeed LocalPathProcessor::buildSeed(
       seed.dense_path, max_vel_, max_acc_, seed.local_end_is_goal,
       [this, &mode_context, &terrain_segment_free, &cur_pos, start_clearance,
        start_clearance_ok](const Eigen::Vector3d &a, const Eigen::Vector3d &b) {
+        const bool enforce_sparse_clearance =
+          narrow_passage_enable_ && narrow_passage_clearance_ > 0.0;
         return segmentClear(mode_context.sparsifyQuery(), a, b, cur_pos,
                             start_clearance, start_clearance_ok,
-                            terrain_segment_free);
+                            terrain_segment_free, nullptr,
+                            enforce_sparse_clearance, 0.0,
+                            enforce_sparse_clearance ?
+                            narrow_passage_clearance_ : 0.0);
       });
+  if (seed.sparse_waypoints.size() < 2U &&
+      narrow_passage_enable_ && narrow_passage_clearance_ > 0.0) {
+    // Enforcing the narrow floor on every sparse chord can reject even the
+    // point-by-point expansion when the dense grid path itself grazes 0.235 m
+    // between cell centers. That must not turn a usable seed into
+    // LOCAL_SEED_INVALID: keep the floor as an optimization, then let the
+    // hard trajectory/command gates remain the final authority.
+    seed.sparse_waypoints = utils::getSparseWaypoints(
+        seed.dense_path, max_vel_, max_acc_, seed.local_end_is_goal,
+        [this, &mode_context, &terrain_segment_free, &cur_pos, start_clearance,
+         start_clearance_ok](const Eigen::Vector3d &a, const Eigen::Vector3d &b) {
+          return segmentClear(mode_context.sparsifyQuery(), a, b, cur_pos,
+                              start_clearance, start_clearance_ok,
+                              terrain_segment_free);
+        });
+    RCLCPP_WARN_THROTTLE(logger_, *rclcpp::Clock::make_shared(), 2000,
+      "[MincoPlanner] Narrow sparse-clearance simplification rejected the whole "
+      "seed; falling back to the unconstrained sparse path. Trajectory/command "
+      "clearance gates remain active.");
+  }
   seed.valid = seed.sparse_waypoints.size() >= 2U &&
                pathClear(seed.sparse_waypoints, cur_pos, query, start_clearance,
                          start_clearance_ok, terrain_segment_free);
@@ -327,7 +399,7 @@ bool LocalPathProcessor::segmentClear(
     const std::function<bool(const Eigen::Vector3d &, const Eigen::Vector3d &)>
         &terrain_segment_free,
     SeedRejectInfo *reject_info, bool enforce_clearance,
-    double preferred_clearance) const {
+    double preferred_clearance, double clearance_override) const {
   // 只记整条路径上最早的失败点（reject_info 非空时写第一次）；例外的硬否决可覆盖"只差净空"。
   const auto note_reject = [reject_info, &planning_start](
       const Eigen::Vector3d &point, double clearance, double required,
@@ -378,19 +450,22 @@ bool LocalPathProcessor::segmentClear(
     }
     // 净空是**轨迹**的属性而非折线的属性：MINCO 的位置罚项会把轨迹推离障碍，用折线净空否决种子
     // 等于要求种子先满足轨迹指标，避障能力作废；故硬否决只保留占据 / 地形 / 查询无效。
-    // 净空不足仅记 clearance_only 后继续采样，净空要求仍由发布前校验、20 Hz 监视、MPC 指令门
-    // 三道轨迹级门把关，此处没有放松。
-    double required = fullClearanceRequirement();
+    // 净空不足仅记 clearance_only 后继续采样，净空要求仍由发布前整条轨迹检查、
+    // 执行前指令门两道硬门把关，此处没有放松。
+    double required = clearance_override > 0.0 ?
+      clearance_override : fullClearanceRequirement();
     bool relaxed = false;
     if (start_clearance_ok && start_clearance < collision_dist_ &&
         (point - planning_start).head<2>().norm() <= collision_dist_) {
-      required = std::max(0.0, start_clearance - kNearFieldSlack);
+      // 近场只要求“不比现在更差”，但不能比 override 地板更严；否则窄道内
+      // 稀疏化会把起点附近的合法短段全部拒掉。
+      required = std::min(required, std::max(0.0, start_clearance - kNearFieldSlack));
       relaxed = true;
     } else if (preferred_clearance > 0.0 &&
                (point - planning_start).head<2>().norm() > collision_dist_) {
       required = std::max(required, preferred_clearance);
     }
-    if (clearance.distance <= required) {
+    if (clearance.distance + mas2027_nav_executor::kClearanceComparisonTolerance < required) {
       note_reject(point, clearance.distance, required, relaxed, false, true);
       // 停车/脱困前缀要在这里停下：前缀末端就是"车要停在哪"，它本身必须满足净空。
       if (enforce_clearance) {
@@ -429,7 +504,8 @@ bool LocalPathProcessor::searchDynamicDetour(
     const std::function<bool(const Eigen::Vector3d &, const Eigen::Vector3d &)>
         &terrain_segment_free,
     std::vector<Eigen::Vector3d> &detour,
-    SeedRejectInfo *reject_info, double preferred_clearance) const {
+    SeedRejectInfo *reject_info, double preferred_clearance,
+    double hard_clearance_floor) const {
   detour.clear();
   if (!query || query->sizeX() == 0U || query->sizeY() == 0U) {
     return false;
@@ -467,8 +543,12 @@ bool LocalPathProcessor::searchDynamicDetour(
       const auto result = query->query(point);
       // 必须与种子门/轨迹门用同一有效阈值，否则绕行会拒绝轨迹门接受的窄处而误报"无路可绕"。
       double required = fullClearanceRequirement();
-      if (start_clearance_ok && start_clearance < collision_dist_ &&
-          (point - start).head<2>().norm() <= collision_dist_) {
+      if (hard_clearance_floor > 0.0) {
+        // Narrow repair asks for the hard floor everywhere; the trajectory and
+        // command gates still enforce that same floor point by point.
+        required = hard_clearance_floor;
+      } else if (start_clearance_ok && start_clearance < collision_dist_ &&
+                 (point - start).head<2>().norm() <= collision_dist_) {
         required = std::max(0.0, start_clearance - kNearFieldSlack);
       } else if (preferred_clearance > 0.0 &&
                  (point - start).head<2>().norm() > collision_dist_) {
@@ -520,7 +600,8 @@ bool LocalPathProcessor::searchDynamicDetour(
     // The optional clearance improvement must not monopolize a replan cycle.
     // The original seed remains available if the preferred corridor is costly
     // or impossible to find; normal obstacle detours keep their old behavior.
-    if (preferred_clearance > 0.0 && ++expanded > 8000U) {
+    if ((preferred_clearance > 0.0 || hard_clearance_floor > 0.0) &&
+        ++expanded > 8000U) {
       return false;
     }
     closed[current] = 1U;
@@ -585,7 +666,9 @@ bool LocalPathProcessor::searchDynamicDetour(
   detour.front() = start;
   detour.back() = goal;
   return pathClear(detour, start, query, start_clearance, start_clearance_ok,
-                   terrain_segment_free, reject_info, preferred_clearance);
+                   terrain_segment_free, reject_info,
+                   hard_clearance_floor > 0.0 ? hard_clearance_floor :
+                   preferred_clearance);
 }
 
 bool LocalPathProcessor::buildSafeStoppingPrefix(

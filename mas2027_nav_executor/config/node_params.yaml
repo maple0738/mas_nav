@@ -8,10 +8,7 @@
       planner_frequency: 20.0
       trajectory_timeout_s: 0.6
       odom_timeout_s: 0.5
-      # MPC 下一段指令（未来 0.35 s）在 ROGMap ESDF 上要求的最小净空，应与
-      # planner.minco_optimizer.collision_dist 保持一致。机器人当前所在位置附近
-      # （弧长等于该值以内）只要求不比当前实测净空更差，避免贴墙停车后 cmd_vel 恒为 0。
-      rog_map_clearance: 0.28
+      # 硬净空统一取 planner.minco_optimizer.collision_dist，node 不再单独配置一份。
       # ROGMap 最后一次完成点云地图更新的最大年龄。点云断流或地图工作线程停滞时
       # 目标接纳和速度指令 fail closed；这直接读 ROGMap 快照时戳，不依赖任何 ROS 心跳话题。
       rog_map_timeout_s: 0.5

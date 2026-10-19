@@ -8,6 +8,7 @@
 
 #include "mas2027_nav_executor/path_executor/monitoring/command_safety.hpp"
 #include "mas2027_nav_executor/path_planner/search/global_path_searcher.hpp"
+#include "mas2027_nav_executor/path_planner/search/route_commitment.hpp"
 #include "mas2027_nav_executor/path_planner/trajectory/local_path_processor.hpp"
 #include "mas2027_nav_executor/path_planner/trajectory/minco_optimizer.hpp"
 #include "minco_core/components/planner_mode_context.hpp"
@@ -124,6 +125,41 @@ TEST_F(OnlineNavigation, PlansToObservedGoalWithoutStaticMapOrTF)
   EXPECT_EQ(path.back().header.frame_id, "odom");
 }
 
+TEST_F(OnlineNavigation, KeepsSafeCommittedRouteAcrossReverseMapDetour)
+{
+  const auto start = pose(1.0, 1.0);
+  const std::vector<geometry_msgs::msg::PoseStamped> committed{
+    pose(0.7, 1.0), start, pose(1.4, 1.0), pose(1.8, 1.0), pose(2.2, 1.0)};
+  const std::vector<geometry_msgs::msg::PoseStamped> reverse{
+    start, pose(0.6, 1.0), pose(0.6, 1.8), pose(2.2, 1.8), pose(2.2, 1.0)};
+  const auto safe = [](double, double) { return true; };
+  const auto kept = minco_planner::committedRouteForReversal(
+    start, committed, reverse, 0.05, safe);
+  ASSERT_TRUE(kept);
+  ASSERT_GE(kept->size(), 2U);
+  EXPECT_GT((*kept)[1].pose.position.x, start.pose.position.x);
+  EXPECT_FALSE(minco_planner::committedRouteForReversal(
+    start, committed, reverse, 0.05,
+    [](double x, double) { return x < 1.5; }));
+}
+
+TEST_F(OnlineNavigation, AllowsShorterReverseRouteAndSameDirectionRefresh)
+{
+  const auto start = pose(1.0, 1.0);
+  const std::vector<geometry_msgs::msg::PoseStamped> long_committed{
+    start, pose(1.4, 1.0), pose(1.4, 2.0), pose(2.2, 2.0), pose(2.2, 1.0)};
+  const std::vector<geometry_msgs::msg::PoseStamped> shorter_reverse{
+    start, pose(0.6, 1.0), pose(2.2, 1.0)};
+  EXPECT_FALSE(minco_planner::committedRouteForReversal(
+    start, long_committed, shorter_reverse, 0.05,
+    [](double, double) { return true; }));
+  const std::vector<geometry_msgs::msg::PoseStamped> forward{
+    start, pose(1.5, 1.0), pose(2.2, 1.0)};
+  EXPECT_FALSE(minco_planner::committedRouteForReversal(
+    start, long_committed, forward, 0.05,
+    [](double, double) { return true; }));
+}
+
 TEST_F(OnlineNavigation, MincoSamplesNarrowOnlineHazardDuringOptimization)
 {
   auto q = std::make_shared<OnlineQuery>();
@@ -195,6 +231,35 @@ TEST_F(OnlineNavigation, TightFreeSeedUsesWiderDetourWhenAvailable)
   const auto disabled_seed = processor.buildSeed(path, pose(0.55), s.context);
   EXPECT_TRUE(disabled_seed.valid);
   EXPECT_FALSE(disabled_seed.used_clearance_detour);
+}
+
+TEST_F(OnlineNavigation, RepairsADenseReferenceThatCutsInsideTheNarrowFloor)
+{
+  auto q = std::make_shared<OnlineQuery>();
+  q->cell_clearances.assign(1600, 1.0);
+  // Both path vertices are clear. Their straight chord crosses a 0.24 m
+  // band, and the adjacent rows allow a floor-aware local detour.
+  for (unsigned int x = 12; x <= 19; ++x) {
+    q->cell_clearances[20 * 40 + x] = 0.24;
+  }
+  Search s(q);
+  minco_planner::LocalPathProcessor processor;
+  processor.configure(3.0, 2.0, 2.0, 0.15, 0.42, 0.47,
+                      rclcpp::get_logger("online_test"));
+  processor.setNarrowPassage(true, 0.335);
+  const std::vector<geometry_msgs::msg::PoseStamped> path{
+    pose(1.05), pose(2.55)};
+
+  const auto seed = processor.buildSeed(path, pose(1.05), s.context);
+  ASSERT_TRUE(seed.valid);
+  EXPECT_TRUE(seed.used_narrow_clearance_repair);
+  ASSERT_GE(seed.dense_path.size(), 2U);
+  bool detoured = false;
+  for (const auto & point : seed.dense_path) {
+    EXPECT_GT(q->query(point).distance + 0.001, 0.335);
+    detoured = detoured || std::abs(point.y() - 2.05) > 0.05;
+  }
+  EXPECT_TRUE(detoured);
 }
 
 TEST_F(OnlineNavigation, TightSeedKeepsOriginalRouteWhenWiderDetourIsImpossible)
@@ -351,7 +416,8 @@ mas2027_nav_executor::ExecutorStatus command(
   minco_controller::Control control{};
   control.vx = 1.0;
   return mas2027_nav_executor::checkCommandSafety(terrain, q, nullptr, "odom",
-    0.28, 0.5, 0.05, state, control, rclcpp::Time(42, 0, RCL_SYSTEM_TIME));
+    0.28, false, 0.24, false, 0.5, 0.05, state, control,
+    rclcpp::Time(42, 0, RCL_SYSTEM_TIME));
 }
 
 TEST_F(OnlineNavigation, CommandUsesLiveClearanceWithoutStaticMapOrTF)

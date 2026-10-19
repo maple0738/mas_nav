@@ -11,8 +11,18 @@ double MincoOptimizer::optimize(const std::vector<Eigen::Vector3d> & waypoints,
   const Eigen::Matrix3d & start_state,
   const Eigen::Matrix3d & end_state,
   const VecDf & local_magnitudes,
-  geometry_utils::Trajectory & out_traj)
+  geometry_utils::Trajectory & out_traj,
+  OptimizationStage stage)
 {
+  opt_vars_.stage = stage;
+  opt_vars_.fine_directional_gradient =
+    (stage == OptimizationStage::FINELY_OPTIMIZATION) &&
+    cfg_.stage2_directional_gradient_enable;
+  opt_vars_.time_balance_weight =
+    (stage == OptimizationStage::PRE_OPTIMIZATION) ? cfg_.stage1_time_balance_weight : 0.0;
+  opt_vars_.time_balance_ratio =
+    std::max(0.0, cfg_.stage1_time_balance_ratio);
+
   // 1. Setup the optimization problem
   last_iteration_count_ = 0;
   last_return_code_ = 0;
@@ -88,7 +98,23 @@ double MincoOptimizer::optimize(const std::vector<Eigen::Vector3d> & waypoints,
     cout << "\tOptimized Time: " << opt_vars_.times.norm() << endl;
   }
 
-  if (ret >= 0 || ret == lbfgs::LBFGSERR_MAXIMUMITERATION) {
+  // USTC 5.5.4.1/5.5.4.2: L-BFGS often exits the fine stage on a line-search
+  // threshold even though the current iterate is already a usable trajectory.
+  // Keep the PRE fallback for all other failures, but accept the finite fine
+  // iterate for these convergence-limit return codes. The caller still runs
+  // the complete trajectory/clearance validation.
+  const bool fine_approximate_stop =
+    stage == OptimizationStage::FINELY_OPTIMIZATION &&
+    (ret == lbfgs::LBFGSERR_MAXIMUMLINESEARCH ||
+     ret == lbfgs::LBFGSERR_MINIMUMSTEP ||
+     ret == lbfgs::LBFGSERR_MAXIMUMSTEP ||
+     ret == lbfgs::LBFGSERR_WIDTHTOOSMALL) &&
+    std::isfinite(minCostFunctional);
+  if (ret >= 0 || ret == lbfgs::LBFGSERR_MAXIMUMITERATION || fine_approximate_stop) {
+    if (cfg_.print_optimizer_log && fine_approximate_stop) {
+      cout << YELLOW << " -- [MincoOpt] FINELY stage accepted approximate iterate (code="
+           << ret << ")." << RESET << endl;
+    }
     // 5. Decode the solution and build the output trajectory
     gcopter::forwardMapTauToT(tau, opt_vars_.times);
     opt_vars_.points = Eigen::Map<const Mat3Df>(xi.data(), 3, opt_vars_.piece_num - 1);
@@ -109,6 +135,48 @@ double MincoOptimizer::optimize(const std::vector<Eigen::Vector3d> & waypoints,
     minCostFunctional = INFINITY;
   }
   return minCostFunctional + ret;
+}
+
+double MincoOptimizer::optimizeTwoStage(const std::vector<Eigen::Vector3d> & waypoints,
+  const Eigen::Matrix3d & start_state,
+  const Eigen::Matrix3d & end_state,
+  const VecDf & local_magnitudes,
+  geometry_utils::Trajectory & out_traj)
+{
+  last_fine_stage_used_ = false;
+  geometry_utils::Trajectory pre_traj;
+  const double pre_cost = optimize(waypoints, start_state, end_state, local_magnitudes,
+    pre_traj, OptimizationStage::PRE_OPTIMIZATION);
+  if (!std::isfinite(pre_cost)) {
+    return pre_cost;
+  }
+  const int pre_iterations = last_iteration_count_;
+  const int pre_return_code = last_return_code_;
+  const double pre_objective = last_objective_total_;
+  const uint64_t pre_query_failures = last_query_failure_count_;
+
+  geometry_utils::Trajectory fine_traj;
+  const double fine_cost = optimize(waypoints, start_state, end_state, local_magnitudes,
+    fine_traj, OptimizationStage::FINELY_OPTIMIZATION);
+  const int fine_iterations = last_iteration_count_;
+  const int fine_return_code = last_return_code_;
+  if (!std::isfinite(fine_cost)) {
+    // A failed stage 2 must not silently publish its partial state. Keep the
+    // stage-1 trajectory; the caller still runs the full safety validation.
+    out_traj = pre_traj;
+    last_iteration_count_ = pre_iterations;
+    last_return_code_ = pre_return_code;
+    last_objective_total_ = pre_objective;
+    last_query_failure_count_ = pre_query_failures;
+    if (cfg_.print_optimizer_log) {
+      cout << YELLOW << " -- [MincoOpt] FINELY stage failed (code=" << fine_return_code
+           << ", iter=" << fine_iterations << "); using PRE trajectory." << RESET << endl;
+    }
+    return pre_cost;
+  }
+  out_traj = fine_traj;
+  last_fine_stage_used_ = true;
+  return fine_cost;
 }
 
 double MincoOptimizer::costFunctional(void * ptr, const VecDf & x, VecDf & g)
@@ -169,7 +237,7 @@ double MincoOptimizer::costFunctional(void * ptr, const VecDf & x, VecDf & g)
     magnitudeBounds,
     local_magnitudes,
     penaltyWeights,
-    opt_vars_.clearance,
+    opt_vars_.fine_directional_gradient,
     cost,
     partialGradByTimes,
     partialGradByCoeffs,
@@ -244,6 +312,26 @@ void MincoOptimizer::computeTimeBarrier(const OptVars & opt_vars,
       penalty_log(5) = violation;
     }
   }
+
+  // USTC 5.5.4.2 PRE stage: keep the first-stage segment times near the
+  // average so control points are not pushed out of a narrow tunnel by an
+  // uneven time allocation. This is a soft band, not a new dynamic limit.
+  if (opt_vars.stage == OptimizationStage::PRE_OPTIMIZATION &&
+      opt_vars.time_balance_weight > 0.0 && N > 1) {
+    const double average = times.mean();
+    const double allowed = std::max(0.0, opt_vars.time_balance_ratio) * average;
+    for (int i = 0; i < N; ++i) {
+      const double diff = times(i) - average;
+      const double violation = std::abs(diff) - allowed;
+      if (violation <= 0.0) {
+        continue;
+      }
+      cost += opt_vars.time_balance_weight * violation * violation;
+      gradByTimes(i) += 2.0 * opt_vars.time_balance_weight * violation *
+        (diff > 0.0 ? 1.0 : -1.0);
+      penalty_log(5) = std::max(penalty_log(5), violation);
+    }
+  }
 }
 
 void MincoOptimizer::constraintsFunctional(const VecDf & T,
@@ -255,7 +343,7 @@ void MincoOptimizer::constraintsFunctional(const VecDf & T,
   const VecDf & magnitudeBounds,
   const VecDf & local_magnitudes,
   const VecDf & penaltyWeights,
-  const ClearanceModel & clearance,
+  bool fine_directional_gradient,
   // outputs
   double & cost,
   VecDf & partialGradByTimes,
@@ -328,22 +416,9 @@ void MincoOptimizer::constraintsFunctional(const VecDf & T,
       double tmp_cost{0.0};
       Vec3f gradPos{0.0, 0.0, 0.0}, gradVel{0.0, 0.0, 0.0}, gradAcc{0.0, 0.0, 0.0};
 
-      // For position cost
+      // For position cost: one fixed optimizer soft target, no second safety口径.
       if (weightPos > 0.0 && map) {
-        // 目标净空：默认固定 safe_dist；启用速度感知（默认关闭）后改用发布前校验/运行时监视口径：
-        //   required(v) = collision_dist + max(|v| * react_time, monitor_margin) + 余量，
-        // 否则解会被 validateTrajectory 否掉、窄处走走停停；余量不可省：软目标只能渐近逼近。
-        double required_dist = safe_dist;
-        const double speed = vel.norm();
-        const bool speed_term_active = clearance.enabled &&
-          std::isfinite(speed) && clearance.react_time > 0.0;
-        if (speed_term_active) {
-          required_dist = clearance.collision_dist +
-            std::max(speed * clearance.react_time, clearance.monitor_margin) +
-            clearance.optimizer_margin;
-        }
-
-        double esdf_dist = -required_dist;
+        double esdf_dist = -safe_dist;
         Eigen::Vector3d esdf_grad = Eigen::Vector3d::Zero();
         const auto query = map->query(pos.cast<double>());
         if (query.ok) {
@@ -353,18 +428,26 @@ void MincoOptimizer::constraintsFunctional(const VecDf & T,
           ++query_failure_count;
         }
 
-        const double violaPos = required_dist - esdf_dist;
+        const double violaPos = safe_dist - esdf_dist;
         double violaPosPena, violaPosPenaD;
         if (gcopter::smoothedL1(violaPos, smooth_eps, violaPosPena, violaPosPenaD)) {
-          // d(violaPos)/dpos = -grad(dist)
-          gradPos += (-weightPos * violaPosPenaD) * esdf_grad.cast<double>();
-          tmp_cost += weightPos * violaPosPena;
-          // 净空要求随速度增长，故对速度有梯度；仅在速度项生效且速度非零时加入，避免无谓梯度。
-          if (speed_term_active && speed > 1e-6) {
-            const float speed_f = static_cast<float>(speed);
-            gradVel += (weightPos * violaPosPenaD * clearance.react_time) *
-              (vel / speed_f);
+          // d(violaPos)/dpos = -grad(dist). In the fine stage remove the
+          // along-track component so narrow corridors push control points
+          // sideways instead of pushing them forward/backward along the path.
+          Vec3f applied_grad = esdf_grad;
+          if (fine_directional_gradient) {
+            const double speed = vel.norm();
+            if (std::isfinite(speed) && speed > 1.0e-3) {
+              const Vec3f tangent = vel / speed;
+              const Vec3f perpendicular =
+                applied_grad - tangent * applied_grad.dot(tangent);
+              if (perpendicular.norm() > 1.0e-6) {
+                applied_grad = perpendicular;
+              }
+            }
           }
+          gradPos += (-weightPos * violaPosPenaD) * applied_grad;
+          tmp_cost += weightPos * violaPosPena;
           if (violaPos > max_pena(POS_IDX))
             max_pena(POS_IDX) = violaPos;
         }

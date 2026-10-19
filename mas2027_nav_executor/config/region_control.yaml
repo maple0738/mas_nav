@@ -1,5 +1,21 @@
 /**:
   ros__parameters:
+    # Remote-style yaw command; lower board keeps its existing auto_yaw_offset logic.
+    gimbal_follow:
+      # Choose the nearer forward/reverse tangent; translation still follows MINCO.
+      allow_reverse: true
+      reverse_switch_hysteresis_deg: 10.0
+      ready_tolerance_deg: 5.0
+      ready_release_deg: 8.0
+      settle_time_s: 0.3
+      # Keep base_link +X/-X on the path axis even while translation is blocked.
+      heading_error_gain_s: 1.0
+      heading_deadband_deg: 0.5
+      max_heading_rate_deg_s: 120.0
+      # If the planner is between trajectories, keep follow_gimbal=1 at the last
+      # integrated angle and send zero translation instead of returning the lower
+      # board to free-spin mode. New trajectories continue from the held angle.
+      hold_last_alignment: true
     region_control:
       # Special terrain labels equal chassis modes: slope=5, tunnel=6, undulating=7.
       # Ordinary sections stay at 3.0/4.0; slope mode may rise to 4.0/5.0.

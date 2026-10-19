@@ -77,7 +77,7 @@ flowchart LR
 | `/rog_map/decay_cells` | 衰减单元诊断 |
 | `/rog_map/map_bound` | 当前滑动地图边界 |
 
-`/rog_map/terrain_label` 与旧 `/rog_map/layer_type` 的判据不同。坡道候选要求中心为薄地面，在 11×11 邻域内至少有 30 个薄地面格，拟合平面坡度在约 8°～35°，高度变化至少 0.06 m，拟合均方根误差不超过 0.04 m。隧道候选要求同一柱内上下占据层相距 0.6～1.8 m、竖直占据率不超过 0.45、两层之间至少一半体素明确观测为空闲，且 3×3 邻域至少 5 格满足该条件。隧道优先于坡道。阈值目前是诊断初值，需要用现场点云标定；特别是局部地图垂直窗口只有 2.5 m，超出窗口的顶板无法识别。该话题为候选语义，不等同于可通行净空。`nav_executor` 优先采用在线 `5/6` 生成区域 mode，在线没有特殊地形结果或过期时回退静态 `/terrain_label_map`。
+`/rog_map/terrain_label` 与旧 `/rog_map/layer_type` 的判据不同。坡道候选要求中心为薄地面，在 11×11 邻域内至少有 30 个薄地面格，拟合平面坡度在约 8°～35°，高度变化至少 0.06 m，拟合均方根误差不超过 0.04 m，且**任一样本到拟合平面的残差不超过 0.05 m**。最后一条用于拒绝桌面/箱顶等抬升薄面：它们能让最小二乘 RMS 仍低于 4 cm，却把平地拟合成假坡。隧道候选只从投影层已判为 `PASSABLE/HOLLOW_TUNNEL` 的柱生成：上下占据层跨度必须落在 `projection.tunnel_height_delta_min/max` 内，竖直占据率不超过 `projection.tunnel_occupancy_ratio_max`，两层之间至少一半体素明确观测为空闲，且 3×3 邻域至少 5 格满足该条件。投影层判为 `OCCUPIED` 的高柱不会再被标成隧道。隧道优先于坡道。阈值目前是诊断初值，需要用现场点云标定；特别是局部地图垂直窗口只有 2.5 m，超出窗口的顶板无法识别。该话题为候选语义，不等同于可通行净空。`nav_executor` 优先采用在线 `5/6` 生成区域 mode，在线没有特殊地形结果或过期时回退静态 `/terrain_label_map`。
 
 RViz 的 `ROGMAP` 分组默认开启 `Online Terrain (orange=slope, cyan=tunnel)`；它显示的是 `/rog_map/terrain_markers` 中**在线识别的候选格**，不会把人工标注区涂成在线识别。若需核对数值，可临时开启同组的 `Online Terrain Labels (raw 5/6)`。两个话题来自同一次 `terrainLabels()` 计算，色块只负责显示，不参与规划或底盘控制。
 
@@ -164,6 +164,7 @@ RViz 的 `ROGMAP` 分组默认开启 `Online Terrain (orange=slope, cyan=tunnel)
 | `projection.scan_z_max_abs` | `2.75` | `1.50` | 投影 z 窗口上限 |
 | `projection.scan_z_relative_to_robot` | `true` | `false` | true 时上两项是相对 `/Odometry` z 的偏移，LIO z 漂移不会把车身高度的障碍裁出窗口 |
 | `projection.unknown_as_occupied` | `false` | `true` | UNKNOWN 是否算二维障碍。**必须与 `planner.exploration.unknown_as_occupied` 一致**，否则全局搜索与距离场对同一格给出相反结论 |
+| `projection.body_exclusion_radius` | `0.302` | `0.302` | 方形底盘的外接圆半径；入图前按配对位姿过滤轮廓内的自车回波，保留已观测的墙体占据。设 0 关闭过滤 |
 | `projection.min_observed_voxels` | `1` | `2` | 柱内至少几个已观测（free/occ）体素才算“观测过” |
 | `projection.surface_height_delta_max` | `0.15` | `0.10` | span ≤ 本值 → PASSABLE（薄面：地面、坡面、桌面）。**2026-09-22 由 0.10 放宽到 0.15**（桌子被判障碍），代价见下方⚠️ |
 | `projection.wall_height_delta_min` | `0.8` | `0.20` | span ≥ 本值且竖直占据率 ≥ `wall_occupancy_ratio_min` → OCCUPIED（实心墙） |
@@ -245,7 +246,10 @@ RViz 的 `ROGMAP` 分组默认开启 `Online Terrain (orange=slope, cyan=tunnel)
 `last_total_update_time_ms` / `last_projection_time_ms` / `last_raycast_time_ms` / `last_field_time_ms`
 （分阶段耗时），以及分类归因列 `reason_thin_surface` / `reason_solid_vertical_wall` /
 `reason_hollow_tunnel` / `reason_ambiguous_occupied` / `reason_empty_column` —— 用来定位某一类结构
-被判成了哪一档。
+被判成了哪一档。`terrain_label_flat` / `terrain_label_slope` / `terrain_label_tunnel` 是
+`ProjectionLayer::terrainGeometry()` 实际输出的 `0/5/6` 标签格数，不是上面的分类计数；现场若在平地
+持续出现 `terrain_label_slope > 0` 或 `terrain_label_tunnel > 0`，应同时保存
+`/nav_executor/online_terrain_map` 与 `/rog_map/layer_height_delta` 核对。
 
 ### 已接线但无效的参数
 

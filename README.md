@@ -13,7 +13,7 @@ ROS 2 Jazzy，运行链路统一为独立 `nav_executor`：不依赖 Nav2 server
 | `odom_localizer` | GICP 六自由度先验定位（`lab3.pcd`）→ `/tf_maintainer/map_to_odom` |
 | `tf_maintainer` | 唯一动态 TF 发布者：`map→odom`、`odom→base_link` |
 | `terrain_map_server` | 静态地形服务 → `/cost_map`、`/terrain_label_map` |
-| `nav_executor` | TaskManager + ROGMap + 全局搜索 + MINCO + MPC + 区域控制 → `/opt_path`、`/cmd_vel`、`/nav_executor/chassis_cmd` |
+| `nav_executor` | TaskManager + ROGMap + SMAC/MINCO 规划 + MPC + 区域控制 → `/opt_path`、`/cmd_vel`、`/nav_executor/chassis_cmd` |
 | `nav_serial_bridge`（可选） | 消费 `/nav_executor/chassis_cmd` → CDC1 导航专用串口 |
 | `robot_state_publisher` | URDF → 车体 / 雷达外参 |
 
@@ -28,17 +28,15 @@ MID360 ×2 → mid360_driver → small_point_lio → /Odometry + /cloud_register
                      └─→ ROGMap（进程内：在线占据 / 距离场 / 坡道隧道语义）
 
 lab3_terrain.msgpack → terrain_map_server → /cost_map + /terrain_label_map
-                                         → 全局搜索 → MINCO → MPC → 区域控制 → /nav_executor/chassis_cmd
+                           → SMAC 2D 搜索 → MINCO 轨迹 → MPC → 区域控制
 ROGMap → /rog_map/terrain_label ──────────────────────────↑
 ```
 
-- 全局主搜索是移植的 **SMAC 2D**（`path_planner/search/smac/`）：在静态地形栅格上做
-  8 邻域 A\*，用同图距离场做 ESDF 软代价（`smac_2d.*`）。输出是纯几何折线，时间
-  参数化与运动学可行性交给弧长速度剖面 + MINCO；`planner.use_smac: false` 退回 Astar，SMAC 失败
-  **不自动回退**。
-- MINCO 的走廊、优化与碰撞检查用 ROGMap 在线占据/距离场。全局折线进局部滑窗后逐段验净空：
-  被截断则窗内重搜接回终点，完全封死则只发障碍前停车前缀（零末速度）。地图、距离场或
-  `map→odom` 缺失时不接受目标、不发运动指令。
+- 全局主搜索是 **SMAC 2D**，在 ROGMap 动态格和坡道侧边约束上搜索；`planner.use_smac:false` 时使用 Astar。输出仍是纯几何折线。
+- 局部轨迹由 **MINCO** 生成，并经过发布前整条轨迹校验和执行前指令门。
+  全局折线进局部滑窗后逐段验净空：被截断则窗内重搜接回终点，完全封死则只发障碍前停车前缀（零末速度）。
+- 热启动重规划只复用旧轨迹剩余段最近 `replan_continuity_time_s`（默认 0.3 s），作为 MINCO 初值前缀；
+  如果旧前缀末端与新路径拼接跳跃超过 0.6 m，会自动缩短/放弃旧前缀，避免旧路线拖住新规划。
 - 执行许可由 `TaskManager` 管（`MincoFsm` 已删）：新目标抢占后旧轨迹失效；里程计超
   `node.odom_timeout_s` 停规划与执行。任一雷达掉线自动降级单雷达（含 IMU 切换）、恢复后自动配对，
   参数见 `small_point_lio_params.yaml` 的 `merge_*`、`packet_resync_silence`。
@@ -64,43 +62,39 @@ ROGMap → /rog_map/terrain_label ───────────────�
 
 ## 净空判据与排障
 
-发布前校验、20 Hz 运行时监视、MPC 指令检查共用 `common/environment/clearance_gate.hpp` 的一条判据：
+安全链路只保留两道硬门：
 
+1. **发布前**：`MincoPlanner::validateTrajectory()` 检查整条 MINCO 轨迹的动力学、终点、地形和净空；
+2. **执行前**：`PathExecutor::checkCommandSafety()` 每个控制周期检查下一段指令的 ROGMap 时效、地形 transition 和近场/远场净空。
+
+两道门共用 `common/environment/clearance_gate.hpp` 的同一阈值：
+
+```text
+effective_clearance = max(0, collision_dist - kEsdfJitterTolerance)
+                    = max(0, 0.28 - 0.02) = 0.26 m
 ```
-required(v) = collision_dist + max(v * replan_react_time, monitor_margin)
-```
 
-当前 `collision_dist: 0.28`、`monitor_margin: 0`、`replan_react_time: 0`，`node.rog_map_clearance`
-也是 0.28（两处必须一致）。三条关键规则：
+不再有独立的 20 Hz 全轨迹监视，也没有 `monitor_margin`、`replan_react_time`、`speed_aware_clearance` 等第二套速度相关口径。执行侧指令门是动态障碍的最终兜底；轨迹发布门防止明显不安全的整条轨迹进入跟踪。
 
-- **两道门同公式**：发布门 0.30 / 监视门 0.50 曾导致轨迹一发就被判不安全 → 急停 + 重规划、
-  `/cmd_vel` 只在瞬间有值。监视门另减 `kMonitorClearanceTolerance`（0.05 m）防逐帧抖动误杀。
-- **近场放宽**：起点弧长 `collision_dist` 以内只要求「不比当前实测净空更差」（留 0.02 m），
-  否则贴墙停车后发目标点车不动。日志 `Near-field exemption active: ... X ... Y ... Z` 中
-  X 是实测净空、Y 是下调后要求、Z 是完整要求，`X > Z` 属正常。
-- **第四层兜底**：正常路径 → 窗内绕行 → 完整停车前缀（安全段需 0.45 m）都失败时，发一个不差于
-  当前净空、末速为零的短前缀脱困；`planner.minco_optimizer.stuck_escape.enable: false` 可关闭。
+- **近场放宽**：起点弧长 `collision_dist` 以内只要求「不比当前实测净空更差」（留 0.02 m），否则贴墙停车后发目标点车不动。日志 `Near-field exemption active: ... X ... Y ... Z` 中 X 是实测净空、Y 是下调后要求、Z 是完整要求，`X > Z` 属正常。
+- **搜索启发式不是安全门**：SMAC 的 `minimum_clearance: 0.27` 和在线子目标 `collision_dist`(0.28) 只影响搜索/回退；最终仍由上面两道硬门验收。目标格被占据或净空不足时，沿 `start → goal` 反方向最多回退 `goal_approach_max_shorten`（默认 1.5 m）找可通行接近点，不放松最终阈值。
+- **局部兜底**：正常路径 → 窗内绕行 → 完整停车前缀（安全段需 0.45 m）都失败时，发一个不差于当前净空、末速为零的短前缀脱困；`planner.minco_optimizer.stuck_escape.enable: false` 可关闭。
+- **不再因引导/语义失败急停**：在线全局刷新失败但当前局部轨迹未过期时继续跟随；在线语义标签冲突时回退无特殊区段的普通 profile。
 
-失败原因按 `failure_log_first_n`(10) 逐条、每 `failure_log_every_n`(25) 次采样、每
-`failure_summary_every`(50) 次汇总。`LOCAL_SEED_INVALID` / `..._AFTER_REPAIR` = 没进优化器；
-`OPTIMIZER_FAILED` = 不收敛；`COLLISION` / `TERRAIN_COLLISION` = 硬校验被否。
-四层兜底全败时 `Live obstacle blocks the local route...` 会带 `*_reject=` 现场与自动判读 `verdict=`：
-`GEOMETRY` 连近场规则都过不了（拒绝正确，别动阈值）、`SEED_GATE_STRICTER` 只被更严的种子门否掉
-（判据不一致）、`PREFIX_TOO_SHORT` 卡安全段长度、`TERRAIN` 死在 terrain/动态层、`NONE` 未捕获。
+失败原因按 `failure_log_first_n`(10) 逐条、每 `failure_log_every_n`(25) 次采样、每 `failure_summary_every`(50) 次汇总。`LOCAL_SEED_INVALID` / `..._AFTER_REPAIR` = 没进优化器；`OPTIMIZER_FAILED` = 不收敛；`COLLISION` / `TERRAIN_COLLISION` = 硬校验被否。局部兜底全败时 `Live obstacle blocks the local route...` 会带 `*_reject=` 现场与自动判读 `verdict=`：`GEOMETRY` 连近场规则都过不了（拒绝正确，别动阈值）、`SEED_GATE_STRICTER` 只被更严的种子门否掉、`PREFIX_TOO_SHORT` 卡安全段长度、`TERRAIN` 死在 terrain/动态层、`NONE` 未捕获。
 
-反复急停 = 两道门又不一致；只有 `not published` = 近场外净空不够，先查配准与 ROGMap 是否把车体
-自身算成障碍，**不要直接减小 `collision_dist`**。细节见 `docs/refusal_triage_2026-09-16.md`。
+反复急停时先看 `Braking:` 的 `reason=`：`rog_map_stale` / `tf_unavailable` 是数据新鲜度问题，`clearance` 是执行侧指令净空，`terrain_transition` 是地形方向门；不要直接减小 `collision_dist`。细节见 `docs/refusal_triage_2026-09-16.md`。
 
 ## ROGMap 与 RViz
 
 - ROGMap 订阅 `/cloud_registered` + `/Odometry`；RViz `ROGMAP` 分组默认显示紫色 `Occupied`（0.05 m）
   与 `2D Distance Field`。先验图融合关闭，`Static Layer Value` 不代表地形图；投影高度、地面/墙体
-  阈值与 `node.rog_map_clearance` 需在静止实车上标定。已移除目标跟踪与未来预测（防振动误判）。
+  阈值与 `planner.minco_optimizer.collision_dist` 需在静止实车上标定。已移除目标跟踪与未来预测（防振动误判）。
 - MPC 仍为全向模型（`linear.x/y`、`angular.z`，内部角速度限制 ±2 rad/s、角加速度限制 ±4 rad/s²，需按底盘标定）；最终 `w` 由下面的角速度配置覆盖。
   区域控制沿最终轨迹标注坡道、隧道和起伏路，以 `/nav_executor/chassis_cmd` 同步发布速度与
-  mode；`/cmd_vel` 保留供观测。`nav_serial_bridge` 从同一消息提取 `vx`、`vy`、`w`，
-  通过导航专用 CDC1 串口直接发送；当前固件包没有 `mode` 字段。
-  最终 `w` 始终为 `+4 rad/s`，包括行进、到达目标和线速度停车期间；不按正弦变化。
+  mode 及小 yaw 对齐请求；`/cmd_vel` 保留供观测。`nav_serial_bridge` 从同一消息提取平移速度、相对下位机 auto_yaw_offset 的遥控式位置指令 `small_yaw_ref` 和 `follow_gimbal`，
+  通过导航专用 CDC1 串口直接发送；下发包没有 `w`、导航状态或 `mode` 字段。
+  普通路段 ROS 中的 `w` 为 `+2 rad/s`，特殊跟随显示 MPC 内部角速度，均不经串口发送；下位机自动模式在导航在线且平移速度有效时自行固定 `+4 rad/s`，离线或速度无效时清零。
   区域 mode 只在导航内部生效；特殊地形的底盘朝向闭环尚需相对角度 `δ` 反馈。
 - `lab3_terrain.msgpack` 只有平地/障碍，无坡道台阶与方向数据；方向层实测全 0，逐边方向约束只在
   `validateTrajectory` 的 `terrain->transition()`（失败记 `TERRAIN_COLLISION`）。
@@ -121,7 +115,10 @@ export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 cd /home/mas/mas_nav_2027_native
 rosdep install -r --from-paths src --ignore-src --rosdistro jazzy -y
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON --parallel-workers 4
+
+colcon build --symlink-install --parallel-workers 4 --cmake-args \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 source install/setup.bash
 ```
 
@@ -152,6 +149,12 @@ source /home/mas/mas_nav_2027_native/install/setup.bash
 ros2 launch mas2027_nav_bringup nav_executor_launch.py
 ```
 
+导航从特殊地形入口前的 `PREPARING` 阶段开始发送 `follow_gimbal=1` 和角度制 `small_yaw_ref`，经过 `ARMED`、`COMMITTED`、`INSIDE` 和 `RELEASING` 阶段持续跟随，到释放点后清除请求。普通路段不请求跟随。无轨迹/许可、失效输入或串口指令超时会清除跟随请求并停止平移；串口桥退出前发送零速度、无跟随请求的最后一帧。
+
+特殊地形跟随按轨迹轴线对齐：`gimbal_follow.allow_reverse=true`，在轨迹切线及其反方向中选择较近朝向；正反方向切换使用 10° 滞回。`base_link` 的 +X 就是云台正方向，因此 +X 或 -X 与轨迹共线即可，不要求车头一定朝前；同一 MPC 的整个预测窗采用相同选择，MINCO 位置和世界系速度不反号。角度指令由 MPC 角速度前馈加上 LIO 实测轴线误差修正（`heading_error_gain_s=1.0`、`heading_deadband_deg=0.5`、`max_heading_rate_deg_s=120`），所以安全门只停止平移时仍会继续把云台轴线转回轨迹。跟随阶段等待所选轴线误差进入 5°并稳定 0.3 s；健康 MPC 周期承接上一拍命令继续加速，仅在失效/拒绝时锚到实测速度。普通路段上限仍为 3 m/s，角速度/角加速度限制仍为 ±2 rad/s、±4 rad/s²。详见 [倒车跟随与响应速度](docs/reverse_follow_speed_2026-10-17.md)。
+
+`force_follow_gimbal` 启动参数已删除；跟随请求完全由特殊地形区域阶段控制。修改跟随控制参数需重启导航，不需要改下位机。
+
 常用启动参数：`use_rviz`、`use_odom_localizer`、`use_nav_serial`、`nav_serial_device`、`output_topic`。
 启动模式仅由 `mas2027_nav_executor/config/node_params.yaml` 中的 `node.map_source` 选择，修改后重启生效。
 设为 `prior` 时，先验地图文件统一在 `mas2027_nav_bringup/config/navigation_map.yaml` 中选择。
@@ -159,7 +162,7 @@ ros2 launch mas2027_nav_bringup nav_executor_launch.py
 使用 `odom` 下的 LIO 与在线 ROGMap 分段推进；速度与加速度采用规划器、MPC 和区域控制 YAML，未知区域作为障碍。
 在线模式默认启用 B1 累计地图，在 `/nav_executor/online_global_map` 保留本次启动内的历史观测，并提供固定版本的全局查询接口；当前任务搜索仍使用 A 方案，后续 B2 接入累计地图路线。
 具体启动、目标坐标和能力范围见 [无先验地图导航](docs/online_navigation.md)。
-`use_nav_serial` 默认 `True`，通过 CDC1 直接发送 `vx`、`vy`、`w`、`nav_state`；只想观察导航时置
+`use_nav_serial` 默认 `True`，通过 CDC1 发送 `vx`、`vy`、小 yaw ref 和请求标志；只想观察导航时置
 `False`。导航桥默认读取 USB 接口自身的 `iInterface`，仅连接字符串为 `PCCOMM-NAV` 的
 CDC 串口，不依赖 `/dev/ttyACM*` 编号、`if02` 顺序或设备产品名称；
 `nav_serial_device` 可显式指定串口路径。RViz 的 2D Goal Pose 发到 `/goal_pose`。
@@ -168,7 +171,7 @@ CDC 串口，不依赖 `/dev/ttyACM*` 编号、`if02` 顺序或设备产品名�
 
 不要同时启动整套导航和独立串口桥。确认导航接口对应的串口没有其他占用后，按上面的方式加载
 ROS 环境，单独运行 `ros2 run nav_serial_bridge nav_serial_bridge_node`，保持约 30 秒再按 Ctrl+C。
-没有 ROS 底盘命令时，桥发送 `vx=vy=0`、`w=+4 rad/s`、`nav_state=1`。每 5 秒的 `CDC1` 日志给出：
+没有 ROS 底盘命令时，桥发送 `vx=vy=0`、小 yaw 请求清零的 16 字节帧；自动模式的下位机只要导航通信在线，零平移时仍固定 `+4 rad/s` 自转。每 5 秒的 `CDC1` 日志给出：
 
 - `tx_ok` 和括号内的 Hz：主机成功写入串口的帧数与平均频率，目标约 50 Hz；
   `tx_failed` 为短写或系统调用失败数，`max_tx_gap` 为相邻成功写入调用的最大间隔。
@@ -201,7 +204,7 @@ cd /home/mas/桌面/mas_vision/build
 
 视觉台架入口不启动相机，只在 CDC0 发送零目标角、`fire_advice=0`。导航桥只接收
 `/nav_executor/chassis_cmd` 的导航系统指令；没有新指令或指令超过 300 ms 时在 CDC1
-发送零线速度、`w=+4 rad/s`、`nav_state=1`。不要同时运行视觉 `./base` 或第二个
+发送零平移速度、小 yaw ref 和请求标志均为零的 16 字节帧。下位机自动模式的自转由下位机自身生成。不要同时运行视觉 `./base` 或第二个
 导航桥。视觉每 3 秒的 `[serial-rate]` 目标为发送约 250 Hz、接收约 500 Hz，
 `tx_err`、`crc_errors`、`dropped_bytes`、`queue_dropped` 应为 0；导航每 5 秒的
 `CDC1` 目标为发送约 50 Hz、接收约 500 Hz，写入和 CRC 错误应为 0。
@@ -209,8 +212,7 @@ cd /home/mas/桌面/mas_vision/build
 
 ## 核心配置
 
-- `mas2027_nav_executor/config/node_params.yaml`：频率、话题、坐标系、`node.rog_map_clearance`
-  与 `node.rog_map_timeout_s`。
+- `mas2027_nav_executor/config/node_params.yaml`：频率、话题、坐标系、轨迹/里程计/ROGMap 超时。
 - `mas2027_nav_executor/config/planner_params.yaml`：全局搜索（`use_smac`、`smac_2d.*`、`tolerance`）、
   MINCO 与恢复参数、`planner.rog_map.*`、`planner.online_global_map.*`。
 - `mas2027_nav_executor/config/mpc_params.yaml`：MPC 约束与权重。
@@ -231,8 +233,8 @@ cd /home/mas/桌面/mas_vision/build
 `map→odom`；改点云或雷达外参后先在 RViz 确认地板、天花板重合。
 
 **实时障碍由 ROGMap 独占负责**。主导航栈已删除 `/dynamic_cost_map`、其心跳闭锁、
-二维动态格融合和对应可视化；ROGMap 在在线快照、局部种子路径、轨迹发布/20 Hz
-监视与 MPC 指令前视中仍保持 fail closed。`node.rog_map_timeout_s` 直接检查进程内 ROGMap
+二维动态格融合和对应可视化；ROGMap 在在线快照、局部种子路径、轨迹发布前整条检查
+与执行前指令前视中仍保持 fail closed。`node.rog_map_timeout_s` 直接检查进程内 ROGMap
 最后一次完成快照的时间：点云断流或工作线程停滞时拒绝新目标并制动，不需要替代心跳话题。
 `map_server` 仍然必要，但职责只是发布静态
 `/cost_map` 和 `/terrain_label_map`，已不依赖点云、先验 PCD、PCL 或 TF。
@@ -281,5 +283,6 @@ ros2 run tf2_ros tf2_echo map odom && ros2 run tf2_ros tf2_echo odom base_link
 ```
 
 点目标后没有轨迹：依次确认 ROGMap 已收到点云与里程计、目标在当前滑窗可达范围内、`/opt_path`
-有发布；MPC 输入过期、TF 失败或求解失败时执行器发零速。修改记录见
+有发布；MPC 输入过期、TF 失败或求解失败时执行器发零速。实车复跑要保留地图与轨迹证据时，先按
+[现场导航运行记录](docs/field_run_recording.md) 启动记录器。修改记录见
 [`docs/change-history.md`](docs/change-history.md)。

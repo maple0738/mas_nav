@@ -2,6 +2,373 @@
 
 本文件记录由开发任务产生的代码、配置、脚本、资源和文档变更。新记录追加在最上方，不改写旧记录。
 
+## 2026-10-19 — 增加窄道碰撞排查与调参文档
+
+- 新增 `docs/narrow_passage_collision_tuning.md`，按入窄道转向、对齐直行、退出时自转和地图漏墙区分排查路径；列出当前参数、可验证的试验调整、对通行性的影响，以及一轮现场录包的核对步骤。文档说明 0.25 m 地图连通瓶颈、0.302 m 旋转半径与约 0.214 m 对齐半宽的关系，也指出 5° 航向就绪容差相对约 1.1 cm 名义间隙的风险。核对 `nav_executor_launch.py`，补充 online 模式覆盖 YAML 中 `unknown_as_occupied`、三维近距盲区强制 free 更新的事实及运行时参数抓取位置。
+- 验证：逐项对照当前 YAML、执行器航向就绪/窄道限速代码、launch 覆盖和 `20261018_130912` 历史距离场分析；`git diff --check` 通过。本文仅增加操作说明，未运行实车或进行新的安全标定，试验值仍需现场逐项验证。
+
+## 2026-10-19 — 查明 0.25 m 可通而 0.30 m 被拒，并校正外形说明
+
+- `20261018_130912` 同一帧 ROGMap 距离场的离线搜索显示：起点到目标在 0.25 m 门槛下连通，在 0.26 m 下即断开，瓶颈约 `(2.54,-1.24)`、格心净空约 0.25 m。因此将全局搜索门槛统一改为 0.30 m 会直接判无路，与实车物理上能否对齐直行是两个问题。`20261018_135419` 随后的实车记录以 0.27/0.25 m 主/回退搜索和 0.24 m 窄道地板完成 4/4 目标。
+- 用户确认车体是正方形，0.302 m 是**中心到角点的旋转半径**。对齐直行半宽由此为约 0.214 m；原 URDF 的 0.5×0.5 m 方框对应 0.354 m 旋转半径，与实测不符。`mas2027_sentry.urdf` 将 visual/collision 平面方框改为按该半径推得的 0.4271×0.4271 m；`planner_params.yaml`、`nav_executor_node.cpp` 启动诊断及执行器 README、在线导航说明明确区分旋转外廓、直行半宽和地图 ESDF 格心净空。5 cm 格子下，0.25 m 读数对应的名义直行侧向余量仅约 0.011 m，不能当作可靠安全间隙。
+- 验证：重新核对历史现场距离场分析和配置快照；`mas2027_robot_description` 与 `mas2027_nav_executor` Release 构建通过，导航包 CTest 11/11 通过；XML 解析确认 base_link 的 visual/collision 平面方框均为 0.4271×0.4271 m，`git diff --check` 通过。尚未用校正后的 URDF 与导航版本实车复跑；墙体实体边界、车体中心偏置及定位/航向误差对上述 0.011 m 余量的影响未现场量测。
+
+## 2026-10-19 — 区分窄道直行和车体旋转净空，保留真实墙体占据
+
+- 复查 `20261018_135419` 现场记录：4/4 目标到达且无途中急停，所用 SMAC 主/回退净空为 0.27/0.25 m，轨迹 `collision_dist=0.28 m`（有效 0.26 m），窄道地板 0.24 m；这些值允许已对齐的方形车体平移，不能代表实测 0.302 m 的旋转外廓。后来把整条轨迹硬净空抬到 0.40 m 时，曾在 0.387 m 处拒绝窄口接近轨迹。`planner_params.yaml` 保留历史通过门槛，把 `swept_radius` 修正为 0.302 m。
+- `PathExecutor` 在前方轨迹点低于旋转所需净空时进入几何对齐，航向未就绪时由 `nav_executor_node.cpp` 停止平移；离开窄道和目标结束时要求当前位置净空至少为 0.302 m 旋转半径、0.05 m 目标间隙和半个栅格对角线之和，才交还下位机自由旋转。轨迹接收仍按历史 0.26/0.24 m 规则，避免可通过的已对齐通道被统一旋转半径拒绝。`path_executor.hpp/.cpp` 和 `test_mpc_gimbal_follow.cpp` 增加相应状态与回归。
+- ROGMap 原来每帧用 `clearBodyDisk()` 把机器人附近 0.30 m 的二维占据直接改成 FREE，可能吞掉真实墙体；`prob_map.cpp` 在 `unknown_as_occupied=false` 时仍强制清空 0.30 m 近场体素。现在仅在需要处理 UNKNOWN 盲区时执行后者，并在入图前按配对位姿和 0.302 m 角点半径对应的方形轮廓过滤自车回波，移除投影后圆盘清空。涉及 `body_return_filter.hpp`、`rog_map.cpp`、`projection_layer.*`、配置与 README；执行器 README 和在线导航说明同步更新。
+- 验证：`rog_map` 与 `mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过；CTest 分别 2/2、11/11 套件通过，覆盖旋转方形过滤、0.35 m 可行轨迹仍保持对齐及目标处 0.35/0.40 m 释放条件；`git diff --check` 通过。尚未实车复跑，也未用同步点云和位姿量测确认轮廓过滤边界；方形半宽由 0.302 m 角点半径推算，若实物长宽或中心偏置不同，需用实测足迹替换这一近似。
+
+## 2026-10-19 — 修复窄道对齐长时间不退出
+
+- 12:15–12:18 的运行日志中，`Chassis alignment transition` 在 12:17:10 左右进入 `follow=true geometric=true` 后，后续多个目标完成直到退出运行都没有 `follow=false`。原退出条件同时要求已走满 2 m、完整前视轨迹持续宽路 0.75 m，以及实测位置相对“最后规划窄点”的旧切线方向越过 0.50 m；目标附近轨迹变短、重规划更换窄点和折返时，后两项可能一直不成立。
+- `PathExecutor::narrowPassageHeadingErrorDegrees()` 保留 2 m 最短里程，满 2 m 后改按当前实测净空高于普通门槛 0.03 m、前方 0.50 m 无安全窄点退出，不再依赖可能随重规划移动的“最后窄点”投影和 0.75 m 完整参考段。退出后，前方较远窄点不会在下一拍立即重入；接近下一窄段 0.50 m 才重新进入，若前视已无窄点则恢复原 2 m 预对齐范围。`nav_executor_node.cpp` 在目标完成后调用 `releaseNarrowPassageAlignmentAtGoal()`：已满 2 m 时释放，未满则继续跨目标保持。退出时的 `Chassis alignment transition` 保留已完成的累计里程以便现场核对。涉及 `path_executor.hpp/.cpp`、`nav_executor_node.cpp`、`test_mpc_gimbal_follow.cpp` 和执行器/在线导航/区域控制说明。
+- 验证：`mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过；CTest 11/11 套件通过。新增回归覆盖满 2 m 后即使 1 m 外还有下一窄段也能退出、不在下一拍重入、接近新窄段后可重新进入，以及目标完成前后 2 m 边界。`git diff --check` 通过。未做实车复跑；最新运行没有逐周期里程记录，旧代码实际锁存里程只能由路线位移推断，下一次需用退出日志确认。
+
+## 2026-10-19 — 保持窄道对齐跨目标空档并修复参考线切角漏检
+
+- 上次运行的 17 个目标均报到达，但局部重规划有 40 次优化失败、36 次轨迹净空拒绝；日志中曾出现参考线最小净空 0.05–0.11 m、轨迹 0.19–0.23 m 低于 0.24 m 窄道地板。原局部修复只查询稠密路径顶点，端点合格而连接线切入障碍的情况不会触发绕行。`local_path_processor.cpp` 现在对每段按地图分辨率采样，低于窄道地板时尝试实时栅格绕行；无合格绕行时打出明确日志，轨迹/指令硬门继续否决不合格候选。`test_online_navigation.cpp` 改用两个合格端点但中间低净空的用例。
+- 对齐跳变的根因之一是 `nav_executor_node.cpp` 在接收新目标和暂时无活动目标时重置几何锁存，且无轨迹时的保持条件要求仍有轨迹。现在几何锁存跨相邻目标、规划空档与无轨迹周期保留，未满 2 m 不会因这些空档回普通模式；保持时 `GimbalFollowAdapter::hold()` 明确返回跟随模式，底盘保持最后角度并下发零平移。里程计失效期间仍不累计里程。实际 `follow_gimbal` 改变时记录 `Chassis alignment transition`，含锁存状态、累计里程和输入状态。涉及 `path_executor.hpp`、`gimbal_follow_adapter.hpp`、`nav_executor_node.cpp`、`test_region_yaw_ref.cpp` 及执行器/区域控制说明。
+- `path_executor.cpp` 的窄道制动限速基准改为与指令门相同的当前窄道净空基准，避免底板高于地板时限速后又被指令门拒绝；`test_mpc_gimbal_follow.cpp` 覆盖该情形。当前历史回退配置的净空数值保持不变。
+- 验证：`mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过；CTest 11/11 套件通过，包含端点合格/中间切角的绕行回归、窄道制动基准和角度保持测试；`git diff --check` 通过。未测试实车下发模式与角度响应，也没有上次运行的逐周期 `follow_gimbal` 录包，故上次切换次数无法精确还原；无绕行路线时仍可能发生安全门拒绝并等待地图/路线更新，下一次运行需用新增切换日志核对 2 m 保持。
+
+## 2026-10-19 — 窄道对齐进入后至少保持 2 m
+
+- 现场反馈上一轮改动后仍出现对齐与普通模式往返切换。原退出条件只要求越过最后窄点 0.50 m 且前方 0.75 m 变宽，无法保证进入后的最短对齐行程。`PathExecutor` 现在从首次几何窄道对齐起按有效里程计位姿累计实际行驶距离，在 `narrow_passage_alignment_hold_distance`（默认 2.0 m）未达到前，地图净空变宽、轨迹刷新都不会使其退出；达到后仍沿用原有“越过窄点且连续宽路”的退出条件。重规划间隙继续计里程，定位单次跳变超过 0.50 m 不计作行驶。新目标或目标结束时仍重置；语义区域对齐临时接管航向时保留几何窄道锁存，避免回到普通区域后丢失未满 2 m 的保持期。涉及 `path_executor.hpp/.cpp`、`nav_executor_node.cpp`、`planner_params.yaml`、`test_mpc_gimbal_follow.cpp`、执行器 README 和在线导航说明；启动日志增加 `align_hold` 值。
+- 验证：`mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过；CTest 11/11 通过，回归用例模拟地图变宽、重新生成轨迹和中途只有里程计更新，确认 1.99 m 时仍对齐、超过 2 m 且满足宽路条件后才退出。YAML 解析确认几何对齐开启、前视与保持距离均为 2.0 m；隔离 ROS 域启动节点进入在线规划器初始化，未出现新参数校验错误。`git diff --check` 通过。
+- 未验证：尚未用新版本实车复跑，底盘实际模式切换、弯曲通道内的累计里程和长期定位漂移仍需下一轮录制确认。此次只改对齐保持逻辑，上一条记录的净空回退值继续有效。
+
+## 2026-10-19 — 回退净空标定基线并保持窄道区间对齐
+
+- 按用户确认回退到此前撞墙阶段的净空参数：`planner_params.yaml` 中 SMAC 主/二次搜索为 0.27/0.25 m、MINCO 软目标 `safe_dist=0.33 m`、硬阈值 `collision_dist=0.28 m`（有效 0.26 m）、窄道地板 0.24 m；车体旋转外廓半径仍为 0.28 m。为让该历史基线可启动，新增显式 `planner.corridor.allow_undersized_clearance=true`；默认关闭时仍要求普通和窄道净空至少为旋转半径加 0.05 m，开启时启动日志打印有效门槛、窄道地板相对半径的差值（本配置为 -0.02/-0.04 m）。`nav_executor_node.cpp` 与 `minco_planner.cpp` 的无 YAML 默认值同步，执行器 README 和在线导航说明更新当前数值及风险。制动净空速度包络仍启用。
+- `PathExecutor::narrowPassageHeadingErrorDegrees()` 对几何窄道对齐增加区间锁存：首次看到前方安全窄点进入对齐后，地图短暂变宽或轨迹重规划时沿用最后有效切线；越过最后窄点至少 0.50 m，当前和前方连续 0.75 m 的净空均高于普通有效门槛 0.03 m，才退出。新目标、目标结束和语义区域对齐时重置锁存，避免跨任务保留旧窄道航向。涉及 `path_executor.*`、`nav_executor_node.cpp` 和 `test_mpc_gimbal_follow.cpp`。
+- 验证：`mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过；CTest 11/11 通过，新增用例覆盖净空读数短暂变宽后持续对齐、走出区间后退出和显式重置。YAML 解析确认 0.27/0.25/0.33/0.28/0.24 m 与显式开关；隔离 ROS 域启动 6 s，日志确认有效/窄道阈值 0.260/0.240 m、差值 -0.020/-0.040 m、几何对齐开启，规划器进入初始化并输出 SMAC 0.270/0.250 m。首次裸启动受本机旧 `libusb` 路径冲突影响，随后预加载系统 `libusb` 并加在线模式启动覆盖参数后验证通过；`git diff --check` 通过。
+- 未验证：未实车复跑。该历史净空小于实测旋转外廓半径，不能保证车体不碰墙；区间锁存对弯曲通道、地图持续误判及下位机实际跟随响应仍需现场观测。
+
+## 2026-10-18 — 窄道接近段轨迹门修正与重规划间隙保持云台对齐
+
+- 现场依据：`20261018_213413` 在 21:45:58 接收目标 `(0.41, 3.07)` 后，SMAC 主搜索 0.410 m 无解、0.335 m 放宽搜索成功；轨迹门在 `(0.26, 1.72)` 以 `0.387 < 0.400 m` 拒绝了 MINCO 轨迹，而该点距参考折线仅约 1.5 cm、位于首个安全窄点 `(0.275, 2.025)` 之前约 0.30 m。随后约 8 s 没有新轨迹，`follow_gimbal` 被清零，底盘恢复自由自转；重新跟随后的录包中 `chassis_cmd.vx>0` 时实测位移沿车体 -X，说明重规划间隙丢失了角度基线。现场通道在 y≈2.3 的栅格读数约 0.70 m 宽，路线 x≈0.275 的净空约 0.30 m，而向左约 0.05 m 的格心净空约 0.35 m，存在可满足 0.335 m 地板的居中路线。
+- 改动：`trajectory_safety_checker.cpp` 把任一安全窄点前后 0.50 m 的参考折线标为同一窄走廊；轨迹采样点只有距参考折线 0.20 m 内且最近折线样本属于该走廊时，才把要求降到 `narrow_passage_clearance`。实际轨迹点仍逐点要求不低于该地板，远离窄段或偏离走廊仍按完整阈值。这修复了“窄口前 0.387 m 被 0.400 m 误拒”，不降低窄道绝对地板。
+- 改动：`local_path_processor.*` 新增稠密参考线窄道修复。若参考线本身低于 `narrow_passage_clearance`（SMAC 格心合格、直连弦切进窄处），先用实时栅格按该地板搜索一条局部路线；成功则替换稠密路径并设置 `used_narrow_clearance_repair`，失败则保留原路径，仍由轨迹门和指令门做最终否决。现有软目标绕行与无约束稀疏回退保留。
+- 改动：`TaskManager` 新增 `mission_active` 生命周期标志，`PathPlanner` 暴露 `hasActiveGoal()`。`GimbalFollowAdapter` 新增 `hold()/hasCommand()/commandDegrees()`；顶层节点在同一目标仍 active、已有上一有效跟随角度但暂时无新轨迹时，继续发送 `follow_gimbal=1`、最后 `small_yaw_ref`、`vx/vy=0`，新轨迹从保持角度继续积分；目标结束、`GOAL_INVALID`、里程计过期或姿态无效时仍立即清除。新增 `gimbal_follow.hold_last_alignment`（默认 true），同步 `region_control.yaml`、执行器 README、区域控制说明和在线导航说明。
+- 验证：`mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过；`ROS_LOG_DIR` 可写时 CTest 11/11 通过。新增 `test_global_goal_cell_clearance.NarrowGateIncludesTheApproachToTheFirstTightSample`（0.255 m 接近段在窄点前 0.40 m 放行、0.60 m 外仍按 0.26 m 拒绝）、`test_online_navigation.RepairsADenseReferenceThatCutsInsideTheNarrowFloor`（0.24 m 直连弦被 0.335 m 地板感知绕行修复）和 `test_region_yaw_ref.HoldsLastAngleAcrossAPlannerGapAndResumesFromIt`。用现场相同参数在隔离 ROS 域启动节点 6 s，日志确认 `narrow=0.335`、`geometric_alignment=on`，未出现新参数错误。`git diff --check` 通过。
+- 未验证：未实车复跑；下位机在 `follow_gimbal=1`、`vx/vy=0` 时是否确实保持最后角度而不再自转，仍需现场核对。居中修复能否让该 0.70 m 通道实际通过、保持角度后能否消除 16–19 s 的反向位移，以及 `hold_last_alignment` 长时间保持的副作用均待下一轮录制；若实车仍反向，应优先检查底盘/云台角度基线和 `auto_yaw_offset`，不应继续下调 0.335 m 地板。
+
+## 2026-10-18 — 修复 0.32 m 窄道净空导致的启动失败
+
+- 现场依据：21:41:48 的 `nav_executor_launch.py` 启动中，导航节点在参数校验抛出 `std::invalid_argument` 后退出。检查实际配置发现 `planner.minco_optimizer.narrow_passage_clearance` 被改成 0.32 m，而 `planner.corridor.swept_radius=0.28 m`；名义外沿间隙仅 4 cm，低于现场要求的 5 cm。SMAC 二次搜索仍为 0.335 m，搜索与执行门槛也不一致。
+- 改动：将窄道硬净空恢复为 0.335 m，与 SMAC 二次搜索一致，名义外沿间隙 5.5 cm；`nav_executor_node.cpp` 对这项违规参数抛出包含实际净空、旋转半径和 5 cm 要求的专门报错，避免再被综合参数错误掩盖。普通 0.40 m 有效门槛与几何对齐保持。
+- 验证：`mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过，CTest 11/11 通过；YAML 解析确认外廓半径 0.280 m、窄道和 SMAC 二次搜索净空均 0.335 m、名义外沿间隙 0.055 m。用现场相同参数文件在隔离 ROS 域运行节点 5 s，启动日志确认 `narrow=0.335`、几何对齐开启，并进入规划器初始化；到时发送 SIGINT 退出。隔离进程为绕开本机 `/opt/MVS` 的旧 `libusb` 路径冲突，预加载系统 `libusb`；该冲突未出现在用户的 `ros2 launch` 日志中。`git diff --check` 通过。尚未实车运行。
+
+## 2026-10-18 — 窄道净空再收小 5 mm
+
+- 行为：按最新 0.28 m 旋转外接圆半径，把窄道轨迹/执行指令硬净空 `minco_optimizer.narrow_passage_clearance` 从 0.34 m 调为 0.335 m，SMAC 二次搜索净空同步从 0.34 m 调为 0.335 m；名义车体外沿间隙为 5.5 cm，仍高于要求的 5 cm。同步节点和 MINCO 的无 YAML 默认值，启动日志用三位小数打印窄道阈值；README、在线导航说明同步。普通 0.40 m 有效门槛、0.41 m 主搜索门槛和窄道几何对齐保持。
+- 验证：`mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过，CTest 11/11 通过；YAML 解析确认旋转半径 0.280 m、窄道地板和 SMAC 二次搜索均 0.335 m、名义间隙 0.055 m、几何对齐开启；`git diff --check` 通过。尚未实车复跑。名义间隙未计入定位和地图投影误差，现场仍需实体量测。
+
+## 2026-10-18 — 旋转外接圆半径修正为 28 cm
+
+- 行为：按用户最新修正，将正方形底盘的旋转外接圆半径 `planner.corridor.swept_radius` 从 0.306 m 改为 0.28 m，走廊生成半径同为 0.28 m。窄道轨迹/指令硬净空和 SMAC 二次搜索净空从 0.36 m 改为 0.34 m，按中心到障碍物的 ESDF 距离留下名义 6 cm 实体间隙，仍高于要求的 5 cm；普通轨迹有效门槛 0.40 m、主搜索 0.41 m 与窄道几何对齐保持。同步更新节点、MINCO 无 YAML 默认值、配置注释、执行器 README 与在线导航说明。此条以最新 28 cm 修正前条对 306 mm 实测的保留假设。
+- 验证：`mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过，CTest 11/11 通过；解析 YAML 确认走廊/旋转半径均 0.28 m、窄道地板与 SMAC 二次搜索均 0.34 m、几何对齐开启；`git diff --check` 通过。尚未实车复跑。6 cm 是几何和地图的名义值，实体间隙仍需结合定位、地图投影误差现场确认。
+
+## 2026-10-18 — 走廊生成半径改为 28 cm，独立保留实测外廓安全门
+
+- 行为：`config/planner_params.yaml` 将 `planner.corridor.robot_radius` 从 0.306 m 改为 0.28 m，安全走廊生成时少扣 2.6 cm；新增独立 `planner.corridor.swept_radius=0.306 m`，记录此前现场量得的正方形底盘旋转外廓。`nav_executor_node.cpp` 以 `swept_radius` 而不是走廊生成半径验证普通/窄道净空至少再留 5 cm，启动日志分别打印两种半径。窄道地板 0.36 m、放宽 SMAC 搜索 0.36 m、几何窄道对齐保持开启；README 和在线导航说明同步区分走廊半径与实测外廓半径。
+- 原因：用户要求半径改为 28 cm；但前一条实测旋转外廓为 306 mm，且要求与障碍物至少保持 5 cm。未得到新外廓实测修正前，只把规划走廊参数设为 28 cm，保留原硬安全门，避免配置半径变小后把实车的名义外沿余量降到 5 cm 以下。
+- 验证：`mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过，CTest 11/11 通过；解析 YAML 确认走廊半径 0.280 m、外廓半径 0.306 m、窄道地板 0.360 m、名义差 0.054 m、放宽搜索 0.360 m、对齐开启；`git diff --check` 通过。尚未实车复跑；0.28 m 对走廊生成和窄道通过率的实际影响待现场验证。
+
+## 2026-10-18 — 21:04 现场复盘与正方形底盘窄道对齐恢复
+
+- 现场依据：`20261018_210443` bag 的参数快照确认前轮错误地把几何窄道对齐关闭。用户明确实车为正方形底盘，306 mm 是旋转时的外接圆半径；正方形进入窄道仍需要底盘沿通道切线对齐。该次运行收到 26 个目标，其中 17 个报到达、其余目标被新目标覆盖；前 49 s 的首个目标未到达。首目标 246 次全局路径发布的初段相对目标方向变类 24 次，21:05:38–43 在近乎固定位置反复切换约 2.9 m 与 7.8 m 路线。已提交路线保留日志出现 2 次，不能消除地图判旧路低于安全地板时的换路。
+- 地图证据：对 bag 中 `/rog_map/layer_value` 二维占据层按 0.05 m 栅格计算距离变换，21:05:36–44 的固定位置 `(-1.74,1.75)` 净空为 0.316–0.403 m，40 帧中 17 帧低于 0.36 m。路线翻转前原直达折线的近似最小二维栅格净空约 0.335–0.354 m，低于 0.36 m 地板，因此路线保持的实时安全复核会拒绝它；这不是几何对齐造成的。此数值是地图读数，不等于实车实体间隙。同期地图更新耗时中位数约 20 ms、95 分位约 26 ms，没有明显更新处理积压。
+- 几何核对：若正方形居中且 0.306 m 为角点半径，边长约 0.433 m；保留两侧各 5 cm 时，对齐通道所需宽度约 0.533 m，当前 0.36 m 圆包络地板则对应约 0.72 m。在 21:05:36–44 取 41 帧二维占据图和实测航向，对正方形与占据格的距离作含半格对角线的保守估算：实际航向有 10 帧低于 5 cm，假设已沿原直达折线对齐则仅 1 帧略低于 5 cm。这个离线近似说明朝向会显著改变窄道余量，但不替代完整足迹碰撞检查或实体测量，不能直接下调目前 0.36 m 的圆包络安全门。
+- 改动：`config/planner_params.yaml` 恢复 `narrow_passage_alignment_enable: true`，并与 `nav_executor_node.cpp` 的无 YAML 默认值统一；新增启动日志字段 `swept_radius=0.306` 和 `geometric_alignment=on/off`。配置、执行器 README、在线导航说明改称正方形底盘旋转外接圆半径，保留 0.36 m 地板对应的名义 5.4 cm 外沿间隙。既有历史记录保留，本条纠正前条“圆形车体不需对齐”的判断。
+- 验证：`mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过；包内 CTest 11/11 通过；解析参数 YAML 确认外接圆半径 0.306 m、窄道地板 0.360 m、名义差 0.054 m、几何对齐开启；`git diff --check` 通过。尚未用重新开启对齐的版本实车复跑；二维投影净空抖动来源与实体最小间隙仍需现场和点云核对。
+
+## 2026-10-18 — 在线路线保持与窄道净空抖动修复
+
+- 现场依据：`20261018_203728` 运行在同一目标下于 20:38:32 把约 3.83 m 的向南路线改成约 7.42 m 的向北绕路，20:38:35 又折回；20:39:19 后 182 次局部重规划有 144 次 `COLLISION`。固定位置 `(1.90,1.80)` 的二维占据层距离随滚动图在 0.348–0.432 m 间波动，跨越主搜索和窄道门槛。此前把 `/rog_map/raw_occupied` 最近三维体素（含 `PASSABLE`）直接换算成实体间隙的结论不成立；本次按二维投影和现场观察处理。
+- 改动：新增 `path_planner/search/route_commitment.hpp`。`MincoPlanner::PlanGlobalPath()` 在在线重搜突然要求反向且新路线没有明显缩短时，先在实时地图上以不大于半格的间距复核旧路线剩余段的占据及净空；通过才保留原路线，旧路线失效或新路线明显更短时接受新路线。新目标仍清空旧路线。新增在线导航测试覆盖保持、实时障碍否决、较短绕路和同向刷新。
+- 改动：`TrajectorySafetyChecker` 与 `PathExecutor` 的窄道资格改按安全的参考采样点判断，避免单个低于地板的地图异常点取消整段窄道资格；轨迹每个实际采样点和执行指令仍必须通过实时净空门。`planner_params.yaml` 按现场旋转直径 612 mm 把圆形半径写为 0.306 m，窄道地板及 SMAC 放宽搜索改为 0.36 m，名义外沿间隙 5.4 cm；普通有效门槛仍 0.40 m。圆形车体没有几何窄道朝向要求，默认关闭该对齐及节点参数默认值，特殊地形的语义对齐仍保留。同步执行器默认半径、README 和在线导航说明。
+- 验证：`mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过；全套 CTest 11/11 通过，新增窄道参考异常点和反向路线保持测试。参数 YAML 解析确认半径 0.306 m、地板 0.360 m（差 0.054 m）、放宽搜索 0.360 m、几何对齐关闭。离线对原 bag 20:38:32 路线翻转时的旧路径与二维占据层复核：最近点距实测位姿约 0.036 m，旧路线剩余段最小实时栅格距离约 0.400 m，高于新窄道地板，符合保持条件。`git diff --check` 通过。未进行实车复跑；5 cm 是按配置半径和地图净空的名义值，实体距离、路线保持是否消除现场折返及窄处是否仍卡住均需下一次现场验证。
+
+## 2026-10-18 — 圆形车体净空与朝墙制动速度联动
+
+- 成因：现场 `ROGMap field.inflation_radius=0`，距离场净空是 `base_link` 中心到障碍格的距离。原普通有效阈值 0.26 m、窄道地板 0.24 m 都小于按当前配置认定的圆形底盘半径 0.30 m；它们无法代表车体外沿至少 5 cm 的间隙。此前提出的 `max(0.26, 制动距离)` 也少算了车体半径。
+- 改动：`config/planner_params.yaml` 将圆形车体半径维持 0.30 m，普通 `collision_dist` 改为 0.42 m（扣除共用 0.02 m ESDF 余量后有效 0.40 m），窄道地板改为 0.37 m；同步把 SMAC 主/放宽搜索净空改为 0.41/0.37 m、MINCO 软目标改为 0.47 m。名义实体间隙分别为 10 cm 和 7 cm，窄道多留 2 cm 给地图/定位误差。节点按 `planner.corridor.robot_radius` 校验普通及窄道下限至少为半径加 5 cm。
+- 改动：`common/environment/clearance_gate.hpp` 新增制动净空与反算速度工具；`path_executor` 对 MPC 初次/二次参考和最终指令按 ESDF 梯度朝障碍方向的速度封顶。`command_safety` 在静态下限上追加 `v_toward·reaction_time + v_toward²/(2·deceleration)` 并逐点复核；沿墙平行行驶不追加纵向制动距离，低于窄道地板只允许向净空增大方向脱离。新增 `minco_optimizer.clearance_braking.{deceleration,reaction_time}`（1.2 m/s²、0.20 s；`deceleration<=0` 关闭动态项）与启动时 `Clearance policy`、每 2 s 节流的 `Clearance braking cap` 日志；同步执行器 README 与在线导航说明。`test_mpc_gimbal_follow` 增加朝墙/平行、实体间隙、零梯度窄道、低净空脱离以及先限速再过硬门的回归用例。
+- 验证：`mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过；包内 CTest 11/11 套件通过；解析当前 YAML 确认半径 0.30 m、普通有效净空 0.40 m、窄道地板 0.37 m、SMAC 0.41/0.37 m 与制动参数 1.2/0.20；`git diff --check` 通过。未实车复跑、未量测实际最外半径与实体间隙，地图/定位综合误差是否在预留 2 cm 内仍需现场核对；更高净空阈值可能让不足约 0.74 m 宽的通道无法通过。
+
+## 2026-10-18 — 目标接近减速带：按实测刹车能力封顶参考速度
+
+- 成因（`20261018_194203` bag 量化）：底盘实际只能提供约 1.4–2.6 m/s² 的减速度（命令归零后 1.28 m/s 还要滑 0.49 m/0.61 s，2.46 m/s 还要滑 1.17 m/0.86 s），而规划种子与 MPC 都按 `max_acceleration = 5.0` 编刹车余量；`/opt_path` 在离目标 0.3 m 处仍有 1.0–1.14 m/s。9 个目标里 4 个过冲 0.65–1.14 m，随后在 `dist ≤ 0.15 m 且 |v| < 0.3 m/s` 的到达判据前往复震荡（只有 5 个报 `Navigation goal reached`）。同一个错误模型也让"0.26 m 净空就能停住"的假设失效，是撞墙的同一根因（本次只修减速链路，净空门与速度解耦留待下一批）。
+- 改动：新增共享包络 `common/control/goal_approach.hpp`（`GoalApproachParams` + `goalApproachSpeedLimit`，按 `v·τ + v²/(2a) ≤ 剩余弧长 − stop_margin` 求解，下限 `min_speed`）。
+- 改动：`arc_length_speed_profile.hpp/.cpp` 把加速能力与刹车能力分开：新增 `brake_deceleration` 参数，反向刹车余量用它，段内峰值改为非对称解 `peak² = (2L·a_acc·a_brake + a_brake·v0² + a_acc·v1²)/(a_acc + a_brake)`；原五参数签名保留为对称兼容重载。
+- 改动：`minco_planner` 读取 `minco_optimizer.goal_approach.{deceleration,reaction_time,stop_margin,min_speed}`（默认 1.2 / 0.20 / 0.30 / 0.15），在局部终点为停车点时按剩余弧长封顶 `local_vmax_vec`（同时进入 `local_vmaxs` 约束 MINCO），种子调用改传真实刹车能力，fallback 停车段时间与 `max_brake_dist` 也改用刹车能力。
+- 改动：`path_executor` 新增 `applyGoalApproachCap()`，按已提交轨迹的剩余弧长对 MPC 参考速度封顶（只压速度、不改位置/航向），二次参考重采样后再封一次；`ExecutorOutput` 增加 `goal_approach_capped/remaining_m/allowed_speed` 诊断，节点每 2 s 节流打印。
+- 改动：`mpc_params.yaml` 把 `constraints.acceleration.x/y.min` 从 -5.0 收到 -2.0（取实测刹车能力上沿），加速上限仍 5.0；`planner_params.yaml` 新增 `goal_approach` 段；执行器 README 与 `docs/online_navigation.md` 同步说明。
+- 验证：`mas2027_nav_executor` Release + `BUILD_TESTING=ON` 构建通过；新增 `test_goal_approach`（包络公式、反应时间更保守、非法参数 fail open、弧长 profile 对称/非对称/不可达/非法刹车能力）7 项通过，`test_mpc_gimbal_follow` 新增“最后 0.2 m 强制爬行”“远处不封顶”2 项后 27/27 通过；全套 CTest 11/11。
+- 验证：合成闭环 A/B（域 98，真实节点 + 合成地板点云 + 只具备 1.2 m/s² 刹车能力的理想底盘，目标 7 m，巡航 2.5 m/s，脚本 `.scratch/goal-approach/goal_approach_ab.py`，日志在同目录）：开启后规划器与执行器均打出封顶日志、轨迹末段参考速度下降，过冲 0.024 m、停车点距目标 0.13 m；关闭时过冲 0.138 m、末段实际速度 0.82 m/s（同一脚本前几轮曾出现 0.81 m 过冲，说明该指标对进入目标时的能量很敏感）。
+- 未验证：未实车复跑。实车过冲量、`Navigation goal reached` 是否 9/9、窄道/贴墙目标前的爬行段是否拖慢任务、以及 `stop_margin`(0.30 m) 造成的“提前 0.10–0.13 m 停车”在现场是否可接受都需要下一轮录制确认；`a_eff` 目前取 1.2 m/s²，若实测刹车能力更好可上调。净空门与速度解耦（`required(v)`）本批未做。
+
+## 2026-10-18 — 删除底盘命令消息中未下发的 w 字段
+
+- 改动：从 `third_party/interfaces/msg/navigation/ChassisCommand.msg` 删除 `float32 w`，并从 `nav_executor_node.cpp` 删除对应的 `chassis_command.w` 赋值；`nav_serial_bridge` 本来就不读取该字段，CDC1 串口协议不变。`/cmd_vel.angular.z` 的非跟随 `+2 rad/s` 观测值保留，`ChassisCommand` 现在只承载 `vx`、`vy`、`mode`、`small_yaw_ref` 和 `follow_gimbal`。同步修正执行器 README 与区域控制说明中的消息字段列表和串口字段说明。
+- 验证：`interfaces`、`mas2027_nav_executor`、`nav_serial_bridge` 以 Release/symlink-install 重新构建通过；确认安装后的 `ChassisCommand.msg` 和类型描述均不再包含 `w`；设置可写 `ROS_LOG_DIR` 后执行器 CTest 10/10 通过；`git diff --check` 通过。未进行实车或串口端到端验证；下位机固定 `+4 rad/s` 自转逻辑未改。
+
+## 2026-10-18 — 普通路段下发角速度改为 +2 rad/s
+
+- 改动：`mas2027_nav_executor/src/nav_executor_node.cpp` 将非跟随阶段的 `/cmd_vel.angular.z` 与 `/nav_executor/chassis_cmd.w` 从固定 `+4 rad/s` 改为常量 `kNonFollowYawRateRadS = 2.0`；跟随时仍输出 MPC omega。CDC1 串口协议不包含 `w`，下位机固定自转逻辑未改，因此该值目前只影响 ROS 观测消息和桥接用的 `ChassisCommand.w`，不改变底盘实际自转速度。同步更新执行器 README、区域控制说明和项目 README 的当前行为描述。
+- 验证：`mas2027_nav_executor` Release 目标 `cmake --build build/mas2027_nav_executor -j2` 通过；设置可写 `ROS_LOG_DIR` 后执行器 CTest 10/10 通过；`git diff --check` 通过。未进行实车或串口端到端验证；若需改变底盘实际 `w`，还需同步修改下位机固定 `+4 rad/s` 自转。
+
+## 2026-10-18 — 临时目标阻塞安全重试与现场记录取证修复
+
+- 改动：在线全局搜索对“实时图目标被挡且完整接近窗口内没有安全排出点”立即返回，阻止继续沿旧路线朝障碍探索；只有 B1 累计图也确认目标占据时才标记终止性 `GOAL_INVALID`。未确认时 `TaskManager` 停车一次、清空旧路径、保留原目标并每 0.5 s 重试，实时障碍消失后重新规划；若随后获得累计确认，不重复下发已执行过的急停。涉及 `global_path_searcher.*`、`minco_planner.*`、`task_manager.*`、`test_global_goal_cell_clearance.cpp` 和在线导航说明。
+- 改动：恢复并接入在线累计图、在线导航、SMAC 墙体净空、融合地图查询和在线区域优先级五组回归测试，适配当前指令安全门签名。`record_nav_diagnostics.sh` 在录制期间抓取两个节点的实际参数及节点/话题清单，录制 `/parameter_events`，结束后若参数缺失则告警；同步更新 `docs/field_run_recording.md` 和执行器 README。
+- 验证：`mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过；执行器 CTest 10/10 套件通过，新增测试覆盖实时单次阻塞、B1 两份连续观测确认、确认后的终止判定、临时障碍消失后原目标重新出解，以及滚窗边界不作终止结论。记录脚本 `bash -n` 通过；隔离的 ROS CLI 模拟运行确认录制结束前已保存 `params_executor.yaml`、`params_planner.yaml`、`nodes.txt`、`topics.txt`，收尾正常。`git diff --check` 通过。未启动实车或实际 ROS 导航录制；目标阻塞的现场恢复、MPC 二次参考角度分支和特殊地形跟随仍需现场验证。对 `20261018_150254` bag 进行时间配对，命令 ≥2 m/s 时里程计速度中位数约 1.05–1.09 m/s，0–0.4 s 延迟均未消除差距；缺少底盘侧接收/执行反馈，未改速度上限或串口协议。
+
+## 2026-10-18 — 启用 MPC 二次参考角度分支
+
+- 改动：`mas2027_nav_executor/config/mpc_params.yaml` 将 `mpc.secondary_reference.enable` 设为 `true`、`angle_enable` 保持 `true`、`narrow_enable` 设为 `false`，用于单独验证角度触发的二次参考；角度阈值、时间缩放下限、QP 约束及净空门未调整。
+- 验证：核对 YAML 参数值并执行 `git diff --check`。未重新构建或实车运行；二次参考的实际触发、跟踪误差和碰撞统计仍需下一轮录制验证。
+
+## 2026-10-18 — 无效目标终止锁存与滚动地图终点判定
+
+- 改动：`TaskManager` 新增 `GOAL_INVALID` 终止状态。规划确认目标在已知障碍内且无安全接近/排出点后，只发布一次 emergency stop、清除旧全局路径并等待新目标；新目标进入时重新回到规划状态。`GlobalPathSearcher` 抽出共用的“占据且无安全排出点”判定，要求完整接近范围位于实时滚动窗口内才作终止结论；`PathPlanner::acceptGoal()` 仅在实时图和累计图均确认占据且完整搜索范围已观测时提前拒收。累计图记为自由、实时图暂时占据的远端目标先使用实时图内安全的临时子目标，接近后再决定是否排出终点，避免提前把短暂阻塞点当作任务终点。涉及 `task_manager.hpp/.cpp`、`global_path_searcher.hpp/.cpp`、`minco_planner.hpp/.cpp`、`path_planner.cpp`、`test_global_goal_cell_clearance.cpp` 和执行器 README；窄道 0.24 m 地板、轨迹门及命令门未变。
+- 验证：`mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过；新增累计图确认障碍的提前拒收、滚窗边界不作终止判定、累计图自由/实时图阻塞时先走安全子目标的测试，`test_global_goal_cell_clearance` 9/9，执行器 CTest 5/5 通过；`git diff --check` 通过。未实车复跑，尚未通过 bag 验证 `(4.15, 2.30)` 是否只触发一次急停，也未定量验证返回起点时 ejection 与 `COLLISION` 次数的变化。20261018_150254 是 `secondary_reference.enable=false` 的基线，不构成二次参考验证。
+
+## 2026-10-18 — MPC 二次参考安全化与权重配置接入
+
+- 改动：审查并修正上一版二次参考实现。`mpc.secondary_reference.enable` 默认改为关闭，新增 `angle_enable`、`narrow_enable` 两个独立分支开关，便于实车分别验证角度触发和窄道触发；`min_time_scale` 作为所有时间缩放的硬下限，窄道缩放不得低于它。MPC 的 `q_along/q_cross` 从硬编码默认值接入 `mpc.weights.along/cross`，当前显式保持 3.0/12.0 的实际行为；`mpc.weights.state[0]/[1]` 保留为未配置 along/cross 时的回退，`state[2]` 继续作为 yaw 权重。`sampleReference()` 增加频率、采样周期、延迟和时间缩放的有限性/正值校验；Q 切线在参考速度低于 2 cm/s 时回退到 yaw，避免停车附近权重轴抖动。`ExecutorOutput` 增加二次参考诊断字段，节点每 2 s 节流输出最大夹角、最小时间缩放、窄道标志、二次求解结果和二次 QP 耗时。涉及 `path_executor.hpp/.cpp`、`execution_state.hpp`、`mpc_solver.cpp`、`mpc_types.hpp`、`nav_executor_node.cpp`、`config/mpc_params.yaml`、`test_mpc_gimbal_follow.cpp`、`README.md`。
+- 验证：`mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过；新增 4 个测试覆盖角度分支关闭、窄道分支关闭、沿/横向权重独立生效和 `min_time_scale` 下限；`test_mpc_gimbal_follow` 25/25、执行器 CTest 5/5 通过（需可写 `ROS_LOG_DIR`）。未实车复跑，二次参考默认关闭，下一轮先做基线与分支 A/B。
+
+## 2026-10-18 — MPC 二次参考采样与轨迹切线横向权重
+
+- 改动：`PathExecutor` 首轮 MPC 求解时取得完整预测轨迹，将预测世界系速度与同序号 MINCO 参考速度的夹角余弦用于缩短第二轮参考采样时间步长；已提交轨迹进入几何窄带时也缩短时间步长。同步缩放速度/角速度前馈，第二轮仍使用首轮求解前的加速度锚点；二次求解失败则沿用首轮可行指令，原有区域限速、窄道速度上限和碰撞门保持生效。`MpcSolver` 将 `q_along/q_cross` 的旋转方向改为轨迹速度切线，并修正斜向轨迹非对角权重的符号。新增 `mpc.secondary_reference.*` 参数及执行器 README 说明；涉及 `path_executor.hpp/.cpp`、`mpc_types.hpp`、`mpc_solver.cpp`、`nav_executor_node.cpp`、`config/mpc_params.yaml`、`test_mpc_gimbal_follow.cpp`。
+- 验证：`mas2027_nav_executor` Release、`BUILD_TESTING=ON` 构建通过；新增 4 个 40 步/斜向轨迹测试，覆盖窄道时间缩放、开阔区横向纠偏、二次求解加速度锚点和斜向切线权重；`test_mpc_gimbal_follow` 21/21、执行器 CTest 5/5 通过；`git diff --check` 通过。未实车复跑，尚不能确认 `COLLISION`、云台大角度偏差或实际控制周期耗时的变化；bag 开始前的 emergency 仍缺全过程记录。
+
+## 2026-10-18 — 双雷达外参更新后首轮实车验证
+
+- 改动：无新增算法；记录 `20261018_143410` 运行分析到 `.scratch/field_runs/20261018_143410/analysis.md`。该轮使用实测 URDF/融合外参、PRE/FINELY 两次 MINCO 和几何窄道对齐。
+- 结果：20 个目标、19 个到达；1 个目标被用户改目标。810 次 MINCO 重规划，成功 714，失败 96（`COLLISION=80`、`OPTIMIZER_FAILED=14`、`LOCAL_SEED_INVALID=2`），`TERRAIN_SIDE_ENTRY=0`；`optimizer_time_ms` 平均 1.94 ms、最大 10.11 ms。安全排出点作为终点实际生效 3 次。录制 bag 内只有 7 段 ≥0.5 s 零平移，全部是启动/目标间等待，无中途窄道停顿。
+- 未验证：14:31:46 的 emergency stop 发生在 bag 开始前，无法用该 bag 复盘；`COLLISION=80` 仍集中在贴墙目标附近，15 次 `Gimbal axis not aligned` 有 74–78° 大角度。外参更新与两次 MINCO 不是严格 A/B，路线不同。
+
+## 2026-10-18 — 测量脚本按进程组清理子节点
+
+- 改动：`measure_lidar_mount.sh` 用 `setsid` 启动驱动、robot_state_publisher 和两个 LIO，`cleanup()` 对每个进程组发送 TERM/KILL，而不是只杀 `ros2 run`/`ros2 launch` 外层 PID；缺少 `setsid` 时明确失败。
+- 原因：连续两次测量结束后都残留 `mid360_driver`、`small_point_lio` 和 `robot_state_publisher` 孤儿进程，需要手工 `kill`；外层 shell 退出后实际节点仍在占用雷达 UDP。
+- 验证：`bash -n` 通过。本次没有重新起雷达验证 cleanup；下一次测量结束应检查 `ps` 中无 `mid360_driver`/`small_point_lio` 残留。`install/setup.bash` 路径检查已同时加入。
+
+## 2026-10-18 — 应用双雷达安装实测参数
+
+- 改动：根据连续两次 `measure_lidar_mount.sh` 结果（第二次：右雷达 `xyz=+0.0156,-0.1978,+0.1100, roll=+48.77°`，左雷达 `xyz=+0.0176,+0.1867,+0.1100, roll=-51.29°`，间距约 0.3845 m），更新 `mas2027_sentry.urdf` 的 `lidar_joint`/`lidar_back_joint`，并同步 `small_point_lio_params.yaml` 的 `merge_extrinsic_back_to_front=[0.001984,0.253449,-0.289179,-1.746395,0,0]`、`blind_center=[-0.0156,0.0477,-0.2213]`、`gravity=[-0.028780,-0.748963,-0.656425]`。旧配置按 `y=±0.150, 间距0.300 m` 融合，和实测相差约 8.5–9 cm。
+- 原因：两次自旋/静止测量重复得到相近的左右 y 半径和 roll 差异，说明当前 URDF/融合外参确实与实车安装不一致；这会让后雷达点云错位、墙面重影/变厚，并放大窄道 0.24 m 判据。
+- 未验证：测量本身仍有 `RMSE≈20–21 mm`、z 漂移 `33–46 mm` 和静止单帧标准差偏大的告警；本次采用第二次结果，没有三次复测。未实车导航复跑；下次必须先看合并点云墙面厚度、机器人近场点和窄道净空是否改善，若定位/地图反而变差应回退到旧 URDF/外参并重新测量。
+
+## 2026-10-18 — 修正双雷达安装测量脚本并复核实测差异
+
+- 改动：`measure_lidar_mount.sh` 的工作区根目录从错误的 `src/` 改为仓库根 `src/mas2027_nav_bringup/../..`，并在 `install/setup.bash` 不存在时明确失败；左侧 LIO 的 `blind_center` 不再硬编码镜像值，而是通过 `measure_lidar_mount.py --print-blind left` 从当前 `lidar_back_joint` 计算。`measure_lidar_mount.py` 修复 `--all` 时自旋结果覆盖静止测量 roll 的问题：自旋阶段只更新 xyz，保留静止阶段的 roll/pitch。
+- 原因：现场 `measure_lidar_mount.sh` 曾报 `/src/install/setup.bash` 不存在；同时输出中的“安装姿态 roll”沿用 URDF 旧值，导致建议的 `merge_extrinsic` 使用了旧 roll，和实测 xyz 不一致。左侧 LIO 启动时的硬编码 blind center 也可能污染左侧安装测量。
+- 验证：`bash -n`、`py_compile` 通过；`python3 ... --print-blind left` 能从当前 URDF 输出 `[-0.000000,-0.018412,-0.185097]`。本轮实测本身仍被脚本标记为“标准差偏大/RMSE 偏大/z 变化大”，未把任何测量值写入 URDF 或 `small_point_lio_params.yaml`；需在底盘完全静止、云台匀速的条件下复测后再决定是否更新。
+
+## 2026-10-18 — 两次 MINCO 首轮运行复盘
+
+- 改动：无新增算法；记录 `20261018_141558` 未使用记录器的运行结果到 `.scratch/field_runs/20261018_141558/analysis.md`。启动日志确认 `two_stage=true`，冷/热启动仍启用。
+- 结果：8 个目标、5 个到达；3 个未到达目标均被用户中途改目标。352 次 MINCO 重规划，成功 270，失败 82（`COLLISION=58`、`OPTIMIZER_FAILED=21`、`TERRAIN_SIDE_ENTRY=3`）；无 emergency stop；`optimizer_time_ms` 平均 2.53 ms、最大 13.59 ms。贴墙目标 `(5.02,3.51)`、`(1.53,0.82)` 附近仍有大量局部失败，属于目标终点/排出点几何问题，不是两次优化未启用。
+- 未验证：没有 bag，无法分析 `/cmd_vel` 停顿、实际横向误差或 FINELY 回退频率；下次必须启动记录器。
+
+## 2026-10-18 — 加入 PRE/FINELY 两次 MINCO，保留冷热启动
+
+- 改动：`MincoOptimizer` 新增 `OptimizationStage` 和 `optimizeTwoStage()`；`planner_params.yaml` 默认 `two_stage_enable: true`。PRE 阶段在 `computeTimeBarrier()` 增加段平均时间 `±stage1_time_balance_ratio` 的软约束（`stage1_time_balance_weight`）；FINELY 阶段以 PRE 的轨迹点和段时间为初值，去掉位置 ESDF 梯度沿速度方向的分量（`stage2_directional_gradient_enable`），只保留法向分量。FINELY 的 L-BFGS 若只在 line-search/min-step 收敛阈值退出但目标值有限，则接受当前近似迭代；其他失败仍回退 PRE 轨迹并恢复 PRE 统计，最终轨迹仍由完整安全门验收。冷/热启动逻辑不变：热启动前缀、速度/加速度继承和 `replan_continuity_time_s` 继续负责跨重规划连续性。
+- 原因：当前 MINCO 仍是单阶段各向同性位置梯度，在窄道前后容易把控制点沿轨迹方向推走或切角。中科大 2025 技术报告 5.5.4.2 的 PRE/FINELY 两步优化把“形状稳定”和“方向感知动力学细化”分开；该两步优化与冷/热启动正交，不能用来取消冷热启动。
+- 验证：`mas2027_nav_executor` Release + `BUILD_TESTING=ON` 构建通过；新增 `test_minco_two_stage`，用冷启动种子验证 `optimizeTwoStage()` 返回有限代价、有效轨迹且 FINELY 阶段确实被采用；执行器 CTest 5/5。两次优化尚未实车 A/B；首次现场需重点看 `optimizer_time_ms`、`COLLISION/OPTIMIZER_FAILED`、窄道切角和是否出现 FINELY 回退日志。
+
+## 2026-10-18 — 排出点作为任务终点并收紧窄道对齐触发
+
+- 改动：`GlobalPathSearcher` 新增 `lastGoalShifted()`，只在直接目标搜索成功且实际使用接近点/排出点时置位；回退子目标不置位。`MincoPlanner` 传递该状态并提供 `copyLatestGlobalGoal()`。`TaskManager` 判断到达时，若目标被排出，则以当前全局路径终点作为本目标的合法终点，到达后打印 `Navigation goal reached at safe approach/ejection point ...`，不再要求机器人继续进入障碍内的原始坐标。另调整 `PathExecutor::narrowPassageHeadingErrorDegrees()`：至少向前 0.15 m 才接受窄道点，避免“当前贴墙但路线马上变宽”时把当前点误当窄道入口造成无谓底盘旋转。
+- 原因：`20261018_135717` 目标 `(3.14,-3.48)` 在障碍内，搜索已正确排出到 `(2.87,-3.23)`（距原目标约 0.37 m），但任务层仍按原始坐标判到达，机器人到排出点后继续顶着墙反复 `COLLISION`，直到用户改目标。同时日志多次出现 `source=start start clearance 0.247/0.258, reference min 0.283`，说明当前贴墙、前方变宽，旧对齐逻辑仍触发大角度航向误差。
+- 验证：`mas2027_nav_executor` Release + `BUILD_TESTING=ON` 构建通过；`test_global_goal_cell_clearance` 7/7（新增排出点 flag 断言），`test_mpc_gimbal_follow` 17/17（新增当前贴墙但路线变宽不触发对齐），执行器 CTest 4/4。未实车复跑；下次必须先启动记录器，验证排出点任务结束和窄道对齐触发条件。
+
+## 2026-10-18 — 实车验证：几何窄道对齐消除中途停顿
+
+- 改动：无新增算法；记录 `20261018_135419` 实车验证结果，分析写入 `.scratch/field_runs/20261018_135419/analysis.md`。该轮使用 `narrow_passage_alignment_enable: true`、`narrow_passage_alignment_lookahead: 2.0` 和 `relaxed_minimum_clearance: 0.25`。
+- 结果：4/4 目标到达，运行 63.6 s；MINCO 重规划 208 次（成功 198，失败 `COLLISION=9` + `OPTIMIZER_FAILED=1`），`LOCAL_SEED_INVALID=0`、`TERRAIN_SIDE_ENTRY=0`、无 emergency stop；3 次窄道续行、5 次 `Gimbal axis not aligned`。`/cmd_vel` 的 5 段 ≥0.5 s 零平移全部是启动等待、目标到达/下一目标等待或终点等待，没有中途窄道停顿。13:55:05 和 13:55:08 的 `chassis_cmd.follow_gimbal=true` 时仍有非零平移速度，说明普通窄道是边蠕行边对齐，没有因等待航向额外停车。
+- 未验证：本轮没有复现目标落在墙内的情况，`lastGoalInvalid()` 的终止停车尚未实车触发；9 次 COLLISION 和 1 次 OPTIMIZER_FAILED 仍会在目标附近出现，但未造成急停或撞墙。
+
+## 2026-10-18 — 几何窄道提前对齐底盘航向
+
+- 改动：参考中科大 2025 技术报告 5.5.5.4.4，`PathExecutor` 新增 `narrowPassageHeadingErrorDegrees()`：沿已提交轨迹向前扫描 `narrow_passage_alignment_lookahead`（默认 2.0 m），找到第一个净空落在 `[narrow_passage_clearance, effective threshold)` 的轨迹点，返回该处轨迹切线相对当前 LIO yaw 的角度误差。`nav_executor_node` 在没有语义区域航向时，把这个误差送入 `GimbalFollowAdapter`，让底盘在进入几何窄道前按轨迹切线对齐；普通窄道边蠕行边对齐，不额外停车等待，语义坡道/隧道仍保留原来的准备阶段停车对齐。新增 `narrow_passage_alignment_enable` / `narrow_passage_alignment_lookahead` 参数；不改变 0.24 m 净空地板、全局搜索和碰撞门。
+- 原因：当前 `RegionController` 只在语义 `alignment_segment_` 上返回航向误差，普通窄道只限速不对齐；车体进入狭缝时可能以斜角通过，增加擦墙和卡住风险。报告的做法是不依赖 label，直接用轨迹点到 ESDF 的距离判断狭窄并提前对齐。
+- 验证：`mas2027_nav_executor` Release + `BUILD_TESTING=ON` 构建通过；`test_mpc_gimbal_follow` 新增 `NarrowPassageAlignmentUsesEntryTangent`（0.25 m 窄带返回 +90° 轨迹切线误差，开阔区返回 nullopt），16/16 通过；`test_global_goal_cell_clearance` 7/7；执行器 CTest 4/4。未实车复跑，窄道内是否因对齐产生额外摆动需下一次录制确认；若现场出现擦碰，先关闭 `narrow_passage_alignment_enable`，再检查 `heading_ready` 和 `small_yaw_ref`。
+
+## 2026-10-18 — 目标在已知障碍内时终止旧轨迹，禁止继续朝墙探索
+
+- 改动：`GlobalPathSearcher` 新增终止性目标判定 `lastGoalInvalid()`：目标在滚动窗口内且目标格代价不可通行时，再用 `findGoalApproach()` / `findGoalEjection()` 检查 `goal_approach_max_shorten` 内是否存在安全接近/排出点；两者都不存在就把该目标标记为无效，不再进入普通“朝目标方向找可达子目标”的回退。`MincoPlanner::PlanGlobalPath()` 传递该状态，`TaskManager` 在 `FOLLOWING`/`PLANNING` 两条路径上立即停止运动、发布急停并清空全局路径，不再保留旧轨迹继续跟随。另将窄道稀疏折线强制改为 best-effort：强制 0.24 m 后若返回空，则回退无净空约束的稀疏折线，避免把可用种子误判成 `LOCAL_SEED_INVALID`；轨迹门和命令门仍按 0.24 m 地板验收。
+- 原因：`20261018_134100` 中用户下发目标 `(5.81,-0.65)`，13:43:01 在线图已确认目标 `cost=254`、`clearance=-1.221`，且 1.5 m 内无任何达到 0.25 m 的安全排出点；旧逻辑仍通过回退子目标从 `x≈0.2` 一路推进到 `x≈4.2`，直到旧轨迹失效触发急停，现场反馈撞墙。该轮还出现 45 次 `LOCAL_SEED_INVALID`，与窄道稀疏强制过严有关。
+- 验证：`mas2027_nav_executor` Release + `BUILD_TESTING=ON` 构建通过；`test_global_goal_cell_clearance` 新增 `RejectsGoalInsideObstacleWhenNoEjectionExists`，7/7 通过；`test_mpc_gimbal_follow` 15/15；执行器 CTest 4/4。未实车复跑；下一次必须确认目标在障碍内时确实在撞墙前停住，并观察 `LOCAL_SEED_INVALID` 是否下降。
+
+## 2026-10-18 — 清除净空边界伪否决并让窄道稀疏折线避免切角
+
+- 改动：`clearance_gate.hpp` 新增 `kClearanceComparisonTolerance=1 mm`，仅用于浮点比较；`TrajectorySafetyChecker::checkPoint()`、`checkCommandSafety()` 和 `LocalPathProcessor::segmentClear()` 改用该容差，避免“实测 0.259999 / 阈值 0.260000”被记录成 below 并反复否决。`LocalPathProcessor` 新增 `setNarrowPassage()`，窄道开启时稀疏折线跳跃段必须保留 `narrow_passage_clearance`（当前 0.24 m）净空；`segmentClear()` 增加可选绝对净空覆盖，起点近场仍按“不比当前更差”，不会因地板把贴墙起点全部拒掉。这样绕过窄口的稠密折线不会再先被简化成切角弦、再被 MINCO 轨迹门否决。同步执行器 README 和在线导航说明。
+- 原因：`20261018_133120` 已验证全局 0.25 m 二次搜索和路径感知窄道能工作（9/9 目标到达），但日志仍有 `Trajectory clearance 0.260 m below required 0.260 m`、`Braking ... value=0.260 threshold=0.260`；另有多处轨迹在参考折线 0.25 m 走廊外切到 0.235–0.236 m，触发 1–2 s 的 MINCO 重试暂停。前者是浮点边界，后者是稀疏化切角。
+- 验证：执行器 Release + `BUILD_TESTING=ON` 构建通过；`test_global_goal_cell_clearance` 新增 `AcceptsClearanceExactlyAtThreshold`，6/6 通过；`test_mpc_gimbal_follow` 新增 `AcceptsCommandClearanceExactlyAtThreshold`，15/15 通过；执行器 CTest 4/4。未在新增稀疏折线约束后实车复跑，需下一次录制确认暂停是否继续缩短；若窄道切角仍存在，再单独调整 MINCO 时间权重/窄段速度，不直接降低 0.24 m 地板。
+
+## 2026-10-18 — 窄道全局二次搜索与前方窄道提前限速
+
+- 改动：`GlobalPathSearcher` 在直线接近点失败后，增加目标周围环带内的目标排出点搜索（只接受机器人一侧、满足搜索代价和净空的格）；`makePlanOnQuery()` 在 SMAC 主净空搜索失败时，可用 `smac_2d.relaxed_minimum_clearance`（当前 0.25 m）再搜索一次，成功后恢复主净空，且只有窄道续行开启时才传入该值。新增 `relaxed_minimum_clearance` 参数说明。`TrajectorySafetyChecker` 的窄道判据不再只看起点：它沿本次 MINCO 种子折线缓存净空，参考折线最低净空落在 `[floor, 有效阈值)` 时，只对距该窄段 0.20 m 内的轨迹采样放宽到 floor；偏离走廊仍按完整阈值。`PathExecutor` 在前方 1.5 m 的已提交轨迹进入窄带时提前把速度限到 `narrow_passage_speed`，`checkCommandSafety()` 同步接收“前方窄道”标志；当前实测净空低于 floor 时不允许该放宽。同步执行器 README、在线导航说明和参数注释。
+- 原因：`20261018_130912` 在 13:11:52 和 13:13:18 的停顿中，13:13:14 的 ROGMap 距离场从起点到目标在 0.25 m 阈值下连通、在 0.26 m 下断开，走廊瓶颈约 `(2.54,-1.24)` 为 0.25 m；旧全局搜索固定 0.27 m，直接搜索失败后只能报“无可达子目标”。MINCO 与命令门又只看当前净空，机器人到窄口前仍用 0.26 m，形成到口停一下再过的行为。该改动不把常态化阈值降到 0.24 m：全局二次搜索只在主搜索失败且窄道续行开启时启用，执行侧仍逐点验收。
+- 验证：`mas2027_nav_executor` Release 构建通过；`test_global_goal_cell_clearance` 新增 `RelaxedSearchUsesNarrowCorridor`（0.25 m 走廊主搜索失败、二次搜索成功且主净空恢复）、`EjectsGoalAroundBlockedDirectLine`（直线全堵时目标排出）和 `PathAwareNarrowGateAllowsOnlyPlannedCorridor`（参考折线窄段放行、无参考折线或偏离 0.3 m 仍拒绝），5/5 通过；`test_mpc_gimbal_follow` 新增前方窄道限速/指令门放行、当前低于 floor 不放行两项，14/14 通过。未实车复跑，0.25 m 全局二次搜索与 0.24 m 局部地板仍需下一次录制确认，若出现擦碰应先关闭 `narrow_passage_enable`。
+
+## 2026-10-18 — 记录器补充实际执行轨迹和配置快照
+
+- 改动：`record_nav_diagnostics.sh` 增加 `/opt_path`（执行器实际消费的 `MpcPositionCommand`），并在运行开始时把执行器、bringup 的 `*.yaml` 和机器人 URDF 复制到 `RUN_DIR/config/`。这样分析不依赖导航节点退出后仍能成功执行 `ros2 param dump`，也能把 MPC 实际轨迹与 `/nav_executor/minco_path`、ROS 命令和地图快照逐帧对齐。同步 `field_run_recording.md` 的记录内容说明。
+- 验证：`bash -n` 通过；有界自检验证启动时生成 `config/` 快照（9 个 YAML/URDF），`/opt_path` 已加入 bag topic 列表；无 bag 时写 `Bag metadata missing` 并保留配置/日志目录，CSV/README 收尾逻辑仍沿用上一轮测试。未重放实车；`/opt_path` 自定义消息能否被 bag 正常回读需下一次实跑确认。
+
+## 2026-10-18 — 记录器收尾先保存 CSV/日志，避免二次 Ctrl-C 丢证据
+
+- 改动：`record_nav_diagnostics.sh` 在 bag 停止后先写 `bag_info.txt`、复制 ROS 日志和 `minco/rog_map` CSV、写 `README.txt`，再执行可选的 `ros2 topic/node/param` 查询；收尾期间忽略第二次 `Ctrl-C`/`TERM`/`HUP`，参数查询各加 3 s 超时。输出摘要加入 bag 消息数、日志/CSV 文件数和空包/无 CSV 警告。这样即使节点已退出或用户再次按 Ctrl-C，已生成的证据仍会落盘。同步脚本文档无需改接口。
+- 验证：`bash -n` 通过；隔离 ROS 域以 `FIELD_RECORD_SECONDS=1` 做有界自检，预置一个 CSV 后自动生成 `README.txt`、`bag_info.txt`、logs/csv 目录和 CSV 副本，空包场景打印警告并仍保留收尾文件。未重放实车，也未在真实终端做二次 Ctrl-C 注入；`ros2 bag info` 在无 bag 消息时返回非零属预期。
+
+## 2026-10-18 — 清除机器人自身结构造成的近场投影障碍
+
+- 改动：`ProjectionLayer` 新增 `clearBodyDisk()`，ROGMap 每次投影后用 `projection.body_exclusion_radius`（默认 0.30 m）把机器人中心附近的二维占据格改为 FREE/EMPTY_COLUMN，并同步 `mask/value`；`ProjectionLayer` 的分类、地面过滤、坡道/隧道标签和最终净空门不变。原因是 LIO 的球状盲区以雷达安装点为中心，云台/另一台雷达的回波仍可能进入 `/cloud_registered_full`，在最坏情况下机器人中心 0.17–0.25 m 处出现 `OCCUPIED`，导致窄处误停。同步 ROGMap README 参数表。
+- 验证：ROGMap 新增 `ProjectionGround.BodyDiskClearsNearbyOccupiedCells`，验证 0.10 m 圆盘内占据格清成 FREE、圆盘外仍 OCCUPIED；`test_projection_terrain` 16/16、ROGMap CTest 2/2、执行器 CTest 4/4 通过，两个包 Release 构建通过。用 `20261018_120130` bag 的 `layer_type` 离线检查：12:03:05 机器人中心 0.30 m 内有 19 个占据格，清除后该点 EDT 从 0.141 m 变为 0.283 m；这在数值上覆盖了本次多次 `clearance 0.25 < 0.26` 的停顿。未实车复跑；0.30 m 是车体半宽近似，若实际云台/雷达支架更大或现场出现擦碰，应先核对真实几何再调整，设为 0 可立即关闭。
+
+## 2026-10-18 — 窄道按实测净空低速续行
+
+- 改动：新增 `minco_optimizer.narrow_passage_enable/clearance/speed`（默认 true / 0.24 m / 0.5 m·s⁻¹）。`TrajectorySafetyChecker` 与 `checkCommandSafety` 只在机器人当前实测净空已落在 `[floor, collision_dist-0.02)` 时，把该段轨迹的净空下限降到 `max(floor, 当前净空-0.02)`，并允许沿整段轨迹使用该下限；未来任一点低于 floor 仍拒绝。`PathExecutor` 在该模式下把平移速度限到 0.5 m/s。该策略不把 `collision_dist=0.28` 或常态化 0.26 m 门降低；开阔区接近窄道仍按完整阈值。参数关闭即恢复原行为。同步执行器 README、在线导航说明和参数注释；参考中科大 2025 技术报告 5.5.5.4.4 的窄环境低速/对齐思路。
+- 验证：执行器 Release、`BUILD_TESTING=ON` 构建通过；`test_mpc_gimbal_follow` 新增 `AllowsOnlyCreepWhenAlreadyInsideNarrowClearance`，用 0.25 m 合成净空验证严格模式仍 `DYNAMIC_BLOCKED`、窄道模式发布且速度 ≤0.2 m/s（测试参数），该测试套件 12/12 通过；执行器 CTest 4/4、`git diff --check` 通过。未实车复测；未实现 USTC 的底盘沿轨迹切向对齐，普通模式自转仍保留；0.24 m 下限与 0.5 m/s 需现场按实际车体半宽和擦碰情况确认，若出现碰撞应立即关闭该参数。
+
+## 2026-10-18 — 全局搜索起点净空不足时弹出到邻近安全格
+
+- 改动：`GlobalPathSearcher::makePlanOnQuery()` 在代价起点投影后，再检查 SMAC 的 `minimum_clearance`；若起点是自由格但 ESDF 低于 0.27 m，则在 0.6 m 内按环形搜索找同时满足栅格代价和搜索净空的邻近格作为搜索起点，并把实际位移写进日志。只替换全局折线端点，局部轨迹仍从实测位姿开始，近场豁免、发布前整条轨迹检查、执行前指令门和 `goal_approach` 均不变。参考 `中科大哨兵2025技术报告.pdf` 5.5.1 的“起始点/目标点排出障碍物”策略补齐起点侧；此前只有目标接近点。同步 `online_navigation.md`、执行器 README 和变更记录。
+- 验证：执行器 Release、`BUILD_TESTING=ON` 构建通过；`test_global_goal_cell_clearance` 新增 `EjectsStartFromLowClearanceCell`，用起点净空 0.20 m、相邻格 0.40 m 的合成地图验证搜索起点被移到安全格且返回路径，2/2 用例通过；全套执行器 CTest 4/4 通过，`git diff --check` 通过。未在实车复跑，未验证 0.6 m 位移在窄通道/贴墙恢复中的实际效果；若 0.6 m 内没有安全格，仍按原逻辑失败并留给局部脱困。
+
+## 2026-10-18 — 拒绝抬升薄面造成的假坡道标签
+
+- 改动：`ProjectionLayer::terrainGeometry()` 的坡道拟合在原有 RMS ≤0.04 m 之外，增加“任一样本到拟合平面的残差 ≤0.05 m”。原因来自 `20261018_114433` 录制运行：在线累计图在 `(2.2～2.7,-0.5～0)` 有 51 个 `label=5` 格，机器人在 `(2.04,-0.19)` 附近约 20 Hz 反复切换 `label 5/0`；本地 `terrain_label` 在 `(2.48,-0.22～0.18)` 输出一条假坡，而同一时刻高度场里 `(2.73,-0.07)` 有一个高出地面约 0.20 m 的薄面。该样本使 11×11 平面拟合得到 20°～30° 坡度、RMS 2.9～3.6 cm、最大残差 10～16 cm，旧逻辑只看 RMS 因而通过；假坡还会经 `buildSlopeSideMask()` 变成硬侧边，进入在线搜索、局部路径和最终轨迹检查。新增 `RaisedThinSurfaceDoesNotTiltGroundPlane` 和 `NoisyContinuousInclineStillSlope` 回归用例；同步 ROGMap README 与地形语义说明。未改投影占据分类、隧道阈值或净空门。
+- 验证：`test_projection_terrain` 15/15 通过；在录制 bag 的 `layer_height_delta`/`layer_type` 快照上按同一拟合条件离线回放，`11:45:44` 假坡簇的 11 个候选全部被拒，`11:45:04` 的 29 个候选也全部被拒（该回放使用点云高度差近似 `thinGround`，不是节点原函数重放）；`rog_map` CTest 2/2、执行器 CTest 4/4 通过，两个包的 Release 构建通过，`git diff --check` 通过。未在实车复跑，未验证新阈值对真实坡道的召回率；如果现场真实坡道带 >5 cm 的局部凸起，可能被保守拒绝，只影响坡道 mode/速度上限，不放松安全门。
+
+## 2026-10-18 — 增加现场导航运行取证记录器
+
+- 改动：新增 `mas2027_nav_bringup/scripts/record_nav_diagnostics.sh` 与 `config/qos_diagnostics.yaml`，用 MCAP 记录 TF、里程计、目标、底盘/区域状态、MINCO/全局轨迹、累计在线地图、ROGMap 的 `layer_type/layer_value/terrain_label/layer_height_delta/field/occupied/raw_occupied`，默认还记录 `/cloud_registered_full`；停止后自动复制本次 ROS 日志、`minco_perf_*`/`rog_map_perf_*` CSV、节点参数、topic/node 列表和 bag 摘要到 `.scratch/field_runs/<时间>/`。QoS 覆盖保证 best_effort 的 ROGMap 话题和 transient_local 的累计地图能真正入包；`--disable-keyboard-controls` 避免无 TTY 时 rosbag2 停止挂起。同步安装入口和 `docs/field_run_recording.md`，不启动或配置导航节点，不改变规划/控制行为。
+- 验证：`bash -n` 与 `--help` 通过；在隔离 ROS 域用 best_effort `/rog_map/layer_type` 合成发布者做 5 s 有界录制，脚本自动停止并生成 101 条消息的 MCAP、`bag_info.txt`、日志、参数和 README，退出码 0；另用 transient_local `/nav_executor/online_terrain_map` 在发布后启动录制，成功捕获 1 条 latched 消息；`mas2027_nav_bringup` Release 构建与 symlink 安装通过，安装目录中的 `record_nav_diagnostics.sh` 可直接执行。未连接实车、未录制真实导航，也未在真实终端上做一次完整 Ctrl-C 启停；`/cloud_registered_full` 的 1–3 GB/5 min 容量估算需按现场点云再确认。
+
+## 2026-10-18 — 收紧在线隧道标签并增加地形标签诊断
+
+- 改动：`ProjectionLayer::terrainGeometry()` 只在投影层已判为 `PASSABLE/HOLLOW_TUNNEL` 的柱上生成隧道 `6` 标签，并使用 `projection.tunnel_height_delta_min/max` 与 `tunnel_occupancy_ratio_max`，不再用固定 0.6～1.8 m 窗口给 `OCCUPIED` 稀疏高柱贴标签。ROGMap 性能 CSV 增加 `terrain_label_flat/slope/tunnel`（actual label counts），`nav_executor` 在 `RegionStatus` 的 label 或 mode 变化时打印位置、阶段和 online 标志。同步 ROGMap README 与 `terrain_semantics.md`；未改投影遮挡分类、障碍阈值、净空门槛或搜索算法。
+- 验证：`rog_map` 与 `mas2027_nav_executor` 的 Release、`BUILD_TESTING=ON` 构建通过；ROGMap CTest 2/2 套件、执行器 4/4 套件通过，`test_projection_terrain` 新增 `ConfiguredTunnelSpanIsUsed`、`OccupiedGapIsNotTunnel` 并将旧隧道用例改到配置窗口内，13 项全通过；另用最小 `PerformanceMonitor` 实例写出 CSV，detailed 与 summary 的 header/row 字段数分别为 63/63、33/33，末三列 `terrain_label_*` 值正确；`git diff --check` 通过。未重放 2026-10-18 的 11:00–11:04 现场运行，未做地图快照或实车复测；因此只能证明标签逻辑不再给已判占据的 0.6～1.8 m 空隙发 `6`，不能证明平地 mode 5/6、目标格被挡或低净空制动均由该问题造成。
+
+## 2026-10-18 — 修正 ROGMap 距离场半格偏移
+
+- 改动：`rog_map::QueryAdapter::query()` 与 `DynamicLayer::evaluate()` 的 ESDF 插值坐标统一减去半格，使 `mapToWorld()` 给出的栅格中心对应同一格 EDT 样本。此前在格中心查询会插入相邻格，可把占用格中心读成正净空，也可能把安全格读成低净空。新增使用真实二维 EDT 生成器的单元测试，覆盖障碍格与相邻自由格、双线性和二次插值，并验证直接距离场查询。没有更改占用分类、最低净空、安全门槛或搜索算法。
+- 验证：`rog_map` 与 `mas2027_nav_executor` 的 Release、`BUILD_TESTING=ON` 构建通过；ROGMap 14 项、执行器 98 项测试均无失败，`git diff --check` 通过。未重放 2026-10-18 的现场运行（没有同步保存地图快照），未在实车上验证失败次数或具体目标净空变化；半格修正不能独自证明所有低净空记录为误判。
+
+## 2026-10-18 — 全局搜索日志统计勘误
+
+- 改动：修正上一条记录对最近运行 `open set exhausted` 的计数解释。21 次搜索耗尽中，16 次 `iterations=1`；另外 5 次分别为 143、625、1331、1365、1368 次。此前用子串匹配把所有以数字 1 开头的迭代数都误计为 1。本次仅在修改历史顶部追加勘误，没有改搜索代码或安全参数。
+- 验证：对 `/home/mas/.ros/log/mas2027_nav_executor_node_14126_1792290943387.log` 的每条 `open set exhausted before goal` 记录使用行末 `iterations=(\d+)` 提取整数并统计；`git diff --check` 通过。未重放现场地图，也未运行实车。
+
+## 2026-10-18 — 统一全局目标净空判定位置
+
+- 改动：`GlobalPathSearcher` 在决定是否使用目标接近点时，改用目标栅格中心查询 ESDF，并按 SMAC 的 float 精度比较最低净空；接近点检查也采用同一精度，避免原始目标坐标通过预检后又被 SMAC 在同一目标格中心直接拒绝。新增合成地图回归用例及 CMake 测试目标；`online_navigation.md` 写明格中心判据，并将两项未知区配置表修正为当前 YAML 的 `false`。未改 `smac_2d.minimum_clearance`、轨迹碰撞门槛或近场安全门。
+- 验证：`mas2027_nav_executor` Release 且 `BUILD_TESTING=ON` 构建通过；新增测试验证“目标原始坐标净空充足、目标格中心不足”时能选安全接近点并返回路径；包内 4 个 CTest 套件合计 98 项通过，`git diff --check` 通过。按最近运行日志统计有 55 次目标 ESDF 净空拒绝、21 次搜索耗尽且均只扩展起点；本次未重放该运行（没有同步保存的 ROGMap 快照），未做实车复测，不能判断低净空格来自真实障碍还是点云投影误判，也不能认定全部现场搜索失败已消除。
+
+## 2026-10-18 — 云台跟随限定为特殊地形通过窗口
+
+- 改动：删除 `force_follow_gimbal` 启动/节点参数及执行器、串口桥的全程强制跟随分支。`nav_executor_node` 按 `RegionController` 的特殊地形阶段请求跟随：入口前的 PREPARING、ARMED、COMMITTED，地形内的 INSIDE，以及出口后的 RELEASING 均发送 `follow_gimbal=1`，到释放点恢复普通阶段后清除；无有效轨迹/许可或姿态时也清除。`nav_serial_bridge` 只转发新鲜且角度有效的请求，超时与退出帧清除跟随和角度。精简 `GimbalFollowAdapter` 的强制模式与普通路段航向入口，更新 launch、区域回归测试、项目和执行器说明；16 字节 CDC1 协议和下位机未改。
+- 验证：`mas2027_nav_executor`、`nav_serial_bridge`、`mas2027_nav_bringup` 的 `BUILD_TESTING=ON` 和正常运行安装目录构建通过；执行器 CTest 3/3 套件、串口桥 CTest 2/2 套件通过，区域测试覆盖 5/6/7 三类标签从普通、准备、请求、提交、内部、释放到普通阶段的跟随标志。直接运行本次构建的串口桥，用隔离 ROS 域和虚拟串口采样普通/特殊/释放/超时阶段 25/25/26/28 帧，全部 CRC 有效且标志、角度、速度符合预期；`ros2 launch --show-args` 无强制跟随参数，Python 语法和 `git diff --check` 通过。未启动实车导航、连接真实串口或验证底盘在特殊地形的实际姿态。
+
+## 2026-10-18 — 回退 TDT，恢复 SMAC 2D 与 MINCO
+
+- 改动：按要求撤销 TDT 接入。`GlobalPathSearcher` 恢复以 SMAC 2D 为默认全局搜索（`use_smac:false` 时使用 Astar），保留先前的安全接近点和在线坡道侧边搜索约束；`MincoPlanner` 恢复直接使用 MINCO 优化，保留 0.3 s 热启动前缀、发布前整条轨迹检查和执行前指令门。移除 TDT YAstar/MinimumSnap 调用、分层 `Mask` 查询、OSQP/OsqpEigen CMake 依赖、TDT 源码/脚本/专项测试，清理旧构建产物和安装许可。同步项目、执行器、在线导航、地形和 Foxglove 文档；云台跟随及串口协议等独立改动保留。
+- 验证：`mas2027_nav_executor` 的 `BUILD_TESTING=ON` 和生产 Release 构建通过；包内 CTest 3/3 套件通过，独立目标接近点回归 2/2 通过；新生产节点无 TDT 字符串及 OSQP/QDLDL 动态依赖，`git diff --check` 通过。未启动实车导航或验证现场路径通过率。
+
+## 2026-10-17 — follow_gimbal 在单独运行时也默认保持 1
+
+- 改动：`nav_executor_node` 和 `nav_serial_bridge` 的 `force_follow_gimbal` 参数默认值从 `false` 改为 `true`，与 `nav_executor_launch.py` 已有的默认值一致。这样即使不通过整套 launch、单独启动执行器或串口桥，也会持续发送 `follow_gimbal=1`；显式传 `force_follow_gimbal:=False` 才恢复仅特殊地形跟随。串口桥仍要求 `small_yaw_ref` 为有限值，非有限时清除跟随并保持最后有效角度；速度无效/超时仍只清零平移，不改变本测试模式的 1。同步 README 和区域说明。
+- 验证：`mas2027_nav_executor` 与 `nav_serial_bridge` Release 构建通过；`BUILD_TESTING=ON` 下执行器 5 个套件、串口桥 2 个套件全部通过（41+2 个用例）；`git diff --check` 通过。未连接实车串口或实测下位机 flag，需重启这两个节点后确认。
+
+## 2026-10-17 — Foxglove 轨迹可视化话题与固定坐标系说明
+
+- 改动：更新 `docs/foxglove_remote_debug.md`，明确 online 模式 3D Fixed frame 用 `odom`、prior 模式用 `map`；新增当前实际可用的轨迹话题：`/nav_executor/minco_path`（`nav_msgs/Path`，TDT MinimumSnap/MINCO 回退）、`/nav_executor/debug/minco_trajectory`（按速度着色 Marker）、`/nav_executor/global_plan` 与 `/nav_executor/debug/global_plan`；说明 `/opt_path` 是自定义消息，3D 面板不认，应使用上述 Path/Marker 话题。同步更新限流白名单示例和地形检查的 TF 说明。
+- 验证：文档内容与当前 `node_params.yaml` 的话题名、`nav_executor_node` 可视化发布代码和 launch 的 Foxglove bridge 参数核对；`git diff --check` 通过。未启动 Foxglove/导航实车验证本次文档描述的可视化画面。
+
+## 2026-10-17 — TDT 默认后端收口：依赖、测试与安全查询统一
+
+- 改动：继续完成 TDT 默认链接入。将 `tdt_planning_bridge.cpp` 从 `_tdt` 静态库移入 `_planner`，打破 `_planner → _tdt → geometry_utils::Trajectory` 的静态链接环；删除 CMake 中五个已删除测试文件的残留目标，使 `BUILD_TESTING=ON` 可以完整构建。`MincoPlanner::ReplanLocal()` 的 TDT 路径复用 `replan_continuity_time_s` 的短旧轨迹前缀，TDT MinimumSnap 失败时回退现有 MINCO 求解器，回退仍使用同一发布前整条轨迹校验和执行前指令门。在线模式把 `OnlineSemanticMaskQuery` 同时交给 TDT/MINCO/走廊和发布前安全检查，避免“优化器看见语义侧边、最终校验看不见”的口径分叉。补充 TDT 构建脚本、静态 OSQP 依赖和 README 构建命令；同步在线导航/地形语义说明。
+- 验证：使用 `build/tdt_deps/static_install` 静态 OSQP 的 `BUILD_TESTING=ON` 全量构建通过；`ctest` 5 个套件全部通过（TDT 搜索/优化 6 例、语义掩码 7 例、重规划前缀 2 例、MPC/PathExecutor 11 例、区域/适配器 15 例，共 41 例）；另用 `.scratch/gimbal_alignment_test` 运行目标接近点 2 例通过。主节点 Release 构建通过，`ldd` 确认无动态 OSQP/QDLDL 依赖；YAML 解析、`nav_executor_launch.py --show-args`、安装许可比对和 `git diff --check` 通过。未启动实车导航；TDT 的 OSQP 收敛率、窄坡/窄道通过率和 0.3 s 连续性前缀仍需实车/离线长场景验证。
+
+## 2026-10-17 — 移植 TDT 分层掩码并对齐在线搜索与轨迹生成
+
+- 改动：从 TDT `tdt-nav-kit` 的 `YAstar` 提取原有 `Mask` 位图层合并模块（MIT，固定上游提交与许可文件，安装包携带许可）；`OnlineSemanticMaskQuery` 将实时 ROGMap 坡道侧边与 B1 累计侧边合为具名硬掩码，同时用侧边有符号距离与原 ROGMap ESDF 取较小值。在线 `GlobalPathSearcher` 的 SMAC/回退搜索使用同一快照的硬格与距离场，MINCO 优化器和走廊在每次局部重规划中使用同口径查询；斜向角点规则、发布前整条轨迹校验和执行前指令门保留，先验模式不变。主要涉及 `mas2027_nav_executor/vendor/tdt/`、`common/environment/online_semantic_mask_query.*`、`global_path_searcher.cpp`、`minco_planner.cpp`、CMake、在线地形文档及专项测试。未整体替换 TDT `YAstar` 或 `MinimumSnap`。
+- 验证：`mas2027_nav_executor` Release 构建（`BUILD_TESTING=OFF`）通过；独立 CMake 编译本次专项测试，6/6 通过，覆盖 TDT 命名层合并/复位、实时与记忆侧边、入口开放、无坡道不改变原距离、SMAC 绕开硬侧边；安装包含 TDT 原 MIT 许可，`git diff --check` 通过。工作树原有五个测试源文件被删除，故未运行包内整套 `BUILD_TESTING=ON` 测试；未启动现场导航、未测 MINCO 完整轨迹成功率/重规划耗时或实车窄坡通行，二维侧边场也不处理隧道顶部三维净空。
+
+## 2026-10-17 — 热启动前缀严格受时长窗口限制
+
+- 改动：修正 `MincoPlanner::PTAllocation()` 的短前缀选择：以前先复制旧路标点、后检查累计时长，旧轨迹首段即使长于 `replan_continuity_time_s=0.3 s` 也会被复用；现在只复制完整落在窗口内的旧段，超出窗口时退回新路径初值。将选择逻辑放入 `replan_continuity.hpp` 并新增 `test_replan_continuity.cpp`，覆盖超窗首段、刚好落在窗口内、关闭窗口和路线拼接跳跃；未新增参数或安全门。
+- 验证：新增回归测试 2/2 通过，`mas2027_nav_executor` Release 构建通过；现有区域/适配器 15 例、MPC/PathExecutor 11 例、目标接近点 2 例均通过；规划器/节点 YAML 解析、`nav_executor_launch.py --show-args` 和 `git diff --check` 通过。未启动实车导航；现有三个专项测试程序沿用先前构建的二进制，未重新编译这些程序，主执行器已针对本次源码重新构建。
+
+## 2026-10-17 — MINCO 热启动只保留短旧轨迹前缀
+
+- 改动：按中科大 2025 技术报告 5.5.4.4 的重规划连续性思路，`MincoPlanner::PTAllocation()` 不再把旧轨迹全部剩余路标点/时长作为热启动初值。新增 `minco_optimizer.replan_continuity_time_s`（默认 0.3 s，0 关闭），只按旧轨迹从当前时刻起的时间累计保留这一小段路标点作为新轨迹初值前缀；如果旧前缀末端与新路径的下一段拼接跳跃超过 0.6 m，自动缩短或放弃旧前缀；旧时长的覆盖范围也只限该前缀，后续段使用新路径的弧长速度剖面。这样保留重规划位置/速度连续性，同时避免旧路线长时间拖住新规划，对应报告中“保留短旧轨迹段、避免重规划状态跳变”的目标。同步 `planner_params.yaml`、项目/执行器 README。
+- 验证：`mas2027_nav_executor` Release 构建通过；区域/适配器 15 例、MPC/PathExecutor 11 例、目标接近点 2 例共 28 例通过；`planner_params.yaml` 解析、`nav_executor_launch.py --show-args` 和 `git diff --check` 通过。当前专项测试未覆盖热启动前缀的具体选择分支，未启动实车导航；0.3 s 前缀时长和 0.6 m 拼接阈值需在窄道/频繁重规划场景实测。
+
+## 2026-10-17 — 安全链路收敛为两道硬门
+
+- 改动：按用户选择删除独立的 20 Hz 全轨迹安全监视，只保留 **发布前整条轨迹检查** 和 **执行前当前指令检查** 两道硬门。`MincoPlanner` 删除 `safety_timer_`、`safetyTimerCallback()`、`is_traj_safe_` 和无参 `checkCollision()`；`TaskManager::allowsMotion()` 只看运动许可，不再依赖 `isTrajSafe()`；`FOLLOWING` 中轨迹安全否决分支和 `escape_active_` 一并删除。`TrajectorySafetyChecker` 去掉 `CheckOptions`、时间起点/前视窗口和多套重载，只保留“整条轨迹 + 固定净空 + 近场豁免”；`MincoOptimizer` 删除速度感知净空模型和 `clearance_*` 配置，只保留固定 `safe_dist` 软目标；`planner_params.yaml` 删除 `monitor_margin`、`replan_react_time`、`speed_aware_clearance`、`clearance_optimizer_margin`、`safety_lookahead_time`，`node_params.yaml` 删除重复的 `node.rog_map_clearance`，执行器改用 `planner.minco_optimizer.collision_dist`。硬阈值不变：`collision_dist=0.28`、ESDF 抖动余量 0.02（有效 0.26）、近场 slack 0.02、地形过渡和 ROGMap 新鲜度检查保留。
+- 验证：`mas2027_nav_executor` Release 构建通过；区域/适配器 15 例、MPC/PathExecutor 11 例共 26 例通过，目标接近点搜索回归 2 例通过；`planner_params.yaml`/`node_params.yaml` 解析、`nav_executor_launch.py --show-args` 和 `git diff --check` 通过。未启动实车导航；移除 1.2 s 运行时全轨迹监视后，动态障碍只由执行侧约 0.35 s 指令前视兜底，提前制动能力相应减少，需实车确认。
+
+## 2026-10-17 — 目标不可通行时回退到安全接近点
+
+- 改动：SMAC 直接搜索遇到目标格被占据、代价不可通行或 ESDF 净空低于 `smac_2d.minimum_clearance` 时，不再让整个目标直接失败。`GlobalPathSearcher` 新增 `goal_approach_max_shorten`（默认 1.5 m，0 关闭）和沿 `start → goal` 反方向的接近点搜索：以目标格中心为准，优先选择满足搜索净空、可通行且不与起点同格的最接近格；找到后只把本次全局搜索端点改成该接近点，原始任务目标仍由 `TaskManager` 保留，最终轨迹、20 Hz 监视和 MPC 指令门全部沿用原阈值，不放松任何安全判据。`MincoPlanner` 读取该参数并传给搜索器，`planner_params.yaml`、项目/执行器 README、在线导航说明同步。
+- 验证：mas2027_nav_executor Release 构建通过；独立搜索回归用例 2 个通过，分别覆盖目标格被占据和目标格仅净空不足两种情况，均能回退到接近点并完成 SMAC 路径；既有区域/适配器 15 例、MPC/PathExecutor 11 例共 26 例通过；`planner_params.yaml` 解析、`nav_executor_launch.py --show-args` 和 `git diff --check` 通过。接近点不等于任务完成，目标持续不可通行时仍会每个刷新周期重试；未启动实机导航，未验证实际窄道/贴墙目标上的回退距离和最终轨迹通过率。
+
+## 2026-10-17 — 在线导航去掉两处“导航失败即停车”的硬门
+
+- 改动：按最新运行记录里的 67 次全局搜索失败、39 次轨迹未发布和 5 次急停，区分安全门与仅影响引导/标注的门。`TaskManager` 在在线模式全局折线刷新失败时，不再立刻撤销运动许可并发布紧急停止；只要当前已提交的局部轨迹仍 `isTrajSafe()` 且未过期，就保留它继续跟随，下个 1 s 刷新周期重试；局部轨迹不安全或过期时才急停。`nav_executor_node` 在在线语义标签产生冲突 mode 窗时，回退为无特殊区段的普通 RegionPlan，而不是把 `region_plan_` 置空导致整条轨迹挂起；prior 模式仍回退静态标注。`MincoPlanner` 的在线回退子目标净空从 `collision_dist+0.05`(0.33 m) 降为 `collision_dist`(0.28 m)，与 SMAC 路径净空 0.27 m 和最终有效硬阈值 0.26 m 对齐；最终轨迹、20 Hz 监视和 MPC 指令门阈值未改。同步 README 与区域说明。
+- 验证：mas2027_nav_executor Release 构建通过；既有区域/适配器 15 例、MPC/PathExecutor 11 例共 26 例通过；区域 YAML 解析、`nav_executor_launch.py --show-args` 和 `git diff --check` 通过。本次没有为 TaskManager 的全局刷新失败分支和在线语义冲突回退新增自动化用例，也未启动实机导航或验证 0.28 m 子目标在狭窄现场的实际通过率。
+
+## 2026-10-17 — base_link 云台轴线按实测航向对齐轨迹
+
+- 改动：确认 `base_link` 的 +X 就是云台正方向，用户只要求该轴与轨迹共线，正负方向不表示必须前进或倒车。`GimbalFollowAdapter` 保留正/反向就近轴线选择和 10° 滞回，在 MPC 角速度前馈上叠加 LIO 实测轴线误差修正：新增 `heading_error_gain_s`（默认 1.0/s）、`heading_deadband_deg`（默认 0.5°）和 `max_heading_rate_deg_s`（默认 120°/s），误差修正与 omega 合并后限速再积分到 `small_yaw_ref`；安全门拒绝平移、MPC omega 为零时仍继续把云台轴转回轨迹，无有效轨迹/许可或姿态无效时保持最后角度。节点声明新参数，并在跟随误差超过 5° 时每 2 s 记录一次误差/ref/反向标志；区域 YAML、`ChassisCommand`/`RegionStatus` 注释、执行器与项目 README、区域说明、倒车跟随说明和专项测试同步；通信帧、下位机和 MINCO 路线未改。
+- 验证：mas2027_nav_executor Release 构建通过；独立 CMake 工程编译实际 `region_control.cpp`、`path_executor.cpp`、`command_safety.cpp`、`terrain_grid.cpp` 和适配器/MPC，区域/适配器 15 例、MPC/PathExecutor 11 例共 26 例通过。覆盖 MPC 零角速度时实测误差的轴线收敛、带位置环延迟和 12° 下位机跟随死区的轴线收敛、正反向选择与滞回、误差死区、总角速率限幅、安全拒绝停车，以及倒车直线/弯道仿真。区域 YAML 解析、`nav_executor_launch.py --show-args` 和 `git diff --check` 通过。既有 5 个删除测试文件保持原状，主工程仍 BUILD_TESTING=OFF、专项测试独立运行；未启动实机导航、未重启运行节点、未验证下位机 12° 死区/轴向/零点或实车对齐精度。
+
+## 2026-10-17 — 允许倒车对齐，恢复持续跟随的运动响应
+
+- 改动：用户确认可倒车并要求恢复新增跟随前的速度。GimbalFollowAdapter 默认允许在正/反向 MINCO 切线中选较近朝向，新增 allow_reverse 与 10° reverse_switch_hysteresis_deg；方向选择同时传给对齐门和整个 MPC 预测窗，反向只加 pi 到 yaw，不反转世界系轨迹/速度。特殊地形保留 5°/0.3 s 对齐等待、8° 释放阈值；普通路段强制 follow_gimbal 测试取消对齐停车，位置与朝向并行跟踪。移除每个健康跟随周期重置实测加速度锚点的逻辑，连续 MPC 命令承接上一拍加速；输入失效、求解/参考失败、安全门拒绝仍停车并锚回实测速度。普通平移上限 3 m/s、角速度 ±2 rad/s、角加速度 ±4 rad/s² 保留。更新执行器输入、参考构造、节点、区域 YAML、专项测试、README 和区域文档；协议和下位机未改。
+- 验证：mas2027_nav_executor Release 构建通过；独立工程编译实际区域/适配器、PathExecutor/MPC/安全门及从当前节点提取的 control_tick，3 套件 30 个用例通过（13+11+6）。覆盖正反向选择及滞回、118° 改为反向 62°、反向已对齐放行、倒车直线/弯道世界速度不反向、连续加速、无效输入/安全拒绝停车、拒绝后实测锚点恢复，以及下位机角度位置环延迟仿真中反向收敛。静止反馈的离线模型中，8 拍转向命令 0.2→1.6 rad/s、平移命令 0.1→0.8 m/s；不作为实机速度数据。YAML/参数及 git diff --check 通过。既有 5 个删除测试文件保持原状，主工程 BUILD_TESTING=OFF、专项测试独立运行；未自动启动导航、未实机提速或刷写下位机。按原启动命令重启导航生效，持续发送 follow_gimbal 默认保持开启。
+
+## 2026-10-17 — 持续 follow_gimbal 测试开关
+
+- 改动：按用户测试要求，nav_executor_launch.py 新增 force_follow_gimbal 启动参数，默认 True，统一传给导航执行器和串口桥。执行器开启后在普通路段也取现有 MINCO 前进切线，继续由同一个 MPC 求解和积分角度；无有效轨迹/许可、过期输入或无效姿态/位置时保持跟随标志及最后角度（初始 0°），停止积分和平移。串口桥从启动到退出前最后一帧均置 follow_gimbal=1；300 ms 超时、NaN/Inf 速度或角度时清零平移并保持最后有限角度；不放宽原运动许可、对齐等待、MPC 和安全门。关闭开关恢复普通路段 flag=0、仅特殊路段跟随的既有行为。节点单独运行时参数默认 false，整套启动覆盖为测试值。通信布局、角度单位及下位机未改。更新 README、区域说明及区域/适配器回归用例。
+- 验证：mas2027_nav_executor、mas2027_nav_bringup、nav_serial_bridge Release 构建通过；独立工程 3 套件共 22 个实际区域/适配器/MPC 和提取当前 control_tick 的专项用例通过，覆盖普通路段测试跟随、对齐放行、无计划/许可、过期输入、无效姿态/位置时保持角度/标志并零平移；串口桥 CTest 2/2 套件通过。隔离 ROS 域的实际 ROS→PTY 正常模式 252 帧、强制模式 221 帧均为 16 字节且 CRC 正确，强制模式每帧 flag=1，验证启动、ROS flag=0 覆盖、正负/零角度、超时/非有限输入保持角度并零平移、恢复和退出。Python 语法、launch --show-args 和实际 launch 参数求值确认默认 True、True/False 均统一传给两节点，git diff --check 通过。既有 5 个删除的执行器测试文件保持原状，主工程 BUILD_TESTING=OFF，专项测试独立运行；未启动实机导航、未连接实际串口或刷写下位机。重启整套导航后按默认启用，force_follow_gimbal:=False 恢复常规模式。
+
+## 2026-10-17 — MPC 跟踪 MINCO 前进切线，最终输出角度 ref
+
+- 改动：用户确认只沿现有 MINCO 路线改朝向，不新增居中规划、下位机不改。RegionController 按当前位置的轨迹向前切线确定航向误差，弯道随切线变化，取消锁定入口方向。PathExecutor 特殊跟随时在同一个 MPC 内联合求解 vx/vy/omega，各预测点 yaw 取 MINCO XY 速度方向、yaw_rate 取切线曲率前馈，低速取相邻位置非零方向，末端沿最后有效切线。等待对齐时参考位置固定在当前点、平移前馈为零，MPC 求解原地转向；5° 内稳定 0.3 s 后跟踪位置/切线，超过 8° 重新等待。采用现有 ±2 rad/s、±4 rad/s² MPC 限制，不叠加普通路段自转；跟随期间角加速度锚点取实测速度，安全门拒绝或求解失败时保持角度不积分。GimbalFollowController 替换为 GimbalFollowAdapter，移除独立航向增益/限速/死区配置；适配器只将 MPC omega 以控制周期积分为角度制 ref_angle、限幅 ±180° 不回绕，并判断稳定状态。最终串口仍发 vx/vy/small_yaw_ref/follow_gimbal 的 16 字节包，不发送 w；普通路段 follow_gimbal=0、角度为 0 并不参与下位机控制。ROS w 仅保留 MPC 内部角速度诊断，普通路段仍显示 4。新增真实 MPC/PathExecutor 测试，更新消息注释、README、区域说明和变更记录。
+- 验证：mas2027_nav_executor Release 构建通过；独立工程编译实际区域、适配器、PathExecutor、命令安全门、MpcSolver/qpOASES，加上提取当前 control_tick 的输入/发布器替身，3 个套件共 18 个专项用例全部通过。覆盖当前切线/弯道/重复点/零速/末端方向、MPC 原地对齐和位置跟踪、曲线前瞻、跨 ±pi 短转向、角速度/角加速度限制、求解输出积分和保持/限幅、普通路段无角度控制、失效和安全拒绝、MPC 求解失败时保留跟随，以及真实 MPC 驱动简化下位机角度伺服的闭环仿真。YAML 检查确认 MPC dt=0.05 与控制频率 20 Hz 一致、独立航向参数已删除；git diff --check 通过。未修改下位机、未刷写、未重启运行中的导航或实机通过。执行器既有 5 个删除的测试文件保持原样，主工程 BUILD_TESTING=OFF，专项测试独立运行。当前只观测 LIO 航向，无底盘对齐回执；下位机 12° 跟随死区未改，MINCO 居中仍是现有 ESDF 软代价效果。使用前重启导航、串口桥和 Foxglove bridge。
+
+## 2026-10-17 — 上位机适配既有 nav_gyro 遥控式 yaw 控制
+
+- 改动：最终仅保留上位机适配，新增下位机目标角转换、对齐门控、跟随 PID 死区改动均按用户要求撤回；保留用户已有 gimbal_gyro_nav_mode、NAV 校验、视觉/发射屏蔽和通信包。硬件确认为云台达妙 H7、底盘 DJI C。上位机新增 `common/control/gimbal_follow_controller.hpp`，按已有下位机 `target = auto_yaw_offset + small_yaw_ref * DEGREE_2_RAD` 接口工作：基于 LIO 的道路入口航向误差，以默认 1/s 增益、30 deg/s 限速逐步调整相对固定切换基准的位置指令，2° 死区内保持，不将对齐后的 ref 清零；位置限制 ±180°，不跨界回绕。区域准备至释放保持 follow_gimbal，LIO 航向误差在 5° 内持续 0.3 s 后放行 MPC/安全门允许的平移，超过 8° 重新等待。MPC/安全门刹停不单独清除有效跟随请求；无许可、无计划、过期输入或无效姿态清除跟随。普通路段 ROS w=4，特殊跟随 w=0，均不作为串口字段发送。RegionStatus 增加 gimbal_heading_error_deg/gimbal_heading_ready，表示 LIO 航向，非底盘回执。更新区域 YAML、消息注释、项目/执行器 README 与区域说明，新增控制专项用例；串口仍为 vx/vy/ref_deg/follow_gimbal 的 16 字节包。
+- 验证：interfaces、nav_serial_bridge、mas2027_nav_executor Release 构建通过；串口桥 CTest 2/2 套件通过。独立编译实际区域/跟随控制代码及从当前节点提取的 control_tick（用输入/发布器替身），8 个区域/控制用例和 3 个发布链路用例全部通过，覆盖遥控式指令限速/对齐后保持、未知下位机角度基准的简化闭环仿真、稳定计时/迟滞/限幅/失效复位，MPC 失败时保留跟随、未对齐零平移/对齐后放行、过期输入/撤销许可/无效姿态清除，以及普通路段恢复。YAML 解析、git diff --check 通过。下位机已按修改前快照逐文件校验回退，初始未修改的 gimbal_func.h 从 HEAD 恢复，原有 12° 跟随死区保留；回退后的两种云台板构建通过。未刷写、未重启运行中的导航节点、未实机联调；执行器已有 5 个删除的测试文件保持原状，主工程 BUILD_TESTING=OFF，专项测试独立运行。当前没有底盘相对角度/模式回传，LIO 航向稳定不能证明底盘误差也小于 5°。需重启上位机导航、串口桥及 Foxglove bridge，控制增益、提前距离和等待时间仍需实机验证。
+
+## 2026-10-17 — 小 yaw ref 改为角度制
+
+- 改动：`RegionController::smallYawRefDegrees` 保留 LIO yaw 输入和内部三角函数为 rad，将入口航向相对偏角转换为 deg 后由 `/nav_executor/chassis_cmd.small_yaw_ref` 发布；范围 [-180°, 180°]，逆时针为正。`nav_serial_bridge` 按 360° 归一化，不再对角度值执行弧度三角函数。同步 `ChassisCommand.msg`、两端接收/协议说明与有符号角度测试。下位机 `modules/NAV/module_nav.h` 的 ref 约定为 deg，float32 类型、follow_gimbal 和 16 字节帧布局/CRC 均不变；保留任务开始时已存在的 robot_control/robot_func 跟随控制修改，该路径的 gimbal_gyro_mode 已按角度制输入执行 DEGREE_2_RAD。本次不修改控制算法。
+- 验证：interfaces、nav_serial_bridge、mas2027_nav_executor Release 构建通过；串口桥 CTest 2/2 套件、区域 4/4 专项用例通过。实际 ROS→PTY 检查收到 251 帧，全部 16 字节且 CRC 正确，覆盖 ±30°、0°、±180°、270°/540° 归一化、跟随标志、非有限角度/速度、超时、恢复和退出。配套 damiao_h7/dji_c 的 sentry/gimbal Debug 构建通过；使用下位机实际接收结构与 CRC 验证 ±30° 字段值、偏移和坏 CRC。旧提取 nav_auto_func 的主机测试因工作区已有函数签名变化而无法编译，本次改用独立通信包检查，不宣称验证现有跟随控制逻辑。两端 git diff --check 通过。未刷写、未重启运行中的导航节点、未实机测试；执行器主工程仍因既有 5 个测试文件缺失使用 BUILD_TESTING=OFF，新增区域测试独立运行；固件 cppcheck 未安装。需同步更新上下位机角度单位并重启导航与 Foxglove bridge，不能与之前 rad 版本混用。
+
+## 2026-10-17 — 特殊地形前发送小 yaw ref 和 follow_gimbal 跟随请求
+
+- 改动：`third_party/interfaces/msg/navigation/ChassisCommand.msg` 增加 `float32 small_yaw_ref` 和 `bool follow_gimbal`，同一控制周期发布并交给 `nav_serial_bridge`。`RegionController` 从坡道/隧道/起伏路的 PREPARING 至 RELEASING 阶段使用区域入口向前的非零路径段方向，计算 `wrap(入口路径航向 - 当前 LIO yaw)`（rad，逆时针为正）。通过释放点后清除；新轨迹、语义刷新、无效计划/姿态或执行器控制拒绝时不保留旧请求。`follow_gimbal=1` 表示请求进入/保持跟随云台模式，0 表示无跟随请求，不是导航状态或完成回执。CDC1 下行改为 16 字节：`0xB5 + float32 vx + float32 vy + float32 small_yaw_ref + uint8 follow_gimbal + CRC16`，CRC 位于 14～15，覆盖前 14 字节；不恢复 w/nav_state/mode。桥在 300 ms 指令超时、速度无效或退出时清零速度与请求，ref 非有限值时仅清除跟随请求。配套修改 `D:/sentry/mas_embedded_threadx/modules/NAV/module_nav.h` 的接收结构为 13 字节，NAV 按 sizeof 自动接收新字段，当前不接入下位机云台或模式切换逻辑，保留之前下位机内部 +4 rad/s 自转逻辑。同步 README、启动注释与两端协议说明，新增区域角度测试。
+- 验证：interfaces、nav_serial_bridge、mas2027_nav_executor 的 Release 构建通过；串口桥 CTest 2/2 套件通过。新增区域测试以独立 CMake 工程编译实际 region_control/terrain_grid，4/4 用例通过，覆盖三类地形提前请求、所有区域阶段/释放、入口折点/重复点、相对角跨 ±π、无效 yaw/位置、撤销计划及在线语义刷新。隔离 ROS 域的实际串口桥 PTY 测试收到 206 帧，全部 16 字节且 CRC 正确，覆盖正/负/零 ref、follow_gimbal 清除、NaN/Inf ref、角度归一化、指令超时、无效速度、恢复与退出。下位机 sentry/gimbal 的 damiao_h7 和 dji_c Debug 构建通过；主机测试使用固件实际接收结构与 CRC 验证字段偏移/有符号 ref/标志，提取当前 nav_auto_func 验证原自转/离线/无效速度/手动行为。启动脚本 Python 编译、两端 git diff --check 通过。未连接实板、未刷写或测试实际对齐/跟随；下位机 cppcheck 未安装。既有 5 个被删除的执行器测试文件保持原状，执行器主工程以 BUILD_TESTING=OFF 构建，未运行缺失文件对应的整套测试。ROS 消息定义改变后需重启导航相关节点和 Foxglove bridge。
+
+## 2026-10-17 — 导航下发仅保留 vx/vy，角速度改由下位机生成
+
+- 改动：`mas2027_utils/nav_serial_bridge/include/nav_serial_bridge/protocol.hpp` 将 CDC1 下行从 16 字节缩为 11 字节：`0xB5 + float32 vx + float32 vy + CRC16`，移除 `w`、`nav_state`，CRC 位于偏移 9～10 并覆盖前 9 字节。桥只检查实际发送的 `vx/vy` 有限性，不再因 ROS 观测字段 `w` 无效而拒绝平移。上行裁判数据保持原格式。更新协议测试、启动注释、项目/执行器 README 与区域控制文档。配套修改 `D:/sentry/mas_embedded_threadx` 的 `NavReceivePacket` 为 8 字节、删除导航状态字段判断，自动模式在导航在线且 `vx/vy` 有效时由下位机固定输出 `+4 rad/s`，离线或输入无效时清零。
+- 验证：`nav_serial_bridge` Release 构建通过，CTest 2/2 套件通过；隔离 ROS 域的虚拟串口端到端检查收到 104 帧，全部为 11 字节且 CRC 正确，覆盖启动零速、ROS `w=NaN` 时有效平移、300 ms 指令超时停车、无效平移停车、恢复和退出零速帧。配套固件 sentry/gimbal 的达妙 H7 与 DJI C Debug 构建通过；主机测试使用固件实际 CRC 和接收结构，并提取当前 `nav_auto_func` 验证非零/零平移时固定自转、离线/NaN/Inf/空包停车与手动模式保持。两端 `git diff --check` 通过。未连接实板、未刷写固件或做实车收发/自转测试；固件 cppcheck 未安装，未运行该检查。上位机既有 5 个被删除的执行器测试文件保持原状，本次仅构建串口桥。
+
 ## 2026-10-16 — 角速度改为始终 +4 rad/s
 
 - 改动：`mas2027_nav_executor/src/nav_executor_node.cpp` 将每周期 `/cmd_vel.angular.z` 与 `/nav_executor/chassis_cmd.w` 固定为 `+4 rad/s`，移除行进正弦和到达目标后切换状态；`vx/vy` 仍按原有运动许可与安全检查输出。`nav_serial_bridge` 的 `protocol.hpp` 固定每个 CDC1 下行帧的 `w=+4 rad/s`、`nav_state=1`，包括无有效指令、超时及退出前最后一帧；这些情形仅清零 `vx/vy`。更新协议测试和项目、区域控制说明。

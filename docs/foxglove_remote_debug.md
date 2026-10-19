@@ -82,7 +82,7 @@ pkill -f foxglove_bridge
 
 ```bash
 ros2 launch foxglove_bridge foxglove_bridge_launch.xml address:=127.0.0.1 port:=8766 \
-  topic_whitelist:="['^/cloud_registered$','^/opt_path_vis$','^/Odometry$','^/tf.*']"
+  topic_whitelist:="['^/cloud_registered$','^/nav_executor/minco_path$','^/nav_executor/debug/minco_trajectory$','^/nav_executor/global_plan$','^/Odometry$','^/tf.*']"
 ```
 
 ## 3. 笔记本端
@@ -123,30 +123,45 @@ Foxglove → `Open connection` → 选 **Foxglove WebSocket** → 填 URL → `O
 
 ## 4. 面板配置
 
-3D 面板的 **Fixed frame 填 `map`**（TF 链是 `map → odom → base_link → lidar_link`，
-由 `tf_maintainer` 统一发布）。若 `map` 帧不存在，先查 TF，否则 3D 里基本没东西可看。
+3D 面板的 **Fixed frame 要按地图模式选**：当前 `node.map_source: online` 时填 `odom`
+（在线模式只发布 `odom → base_link → lidar_link`，没有 `map`）；切到 `prior` 模式时填 `map`
+（`map → odom → base_link → lidar_link`，由 `tf_maintainer` 统一发布）。Fixed frame 不存在时 3D 里基本没东西可看，先查 TF。
 
 | 面板类型 | Topic | 看什么 |
 |---|---|---|
-| TF | — | `map→odom→base_link` 是否通 |
+| TF | — | online 看 `odom→base_link`；prior 看 `map→odom→base_link` |
 | PointCloud2 | `/cloud_registered_full` | ROGMap 使用的完整配准点云；`/cloud_registered` 为相同内容的兼容话题 |
 | PointCloud2 | `/rog_map/occupied` | ROGMap 动态占据 |
 | PointCloud2 | `/rog_map/field` | 2D 距离场 |
 | MarkerArray | `/rog_map/terrain_markers` | 在线坡道（橙）/隧道（青）候选区域 |
 | OccupancyGrid | `/rog_map/terrain_label` | 在线地形原始标签：5=坡道、6=隧道 |
 | OccupancyGrid | `/cost_map`、`/planning_constraints` | 静态地形代价图 / 导航实际使用的静态约束图 |
-| Path | `/opt_path_vis` | 实际执行的轨迹 |
-| Path | `/nav_executor/global_plan` | 全局路径 |
+| Path | `/nav_executor/minco_path` | **当前 MINCO 局部轨迹** |
+| Marker | `/nav_executor/debug/minco_trajectory` | 同一局部轨迹的彩色线，按速度着色 |
+| Path | `/nav_executor/global_plan` | 全局搜索折线（默认 SMAC 2D，可配置 Astar） |
+| Marker | `/nav_executor/debug/global_plan` | 全局折线的粗线 + 目标点 |
+| Path | `/opt_path_vis` | 旧可视化入口，内容与当前局部轨迹对应 |
 | Path | `/backup_path_vis`、`/minco_candidate_path_vis` | 备份/候选轨迹 |
-| MarkerArray | `/nav_executor/debug/safe_corridor` | MINCO 安全走廊 |
+| MarkerArray | `/nav_executor/debug/safe_corridor` | 安全走廊 |
 | Marker | `/nav_executor/debug/dynamic_obstacles` | 当前帧动态障碍 |
 | Odometry | `/Odometry` | 位姿 |
 
+### 在 3D 面板查看轨迹
+
+连接机器人后，打开 Foxglove 的 **3D** 面板：
+
+1. online 模式 Fixed frame 选 `odom`，prior 模式选 `map`；
+2. 在 Topics 中启用 `Path` → `/nav_executor/minco_path`，这是当前局部轨迹；
+3. 需要按速度着色时，同时启用 `Marker` → `/nav_executor/debug/minco_trajectory`；
+4. 想看搜索折线时启用 `Path` → `/nav_executor/global_plan`，它与局部轨迹是两条线，不重合是正常的。
+
+`/opt_path` 是自定义 `interfaces/msg/MpcPositionCommand`，3D 面板不认；画线请用上面的 `Path` 话题。若话题存在但画面为空，先在机器人上执行 `ros2 topic echo /nav_executor/minco_path --once`，确认有 pose；再看 trajectory header 是否为 `odom`。
+
 ### 在 3D 面板查看在线坡道与隧道
 
-连接机器人后，打开 Foxglove 的 **3D** 面板，将 Fixed frame 设为 `map`；在面板的 Topics 列表中找到并开启 `/rog_map/terrain_markers`。橙色方块是 ROGMap 在线识别的坡道候选格，青色方块是隧道候选格。这个显示只包含在线识别，不包含人工地图标注。需要核对原始标签时，再在同一个 3D 面板开启 `/rog_map/terrain_label`（`5`=坡道、`6`=隧道）；普通 OccupancyGrid 配色不会像彩色标记那样醒目。
+连接机器人后，打开 Foxglove 的 **3D** 面板，将 Fixed frame 按模式设为 `odom`（online）或 `map`（prior）；在面板的 Topics 列表中找到并开启 `/rog_map/terrain_markers`。橙色方块是 ROGMap 在线识别的坡道候选格，青色方块是隧道候选格。这个显示只包含在线识别，不包含人工地图标注。需要核对原始标签时，再在同一个 3D 面板开启 `/rog_map/terrain_label`（`5`=坡道、`6`=隧道）；普通 OccupancyGrid 配色不会像彩色标记那样醒目。
 
-若彩色话题没有出现，在机器人上检查 `ros2 topic info /rog_map/terrain_markers --verbose`：应能看到 ROGMap 发布器和 Foxglove 连接后产生的订阅。若曾按本文“限流白名单”示例单独启动 bridge，要把 `^/rog_map/terrain_markers$` 加进白名单，否则 Foxglove 看不到该话题。话题可见但画面为空时，先确认 `/rog_map/terrain_label` 当前确实出现 `5/6`，并检查 `odom→map` TF；没有识别到特殊地形时不会显示色块。3D 面板支持 ROS 2 `visualization_msgs/msg/MarkerArray`，无需另装面板插件。
+若彩色话题没有出现，在机器人上检查 `ros2 topic info /rog_map/terrain_markers --verbose`：应能看到 ROGMap 发布器和 Foxglove 连接后产生的订阅。若曾按本文“限流白名单”示例单独启动 bridge，要把 `^/rog_map/terrain_markers$` 加进白名单，否则 Foxglove 看不到该话题。话题可见但画面为空时，先确认 `/rog_map/terrain_label` 当前确实出现 `5/6`，online 检查 `odom→base_link`、prior 检查 `map→odom`；没有识别到特殊地形时不会显示色块。3D 面板支持 ROS 2 `visualization_msgs/msg/MarkerArray`，无需另装面板插件。
 
 Plot 面板排查"慢/卡顿"最直观：`/cmd_vel` 的 `twist.linear.x` / `twist.angular.z`，
 `/Odometry` 的 `twist.twist.linear.x`。
@@ -194,8 +209,8 @@ HTTP 响应体是 `Missing expected sec-websocket-protocol header`（该字符�
 ### 5.4 自定义消息类型在 3D 面板里加不了
 
 `/opt_path`、`/backup_path` 是 `interfaces/msg/MpcPositionCommand`，3D 面板不认。
-要画线用 `_vis` 后缀的 `nav_msgs/Path`（`/opt_path_vis`、`/backup_path_vis`），
-要看数值用 Raw Messages 面板。
+要画线优先用 `/nav_executor/minco_path`、`/nav_executor/global_plan`（都是 `nav_msgs/Path`）；
+`/opt_path_vis`、`/backup_path_vis` 仍可作为兼容入口。要看数值用 Raw Messages 面板。
 
 ### 5.5 带宽
 

@@ -46,10 +46,10 @@ struct MPCConfig
 
   // 代价权重：Q(状态误差) / R(控制误差)
   // 状态采用 [x, y, yaw]，控制采用 [vx, vy, omega]
-  // Q_along/cross are rotated to align with the reference heading at each horizon step.
+  // Q_along/cross are rotated to align with the reference travel tangent.
   Eigen::Vector3d Q{5.0, 5.0, 2.0};
-  double q_along{3.0};   // weight along heading (lower → timing flexibility)
-  double q_cross{12.0};  // weight cross-track (higher → precision)
+  double q_along{3.0};   // weight along the reference travel tangent (lower → timing flexibility)
+  double q_cross{12.0};  // weight normal to the reference travel tangent (higher → precision)
   Eigen::Vector3d R{1.0, 1.0, 0.5};
 
   // 速度约束（作用在 map/global 速度变量上）

@@ -48,6 +48,10 @@ bool MpcSolver::buildCondensedQP(const State & curr,
   if (static_cast<int>(ref_traj.size()) < N) {
     return false;
   }
+  if (!std::isfinite(config_.q_along) || config_.q_along <= 0.0 ||
+    !std::isfinite(config_.q_cross) || config_.q_cross <= 0.0) {
+    return false;
+  }
 
   // 构建堆叠模型 X = A_hat x0 + B_hat U
   // 其中nx，nu 分别为单步状态与控制量维度，nX，nU 为堆叠后维度
@@ -112,24 +116,24 @@ bool MpcSolver::buildCondensedQP(const State & curr,
   }
 
   // Q_bar / R_bar (对角块)
-  // P1: Rotate Q at each horizon step to decompose tracking penalty
-  // into along-track (heading direction) and cross-track (perpendicular).
-  // Higher cross-track weight enforces precision on curves/narrow passages.
+  // Rotate Q into the trajectory tangent frame. Chassis yaw can differ from
+  // travel direction during ordinary spin or reverse gimbal following.
   Eigen::MatrixXd Q_bar = Eigen::MatrixXd::Zero(nX, nX);
   Eigen::MatrixXd R_bar = Eigen::MatrixXd::Zero(nU, nU);
   for (int i = 0; i < N; ++i) {
-    const double yaw_ref = ref_traj[i].yaw;
-    const double c = std::cos(yaw_ref);
-    const double s = std::sin(yaw_ref);
-    // Q_xy = R^T * diag(q_along, q_cross) * R  (R is 2D rotation by yaw_ref)
-    // R = [c, -s; s, c], so:
-    // Q_xy = [c*q_along*c + s*q_cross*s,   c*q_along*(-s) + s*q_cross*c;
-    //         (-s)*q_along*c + c*q_cross*s, (-s)*q_along*(-s) + c*q_cross*c]
+    const Eigen::Vector2d tangent = ref_traj[i].vel;
+    const double tangent_norm = tangent.norm();
+    // Below ~2 cm/s the reference direction is mostly numerical noise; rotating
+    // the tracking cost with it would make the along/cross axes chatter at stops.
+    const bool has_useful_tangent = std::isfinite(tangent_norm) && tangent_norm > 0.02;
+    const double c = has_useful_tangent ? tangent.x() / tangent_norm : std::cos(ref_traj[i].yaw);
+    const double s = has_useful_tangent ? tangent.y() / tangent_norm : std::sin(ref_traj[i].yaw);
+    // Q_xy = R * diag(q_along, q_cross) * R^T for R=[c,-s; s,c].
     const double qa = config_.q_along;
     const double qc = config_.q_cross;
     Q_bar(i * nx + 0, i * nx + 0) = qa * c * c + qc * s * s;
-    Q_bar(i * nx + 0, i * nx + 1) = (qc - qa) * c * s;
-    Q_bar(i * nx + 1, i * nx + 0) = (qc - qa) * c * s;
+    Q_bar(i * nx + 0, i * nx + 1) = (qa - qc) * c * s;
+    Q_bar(i * nx + 1, i * nx + 0) = (qa - qc) * c * s;
     Q_bar(i * nx + 1, i * nx + 1) = qa * s * s + qc * c * c;
     Q_bar(i * nx + 2, i * nx + 2) = config_.Q.z();  // yaw weight unchanged
 

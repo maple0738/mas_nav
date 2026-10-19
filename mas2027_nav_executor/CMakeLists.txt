@@ -71,7 +71,8 @@ add_library(${PROJECT_NAME}_planner STATIC
   "${minco_source_dir}/src/visualizer.cpp"
   "${minco_source_dir}/src/performance/planner_performance_monitor.cpp")
 target_include_directories(${PROJECT_NAME}_planner PUBLIC
-  "${minco_source_dir}/include" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  "${minco_source_dir}/include" "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/vendor")
 target_compile_definitions(${PROJECT_NAME}_planner PUBLIC
   ROOT_DIR="${minco_source_dir}/" ORIGIN_AT_CORNER USE_ROS2)
 ament_target_dependencies(${PROJECT_NAME}_planner
@@ -142,6 +143,54 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_region_online_priority
     geometry_msgs interfaces nav_msgs rclcpp sensor_msgs tf2 tf2_geometry_msgs tf2_ros)
   target_link_libraries(test_region_online_priority Eigen3::Eigen)
+  ament_add_gtest(test_replan_continuity test/test_replan_continuity.cpp)
+  target_include_directories(test_replan_continuity PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/minco/include>)
+  target_link_libraries(test_replan_continuity Eigen3::Eigen)
+  ament_add_gtest(test_mpc_gimbal_follow
+    test/test_mpc_gimbal_follow.cpp
+    src/path_executor/path_executor.cpp
+    src/path_executor/monitoring/command_safety.cpp
+    src/common/environment/terrain_grid.cpp)
+  target_include_directories(test_mpc_gimbal_follow PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  ament_target_dependencies(test_mpc_gimbal_follow
+    geometry_msgs interfaces nav_msgs rclcpp rog_map sensor_msgs tf2 tf2_geometry_msgs tf2_ros)
+  target_link_libraries(test_mpc_gimbal_follow ${PROJECT_NAME}_mpc Eigen3::Eigen)
+  ament_add_gtest(test_region_yaw_ref
+    test/test_region_yaw_ref.cpp
+    src/common/environment/region_control.cpp
+    src/common/environment/terrain_grid.cpp)
+  target_include_directories(test_region_yaw_ref PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  ament_target_dependencies(test_region_yaw_ref
+    geometry_msgs interfaces nav_msgs rclcpp sensor_msgs tf2 tf2_geometry_msgs tf2_ros)
+  target_link_libraries(test_region_yaw_ref Eigen3::Eigen)
+
+  ament_add_gtest(test_global_goal_cell_clearance
+    test/test_global_goal_cell_clearance.cpp)
+  target_include_directories(test_global_goal_cell_clearance PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/minco/include>)
+  ament_target_dependencies(test_global_goal_cell_clearance
+    geometry_msgs nav_msgs rclcpp rog_map tf2_ros)
+  target_link_libraries(test_global_goal_cell_clearance ${PROJECT_NAME}_planner Eigen3::Eigen)
+  ament_add_gtest(test_minco_two_stage
+    test/test_minco_two_stage.cpp)
+  target_include_directories(test_minco_two_stage PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/minco/include>)
+  ament_target_dependencies(test_minco_two_stage
+    nav_msgs rclcpp rog_map)
+  target_link_libraries(test_minco_two_stage ${PROJECT_NAME}_planner Eigen3::Eigen)
+  # 目标接近减速带：共享速度包络 + 弧长速度剖面（加减速能力分离）。
+  ament_add_gtest(test_goal_approach
+    test/test_goal_approach.cpp
+    src/path_planner/trajectory/arc_length_speed_profile.cpp)
+  target_include_directories(test_goal_approach PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  target_link_libraries(test_goal_approach Eigen3::Eigen)
 endif()
 
 ament_package()

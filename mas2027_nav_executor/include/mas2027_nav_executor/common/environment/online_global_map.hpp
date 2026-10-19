@@ -35,6 +35,7 @@ public:
   nav_msgs::msg::OccupancyGrid terrainGrid() const;
   sensor_msgs::msg::Image uphillImage() const;
   bool terrainTransition(double from_x, double from_y, double to_x, double to_y) const;
+  const std::vector<uint8_t> & slopeSideMask() const { return slope_side_mask_; }
   uint64_t revision() const { return revision_; }
   bool worldToMap(double x, double y, unsigned int & mx, unsigned int & my) const override;
   void mapToWorld(unsigned int mx, unsigned int my, double & x, double & y) const override;

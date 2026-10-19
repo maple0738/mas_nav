@@ -508,7 +508,11 @@ def run_measure(args, urdf):
         if not measured and not want_static:
             print("\n两条里程计话题都没数据，LIO 没起或者话题名不对。")
             return 1
-        joints.update(measured)
+        # analyze_spin_side returns the corrected xyz but deliberately keeps the
+        # URDF rpy. In --all mode do not let that overwrite the static measured
+        # roll/pitch; only xyz belongs to the spin stage.
+        for side, (xyz, _unused_rpy) in measured.items():
+            joints[side] = (xyz, joints[side][1])
 
     report(joints, urdf, gravity_by_side)
     if not want_spin:
@@ -533,6 +537,8 @@ def main():
                         help="只有一台 LIO 在跑时，指名 --odom-topic 是哪一台雷达的")
     parser.add_argument("--duration", type=float, default=40.0, help="--spin 采集时长（秒）")
     parser.add_argument("--tilt", type=float, help="跳过测量，直接算这个倾角（度）对应的参数")
+    parser.add_argument("--print-blind", choices=SIDES,
+                        help="只打印指定雷达当前 URDF 对应的 blind_center，供一键脚本启动左侧 LIO 使用")
     parser.add_argument("--chassis-pitch", type=float, default=0.0,
                         help="车体自身的俯仰（度），车头朝上为正，会从实测倾角里减掉")
     args = parser.parse_args()
@@ -542,6 +548,11 @@ def main():
     if missing:
         print("URDF 里没读到关节 %s，确认 %s" % ("、".join(missing), URDF_REL_PATH))
         return 1
+
+    if args.print_blind is not None:
+        bx, by, bz = blind_center(urdf[args.print_blind])
+        print("[%.6f,%.6f,%.6f]" % (bx, by, bz))
+        return 0
 
     if args.tilt is not None:
         tilt = math.radians(args.tilt)

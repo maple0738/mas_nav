@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <functional>
@@ -16,6 +17,7 @@
 #include "interfaces/msg/chassis_command.hpp"
 #include "interfaces/msg/region_status.hpp"
 #include "mas2027_nav_executor/common/environment/region_control.hpp"
+#include "mas2027_nav_executor/common/control/gimbal_follow_adapter.hpp"
 #include "mas2027_nav_executor/path_executor/mpc/mpc_solver.hpp"
 #include "mas2027_nav_executor/path_planner/path_planner.hpp"
 #include "mas2027_nav_executor/path_executor/path_executor.hpp"
@@ -36,6 +38,10 @@
 namespace mas2027_nav_executor {
 using minco_controller::MPCConfig;
 namespace {
+
+// Observation-only yaw-rate command outside gimbal-following mode. The CDC1
+// serial protocol does not carry w; the lower board owns the physical spin.
+constexpr double kNonFollowYawRateRadS = 2.0;
 
 std_msgs::msg::ColorRGBA velocity_color(
   const double velocity, const double minimum, const double maximum)
@@ -178,12 +184,81 @@ public:
     executor_params.planner_frequency = planner_frequency_;
     executor_params.trajectory_timeout_s = declare_parameter<double>("node.trajectory_timeout_s");
     executor_params.odom_timeout_s = declare_parameter<double>("node.odom_timeout_s", 0.5);
-    executor_params.rog_map_clearance = declare_parameter<double>("node.rog_map_clearance", 0.30);
+    // 与规划器发布前校验共用同一个硬净空，避免 node / planner 两份值漂移。
+    executor_params.rog_map_clearance =
+      declare_parameter<double>("planner.minco_optimizer.collision_dist", 0.28);
+    // ROGMap field.inflation_radius=0: every clearance is from base_link center.
+    // Corridor shaping may use a smaller radius; validate the hard clearance
+    // against the separately measured swept envelope of the square chassis.
+    const double corridor_radius = declare_parameter<double>("planner.corridor.robot_radius", 0.28);
+    const double swept_radius = declare_parameter<double>("planner.corridor.swept_radius", 0.302);
+    const double rotation_margin = declare_parameter<double>("planner.corridor.extra_margin", 0.05);
+    executor_params.swept_radius = swept_radius;
+    executor_params.rotation_margin = rotation_margin;
+    const bool allow_undersized_clearance = declare_parameter<bool>(
+      "planner.corridor.allow_undersized_clearance", false);
+    executor_params.narrow_passage_enable =
+      declare_parameter<bool>("planner.minco_optimizer.narrow_passage_enable", true);
+    executor_params.narrow_passage_clearance =
+      declare_parameter<double>("planner.minco_optimizer.narrow_passage_clearance", 0.24);
+    executor_params.narrow_passage_speed =
+      declare_parameter<double>("planner.minco_optimizer.narrow_passage_speed", 0.5);
+    executor_params.clearance_braking.deceleration =
+      declare_parameter<double>("planner.minco_optimizer.clearance_braking.deceleration", 1.2);
+    executor_params.clearance_braking.reaction_time =
+      declare_parameter<double>("planner.minco_optimizer.clearance_braking.reaction_time", 0.20);
+    executor_params.narrow_passage_alignment_enable =
+      declare_parameter<bool>("planner.minco_optimizer.narrow_passage_alignment_enable", true);
+    executor_params.narrow_passage_alignment_lookahead =
+      declare_parameter<double>("planner.minco_optimizer.narrow_passage_alignment_lookahead", 2.0);
+    executor_params.narrow_passage_alignment_hold_distance =
+      declare_parameter<double>("planner.minco_optimizer.narrow_passage_alignment_hold_distance", 2.0);
+    // 目标接近减速带：与规划侧共用同一组 YAML 键，保证"种子限速"和"参考限速"
+    // 用的是同一个实测刹车能力；deceleration<=0 表示关闭。
+    executor_params.goal_approach.deceleration =
+      declare_parameter<double>("planner.minco_optimizer.goal_approach.deceleration", 1.2);
+    executor_params.goal_approach.stop_margin =
+      declare_parameter<double>("planner.minco_optimizer.goal_approach.stop_margin", 0.30);
+    executor_params.goal_approach.min_speed =
+      declare_parameter<double>("planner.minco_optimizer.goal_approach.min_speed", 0.15);
+    executor_params.goal_approach.reaction_time =
+      declare_parameter<double>("planner.minco_optimizer.goal_approach.reaction_time", 0.20);
+    goal_approach_deceleration_ = executor_params.goal_approach.deceleration;
     executor_params.rog_map_timeout_s = declare_parameter<double>("node.rog_map_timeout_s", 0.5);
     executor_params.control_delay_s = declare_parameter<double>("mpc.control_delay_compensation");
+    executor_params.secondary_reference_enable =
+      declare_parameter<bool>("mpc.secondary_reference.enable", false);
+    executor_params.secondary_reference_angle_enable =
+      declare_parameter<bool>("mpc.secondary_reference.angle_enable", true);
+    executor_params.secondary_reference_narrow_enable =
+      declare_parameter<bool>("mpc.secondary_reference.narrow_enable", true);
+    executor_params.secondary_reference_angle_deg =
+      declare_parameter<double>("mpc.secondary_reference.angle_threshold_deg", 20.0);
+    executor_params.secondary_reference_min_time_scale =
+      declare_parameter<double>("mpc.secondary_reference.min_time_scale", 0.35);
+    executor_params.secondary_reference_narrow_time_scale =
+      declare_parameter<double>("mpc.secondary_reference.narrow_time_scale", 0.70);
     executor_params.deadzone_speed = declare_parameter<double>("mpc.deadzone_speed_threshold");
     executor_params.output_in_body_frame = declare_parameter<bool>("node.output_in_body_frame");
     executor_params.odom_frame = odom_frame_;
+    alignment_odom_timeout_s_ = executor_params.odom_timeout_s;
+    alignment_trajectory_timeout_s_ = executor_params.trajectory_timeout_s;
+    GimbalFollowParams follow_params;
+    follow_params.allow_reverse = declare_parameter<bool>("gimbal_follow.allow_reverse", true);
+    follow_params.reverse_switch_hysteresis_deg = declare_parameter<double>(
+      "gimbal_follow.reverse_switch_hysteresis_deg", 10.0);
+    follow_params.ready_tolerance_deg = declare_parameter<double>("gimbal_follow.ready_tolerance_deg", 5.0);
+    follow_params.ready_release_deg = declare_parameter<double>("gimbal_follow.ready_release_deg", 8.0);
+    follow_params.settle_time_s = declare_parameter<double>("gimbal_follow.settle_time_s", 0.3);
+    follow_params.heading_error_gain_s = declare_parameter<double>(
+      "gimbal_follow.heading_error_gain_s", 1.0);
+    follow_params.heading_deadband_deg = declare_parameter<double>(
+      "gimbal_follow.heading_deadband_deg", 0.5);
+    follow_params.max_heading_rate_deg_s = declare_parameter<double>(
+      "gimbal_follow.max_heading_rate_deg_s", 120.0);
+    gimbal_hold_enabled_ = declare_parameter<bool>(
+      "gimbal_follow.hold_last_alignment", true);
+    gimbal_follow_adapter_ = std::make_unique<GimbalFollowAdapter>(follow_params);
 
     // ── MPC 参数层：采样周期、预测时域、运动约束与代价权重。
     MPCConfig config;
@@ -211,24 +286,108 @@ public:
     }
     config.Q = Eigen::Vector3d(q[0], q[1], q[2]);
     config.R = Eigen::Vector3d(r[0], r[1], r[2]);
+    // State x/y remain supported as the legacy fallback when the explicit
+    // along/cross keys are absent. The current YAML sets both explicitly so the
+    // effective 3.0/12.0 behaviour is preserved and tunable.
+    config.q_along = declare_parameter<double>("mpc.weights.along", q[0]);
+    config.q_cross = declare_parameter<double>("mpc.weights.cross", q[1]);
+    if (!std::isfinite(config.q_along) || config.q_along <= 0.0 ||
+      !std::isfinite(config.q_cross) || config.q_cross <= 0.0) {
+      throw std::invalid_argument("mpc.weights.along/cross must be finite and positive");
+    }
 
     // ── 区域执行层：普通能力作为基线；特殊区域命中后平滑切换 mode 和运动限制。
     region_controller_ = std::make_unique<RegionController>(
       static_cast<uint8_t>(normal_mode), normal_max_speed, normal_max_acceleration,
       speed_blend_rate, acceleration_blend_rate);
 
+    if (executor_params.narrow_passage_enable &&
+      std::isfinite(swept_radius) && swept_radius > 0.0 &&
+      std::isfinite(executor_params.narrow_passage_clearance) &&
+      executor_params.narrow_passage_clearance < swept_radius + rotation_margin &&
+      !allow_undersized_clearance) {
+      throw std::invalid_argument(
+        "planner.minco_optimizer.narrow_passage_clearance=" +
+        std::to_string(executor_params.narrow_passage_clearance) +
+        " m must be >= planner.corridor.swept_radius=" +
+        std::to_string(swept_radius) + " m + rotation margin=" +
+        std::to_string(rotation_margin) + " m");
+    }
     if (control_rate_hz_ <= 0.0 || planner_frequency_ <= 0.0 || config.dt <= 0.0 ||
+      !std::isfinite(executor_params.trajectory_timeout_s) || executor_params.trajectory_timeout_s <= 0.0 ||
       !std::isfinite(executor_params.odom_timeout_s) || executor_params.odom_timeout_s <= 0.0 ||
       !std::isfinite(executor_params.rog_map_timeout_s) || executor_params.rog_map_timeout_s <= 0.0 ||
-      !std::isfinite(executor_params.rog_map_clearance) || executor_params.rog_map_clearance < 0.0) {
+      !std::isfinite(executor_params.rog_map_clearance) || executor_params.rog_map_clearance < 0.0 ||
+      !std::isfinite(corridor_radius) || corridor_radius <= 0.0 ||
+      !std::isfinite(swept_radius) || swept_radius <= 0.0 ||
+      !std::isfinite(rotation_margin) || rotation_margin < 0.0 ||
+      swept_radius < corridor_radius ||
+      (!allow_undersized_clearance &&
+       effectiveClearanceThreshold(executor_params.rog_map_clearance) <
+         swept_radius + rotation_margin) ||
+      !std::isfinite(executor_params.narrow_passage_speed) ||
+      executor_params.narrow_passage_speed <= 0.0 ||
+      !std::isfinite(executor_params.clearance_braking.deceleration) ||
+      !std::isfinite(executor_params.clearance_braking.reaction_time) ||
+      executor_params.clearance_braking.reaction_time < 0.0 ||
+      (executor_params.narrow_passage_enable &&
+       (!std::isfinite(executor_params.narrow_passage_clearance) ||
+        executor_params.narrow_passage_clearance <= 0.0 ||
+        executor_params.narrow_passage_clearance >= executor_params.rog_map_clearance)) ||
+      (executor_params.narrow_passage_alignment_enable &&
+       (!std::isfinite(executor_params.narrow_passage_alignment_lookahead) ||
+        executor_params.narrow_passage_alignment_lookahead <= 0.0 ||
+        !std::isfinite(executor_params.narrow_passage_alignment_hold_distance) ||
+        executor_params.narrow_passage_alignment_hold_distance < 0.0)) ||
+      (executor_params.goal_approach.deceleration > 0.0 &&
+       !executor_params.goal_approach.valid()) ||
+      (executor_params.secondary_reference_enable &&
+       (!std::isfinite(executor_params.secondary_reference_angle_deg) ||
+        executor_params.secondary_reference_angle_deg <= 0.0 ||
+        executor_params.secondary_reference_angle_deg >= 90.0 ||
+        !std::isfinite(executor_params.secondary_reference_min_time_scale) ||
+        executor_params.secondary_reference_min_time_scale <= 0.0 ||
+        executor_params.secondary_reference_min_time_scale > 1.0 ||
+        !std::isfinite(executor_params.secondary_reference_narrow_time_scale) ||
+        executor_params.secondary_reference_narrow_time_scale <= 0.0 ||
+        executor_params.secondary_reference_narrow_time_scale > 1.0))) {
       throw std::invalid_argument(
-        "control_rate_hz, planner_frequency, dt, odom_timeout_s and rog_map_timeout_s "
-        "must be positive");
+        "Invalid control timing, clearance, body radius, braking, or secondary reference parameters; "
+        "effective clearance must be at least swept radius + rotation margin unless "
+        "planner.corridor.allow_undersized_clearance is true");
+    }
+    if (executor_params.secondary_reference_enable &&
+      executor_params.secondary_reference_narrow_time_scale <
+      executor_params.secondary_reference_min_time_scale) {
+      throw std::invalid_argument(
+        "mpc.secondary_reference.narrow_time_scale must be >= min_time_scale");
+    }
+    if (allow_undersized_clearance) {
+      RCLCPP_WARN(get_logger(),
+        "Clearance experiment: effective=%.3f m narrow=%.3f m swept_radius=%.3f m "
+        "(effective-radius=%+.3f m narrow-radius=%+.3f m); "
+        "aligned square half-width=%.3f m",
+        effectiveClearanceThreshold(executor_params.rog_map_clearance),
+        executor_params.narrow_passage_clearance, swept_radius,
+        effectiveClearanceThreshold(executor_params.rog_map_clearance) - swept_radius,
+        executor_params.narrow_passage_clearance - swept_radius,
+        swept_radius / std::sqrt(2.0));
     }
     if (!std::isfinite(velocity_color_min_) || !std::isfinite(velocity_color_max_) ||
       velocity_color_min_ >= velocity_color_max_) {
       throw std::invalid_argument("visualization velocity color range must be finite and ordered");
     }
+    RCLCPP_INFO(get_logger(),
+      "Clearance policy: corridor_radius=%.3f m swept_radius=%.3f m regular=%.2f m narrow=%.3f m "
+      "brake_decel=%.2f m/s^2 reaction=%.2f s geometric_alignment=%s align_hold=%.2f m",
+      corridor_radius, swept_radius,
+      effectiveClearanceThreshold(executor_params.rog_map_clearance),
+      executor_params.narrow_passage_enable ? executor_params.narrow_passage_clearance :
+      effectiveClearanceThreshold(executor_params.rog_map_clearance),
+      executor_params.clearance_braking.deceleration,
+      executor_params.clearance_braking.reaction_time,
+      executor_params.narrow_passage_alignment_enable ? "on" : "off",
+      executor_params.narrow_passage_alignment_hold_distance);
 
     // ── 地图与规划层：TerrainGrid 管静态语义地图；PathPlanner 管全局搜索、MINCO 和在线 ROGMap。
     if (!online_only) terrain_grid_ = std::make_shared<TerrainGrid>();
@@ -310,7 +469,7 @@ public:
       goal_topic_, rclcpp::QoS(1),
       [this](const geometry_msgs::msg::PoseStamped::SharedPtr goal) { accept_goal(goal); });
 
-    // ── 实时命令输出层：/cmd_vel 用于 ROS 速度接口；ChassisCommand 将 vx/vy/w/mode 同周期交给底盘桥。
+    // ── 实时命令输出层：/cmd_vel 用于 ROS 速度接口；ChassisCommand 将 vx/vy/mode 同周期交给底盘桥。
     command_pub_ = create_publisher<geometry_msgs::msg::Twist>(output_topic_, rclcpp::QoS(1));
     chassis_command_pub_ = create_publisher<interfaces::msg::ChassisCommand>(
       chassis_cmd_topic_, rclcpp::QoS(1));
@@ -568,7 +727,18 @@ private:
     } else if (!terrain_grid_) {
       auto annotated = annotateOnlineRegions(*trajectory, *tf_buffer_, region_rules_,
         odom_frame_, online_current ? online_labels.get() : nullptr);
-      // Conflicting semantic mode windows hold this trajectory until a valid plan arrives.
+      if (!annotated && online_current) {
+        // Conflicting online mode windows must not stop ordinary driving. Retry
+        // without semantic labels so the trajectory gets a normal, segment-free
+        // plan; the next replan will try the live labels again.
+        annotated = annotateOnlineRegions(*trajectory, *tf_buffer_, region_rules_,
+          odom_frame_, nullptr);
+        online_applied = false;
+        if (annotated) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+            "Conflicting online terrain labels; using normal region profile for this trajectory");
+        }
+      }
       if (annotated) plan = std::make_shared<RegionPlan>(std::move(*annotated));
     }
     {
@@ -612,18 +782,146 @@ private:
     region_controller_->tickProfile(1.0 / control_rate_hz_);
     input.region_speed_limit = region_controller_->speedLimit();
     input.region_acceleration_limit = region_controller_->accelerationLimit();
+    if (input.odom &&
+      std::abs((input.stamp - rclcpp::Time(input.odom->header.stamp)).seconds()) <=
+      alignment_odom_timeout_s_ &&
+      std::isfinite(input.odom->pose.pose.position.x) &&
+      std::isfinite(input.odom->pose.pose.position.y)) {
+      path_executor_->updateNarrowPassageAlignmentPose(
+        input.odom->pose.pose.position.x, input.odom->pose.pose.position.y);
+    }
+    if (!path_planner_->hasActiveGoal() &&
+        path_executor_->releaseNarrowPassageAlignmentAtGoal()) {
+      RCLCPP_INFO(get_logger(),
+        "Narrow alignment completed at goal after %.2f m of odometry travel",
+        path_executor_->narrowPassageAlignmentTraveled());
+    }
 
+    std::optional<double> heading_error;
+    bool semantic_alignment = false;
+    // Follow a valid road heading even while the MPC or collision gate brakes translation.
+    // The lower board interprets yaw as a position offset from auto_yaw_offset, not a live LIO error.
+    if (input.allow_motion && input.odom && input.trajectory && !input.trajectory->cmds.empty() &&
+      std::abs((input.stamp - rclcpp::Time(input.odom->header.stamp)).seconds()) <= alignment_odom_timeout_s_ &&
+      std::abs((input.stamp - rclcpp::Time(input.trajectory->header.stamp)).seconds()) <= alignment_trajectory_timeout_s_) {
+      const auto & q = input.odom->pose.pose.orientation;
+      const double norm_squared = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+      if (std::isfinite(norm_squared) && norm_squared > 1e-12 &&
+        std::isfinite(input.odom->pose.pose.position.x) &&
+        std::isfinite(input.odom->pose.pose.position.y)) {
+        const double lio_yaw = tf2::getYaw(q);
+        heading_error = region_controller_->trajectoryHeadingErrorDegrees(lio_yaw);
+        semantic_alignment = heading_error.has_value();
+        if (!heading_error) {
+          // 5.5.5.4.4: narrowness is a geometric property, not a terrain label.
+          // Align the chassis to the first low-clearance trajectory tangent
+          // before the body reaches the corridor mouth; translation continues
+          // at the executor's narrow speed cap while the lower board rotates.
+          heading_error = path_executor_->narrowPassageHeadingErrorDegrees(
+            *input.trajectory, input.odom->pose.pose.position.x,
+            input.odom->pose.pose.position.y, lio_yaw);
+        }
+      }
+    }
+    bool odom_pose_current = false;
+    if (input.odom &&
+      std::abs((input.stamp - rclcpp::Time(input.odom->header.stamp)).seconds()) <=
+      alignment_odom_timeout_s_) {
+      const auto & q = input.odom->pose.pose.orientation;
+      const double norm_squared = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+      odom_pose_current = std::isfinite(norm_squared) && norm_squared > 1e-12 &&
+        std::isfinite(input.odom->pose.pose.position.x) &&
+        std::isfinite(input.odom->pose.pose.position.y);
+    }
+    // A planner retry gap must not hand the chassis back to its free-spin mode.
+    // The lower board keeps the gimbal target relative to auto_yaw_offset; if we
+    // clear follow and ref=0 between trajectories, the chassis spins while the
+    // next trajectory is searched and the next translation command can end up in
+    // the opposite direction. Hold the last valid angle with zero translation
+    // until the same active goal yields another trajectory (or is finished).
+    const bool hold_gimbal_alignment = !heading_error &&
+      gimbal_follow_adapter_->hasCommand() &&
+      (path_executor_->narrowPassageAlignmentActive() ||
+       (gimbal_hold_enabled_ && input.trajectory && !input.allow_motion &&
+        odom_pose_current && path_planner_->hasActiveGoal()));
+    const auto follow = hold_gimbal_alignment ?
+      gimbal_follow_adapter_->hold() :
+      gimbal_follow_adapter_->updateHeading(heading_error, 1.0 / control_rate_hz_);
+    input.follow_gimbal = follow.follow_gimbal;
+    input.reverse_follow_heading = follow.reverse_heading;
+    // The aligned square can translate through a slot narrower than its
+    // rotating envelope. Wait for measured heading before entering it.
+    input.hold_translation = follow.follow_gimbal && !follow.heading_ready &&
+      (semantic_alignment || path_executor_->narrowPassageAlignmentActive());
+    if (heading_error) {
+      input.alignment_heading_odom = tf2::getYaw(input.odom->pose.pose.orientation) +
+        follow.heading_error_deg * (3.14159265358979323846 / 180.0);
+    }
     ExecutorOutput output = path_executor_->computeCommand(input);
-    // Keep chassis yaw at +4 rad/s even when translation is stopped.
-    output.command.angular.z = 4.0;
+    if (output.secondary_reference_applied) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Secondary MPC reference: max_angle=%.1f deg min_scale=%.2f narrow=%s solve=%s %.2f ms",
+        output.secondary_reference_max_angle_deg,
+        output.secondary_reference_min_time_scale,
+        output.secondary_reference_narrow ? "true" : "false",
+        output.secondary_reference_solve_ok ? "ok" : "fallback",
+        output.secondary_reference_solve_ms);
+    }
+    if (output.goal_approach_capped) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Goal-approach speed cap: remaining=%.2f m allowed=%.2f m/s (decel=%.2f m/s^2)",
+        output.goal_approach_remaining_m,
+        output.goal_approach_allowed_speed,
+        goal_approach_deceleration_);
+    }
+    if (output.clearance_braking_capped) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Clearance braking cap: ESDF=%.2f m allowed=%.2f m/s",
+        output.clearance_braking_distance_m,
+        output.clearance_braking_allowed_speed);
+    }
+    const double mpc_omega = output.status == ExecutorStatus::PUBLISHED ? output.command.angular.z : 0.0;
+    const double ref_angle_deg = hold_gimbal_alignment ?
+      gimbal_follow_adapter_->commandDegrees() :
+      gimbal_follow_adapter_->integrateMpcYawRate(mpc_omega, 1.0 / control_rate_hz_);
+    if (input.hold_translation) {
+      output.command.linear.x = 0.0;
+      output.command.linear.y = 0.0;
+    }
+    // When following (or holding the last alignment), the lower PID owns
+    // rotation; otherwise publish +2 rad/s for observation only. The bridge
+    // does not receive a yaw rate.
+    if (hold_gimbal_alignment) {
+      output.command.linear.x = 0.0;
+      output.command.linear.y = 0.0;
+      output.command.angular.z = 0.0;
+    } else if (!follow.follow_gimbal) {
+      output.command.angular.z = kNonFollowYawRateRadS;
+    }
     command_pub_->publish(output.command);
     interfaces::msg::ChassisCommand chassis_command;
     chassis_command.header.stamp = input.stamp;
     chassis_command.header.frame_id = "base_link";
     chassis_command.vx = static_cast<float>(output.command.linear.x);
     chassis_command.vy = static_cast<float>(output.command.linear.y);
-    chassis_command.w = static_cast<float>(output.command.angular.z);
     chassis_command.mode = region_controller_->mode();
+    chassis_command.small_yaw_ref = static_cast<float>(ref_angle_deg);
+    chassis_command.follow_gimbal = follow.follow_gimbal;
+    if (!has_follow_gimbal_state_ || chassis_command.follow_gimbal != last_follow_gimbal_) {
+      RCLCPP_INFO(get_logger(),
+        "Chassis alignment transition: follow=%s geometric=%s traveled=%.2f m "
+        "hold=%s heading=%s allow_motion=%s active_goal=%s odom_current=%s",
+        chassis_command.follow_gimbal ? "true" : "false",
+        path_executor_->narrowPassageAlignmentActive() ? "true" : "false",
+        path_executor_->narrowPassageAlignmentTraveled(),
+        hold_gimbal_alignment ? "true" : "false",
+        heading_error ? "true" : "false",
+        input.allow_motion ? "true" : "false",
+        path_planner_->hasActiveGoal() ? "true" : "false",
+        odom_pose_current ? "true" : "false");
+      last_follow_gimbal_ = chassis_command.follow_gimbal;
+      has_follow_gimbal_state_ = true;
+    }
     chassis_command_pub_->publish(chassis_command);
     interfaces::msg::RegionStatus region_status;
     region_status.header.stamp = input.stamp;
@@ -634,7 +932,35 @@ private:
     region_status.phase = static_cast<uint8_t>(region_controller_->phase());
     region_status.path_progress = static_cast<float>(region_controller_->progress());
     region_status.speed_limit = static_cast<float>(region_controller_->speedLimit());
+    region_status.gimbal_heading_error_deg = static_cast<float>(follow.heading_error_deg);
+    region_status.gimbal_heading_ready = follow.heading_ready;
     region_status_pub_->publish(region_status);
+    if (!has_region_status_ || region_status.terrain_label != last_region_label_ ||
+      region_status.mode != last_region_mode_) {
+      const double x = input.odom ? input.odom->pose.pose.position.x : 0.0;
+      const double y = input.odom ? input.odom->pose.pose.position.y : 0.0;
+      RCLCPP_INFO(get_logger(),
+        "Region status transition: label=%u mode=%u phase=%u online=%s "
+        "position=(%.2f, %.2f) progress=%.2f m speed_limit=%.2f m/s",
+        static_cast<unsigned int>(region_status.terrain_label),
+        static_cast<unsigned int>(region_status.mode),
+        static_cast<unsigned int>(region_status.phase),
+        online_plan_active_ ? "true" : "false", x, y,
+        static_cast<double>(region_status.path_progress),
+        static_cast<double>(region_status.speed_limit));
+      last_region_label_ = region_status.terrain_label;
+      last_region_mode_ = region_status.mode;
+      has_region_status_ = true;
+    }
+    if (follow.follow_gimbal && std::abs(follow.heading_error_deg) > 5.0) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Gimbal axis not aligned: error=%.1f deg ref=%.1f deg reverse=%s",
+        follow.heading_error_deg, ref_angle_deg, follow.reverse_heading ? "true" : "false");
+    } else if (hold_gimbal_alignment) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Holding gimbal alignment ref=%.1f deg with zero translation while the "
+        "active goal waits for a new trajectory", ref_angle_deg);
+    }
     if (output.status == ExecutorStatus::REFERENCE_FAILED) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
         "Braking: trajectory cannot be expressed in %s", odom_frame_.c_str());
@@ -659,10 +985,21 @@ private:
   std::shared_ptr<TerrainGrid> terrain_grid_;
   std::array<RegionRule, 3> region_rules_{};
   std::unique_ptr<RegionController> region_controller_;
+  std::unique_ptr<GimbalFollowAdapter> gimbal_follow_adapter_;
+  bool gimbal_hold_enabled_{true};
+  bool last_follow_gimbal_{false};
+  bool has_follow_gimbal_state_{false};
+  double alignment_odom_timeout_s_{};
+  double alignment_trajectory_timeout_s_{};
+  /// 目标接近减速带用的实测刹车能力（<=0 表示关闭），仅用于节流日志。
+  double goal_approach_deceleration_{0.0};
   std::shared_ptr<const RegionPlan> region_plan_;
   double online_label_timeout_s_{0.8};
   bool online_plan_active_{false};
   double online_terrain_labels_received_s_{0.0};
+  uint8_t last_region_label_{255U};
+  uint8_t last_region_mode_{255U};
+  bool has_region_status_{false};
   bool persistent_online_terrain_{false};
   nav_msgs::msg::OccupancyGrid::ConstSharedPtr online_terrain_labels_;
   // 地图输入接口层：静态代价和 label 地图；动态 ROGMap 由 PathPlanner 内部维护。

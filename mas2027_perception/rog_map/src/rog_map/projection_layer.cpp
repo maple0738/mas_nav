@@ -95,6 +95,12 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const
   constexpr double kMinSlope = 0.14;  // tan(8 degrees)
   constexpr double kMaxSlope = 0.70;  // tan(35 degrees)
   constexpr double kMaxPlaneRms = 0.04;
+  // A single raised thin surface can still leave the plane RMS below 4 cm
+  // because it is one sample among many. Reject it by its residual instead;
+  // otherwise a table/box top tilts a flat-ground plane into a false slope.
+  // The actual field run had 10--16 cm raised samples in an otherwise flat
+  // 0.55 m window, including one confirmed false mode-5 region.
+  constexpr double kMaxPlaneResidual = 0.05;
   const size_t count = static_cast<size_t>(width_) * static_cast<size_t>(height_);
   TerrainGeometry geometry;
   auto & labels = geometry.labels;
@@ -110,12 +116,31 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const
       cell.raw_reason == ProjectionClassReason::THIN_SURFACE &&
       std::isfinite(cell.occupied_z_min_abs);
   };
-  const auto tunnelCandidate = [](const CellData & cell) {
-    return std::isfinite(cell.occupied_z_min_abs) &&
+  const auto & tunnel_config = current_config_;
+  const auto tunnelCandidate = [&tunnel_config](const CellData & cell) {
+    // Keep the semantic label tied to the same passability decision as the
+    // projection layer. A tall occupied column is not a tunnel merely because
+    // its sparse returns happen to have a large vertical gap.
+    const double height_delta = static_cast<double>(cell.height_delta);
+    return cell.type == CellType::PASSABLE &&
+      cell.raw_reason == ProjectionClassReason::HOLLOW_TUNNEL &&
+      std::isfinite(cell.occupied_z_min_abs) &&
       std::isfinite(cell.occupied_z_max_abs) &&
-      cell.height_delta >= 0.6f && cell.height_delta <= 1.8f &&
-      cell.vertical_occupancy_ratio <= 0.45f && cell.free_gap_ratio >= 0.5f;
+      height_delta >= tunnel_config.tunnel_height_delta_min &&
+      height_delta <= tunnel_config.tunnel_height_delta_max &&
+      static_cast<double>(cell.vertical_occupancy_ratio) <=
+        tunnel_config.tunnel_occupancy_ratio_max &&
+      cell.free_gap_ratio >= 0.5f;
   };
+
+  struct PlaneSample
+  {
+    double x;
+    double y;
+    double z;
+  };
+  std::vector<PlaneSample> plane_samples;
+  plane_samples.reserve((2 * kRadius + 1) * (2 * kRadius + 1));
 
   for (int y = 0; y < height_; ++y) {
     for (int x = 0; x < width_; ++x) {
@@ -157,7 +182,7 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const
       double sum_x = 0.0, sum_y = 0.0, sum_z = 0.0;
       double sum_xx = 0.0, sum_xy = 0.0, sum_yy = 0.0;
       double sum_xz = 0.0, sum_yz = 0.0, sum_zz = 0.0;
-      int samples = 0;
+      plane_samples.clear();
       float lowest = center.occupied_z_min_abs;
       float highest = lowest;
       for (int dy = -kRadius; dy <= kRadius; ++dy) {
@@ -181,9 +206,10 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const
           sum_zz += z * z;
           lowest = std::min(lowest, neighbor.occupied_z_min_abs);
           highest = std::max(highest, neighbor.occupied_z_min_abs);
-          ++samples;
+          plane_samples.push_back({px, py, z});
         }
       }
+      const int samples = static_cast<int>(plane_samples.size());
       if (samples < 30 || highest - lowest < 0.06f) continue;
       Eigen::Matrix3d normal;
       normal << sum_xx, sum_xy, sum_x,
@@ -195,7 +221,13 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const
       const double slope = plane.head<2>().norm();
       if (!plane.allFinite() || slope < kMinSlope || slope > kMaxSlope) continue;
       const double squared_error = std::max(0.0, sum_zz - plane.dot(rhs));
-      if (std::sqrt(squared_error / samples) <= kMaxPlaneRms) {
+      double max_residual = 0.0;
+      for (const auto & sample : plane_samples) {
+        max_residual = std::max(max_residual, std::abs(sample.z -
+          (plane.x() * sample.x + plane.y() * sample.y + plane.z())));
+      }
+      if (std::sqrt(squared_error / samples) <= kMaxPlaneRms &&
+          max_residual <= kMaxPlaneResidual) {
         labels[index] = kSlope;
         geometry.uphill_x[index] = static_cast<float>(plane.x() / slope);
         geometry.uphill_y[index] = static_cast<float>(plane.y() / slope);

@@ -79,6 +79,11 @@ struct RuntimeStats
   double projection_ambiguous_occupied_count{0.0};
   double projection_empty_column_count{0.0};
   double projection_insufficient_observation_count{0.0};
+  // Counts from ProjectionLayer::terrainGeometry(), not projection classification.
+  // They expose whether online terrain labels are being generated over flat ground.
+  double terrain_label_flat_count{0.0};
+  double terrain_label_slope_count{0.0};
+  double terrain_label_tunnel_count{0.0};
   std::string projection_refresh_reason{"none"};
   double layer_mask_changed{0.0};
   double mask_sequence{0.0};

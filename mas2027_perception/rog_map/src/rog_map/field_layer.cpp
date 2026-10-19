@@ -203,8 +203,9 @@ void DynamicLayer::evaluate(const Eigen::Vector3d & pos, double & dist, Eigen::V
     return;
   }
 
-  const double px = (pos.x() - origin_.x()) / resolution_;
-  const double py = (pos.y() - origin_.y()) / resolution_;
+  // EDT values are stored at cell centers, not at the grid origin corners.
+  const double px = (pos.x() - origin_.x()) / resolution_ - 0.5;
+  const double py = (pos.y() - origin_.y()) / resolution_ - 0.5;
   const int ix = static_cast<int>(std::floor(px));
   const int iy = static_cast<int>(std::floor(py));
   if (ix < 0 || iy < 0 || ix >= width_ - 1 || iy >= height_ - 1) {

@@ -4,14 +4,27 @@
       dt: 0.05
       lookahead_time: 2.0
       control_delay_compensation: 0.05
+      # 首次 MPC 预测与 MINCO 切线偏差较大时，按速度夹角放慢第二次参考推进。
+      # 本轮仅验证角度分支；窄道分支保持关闭。QP 约束及净空门不变。
+      secondary_reference:
+        enable: true
+        angle_enable: true
+        narrow_enable: false
+        angle_threshold_deg: 20.0
+        min_time_scale: 0.35
+        narrow_time_scale: 0.70
       # 线速度死区：低于该值时 path_executor 只发角速度、把线速度清零
       # （path_executor.cpp 中 hypot(vx,vy) < deadzone_speed 则不写线速度）。
       # 0.1 m/s 会让低速段「给一点速度就被清掉」，表现为起步顿挫、贴障时挪不动；
       # 降到 0.02 保留消抖作用，同时让车能平滑起步与缓行。
       deadzone_speed_threshold: 0.02
       weights:
+        # state[2] 是 yaw 权重；state[0]/[1] 仅在未配置下面的 along/cross 时
+        # 作为回退。当前显式写 along/cross，实际生效值为 3.0/12.0。
         state: [3.0, 3.0, 2.0]
         command: [1.5, 1.5, 1.0]
+        along: 3.0
+        cross: 12.0
       constraints:
         velocity:
           x: {min: -4.0, max: 4.0}
@@ -19,6 +32,10 @@
           omega: {min: -2.0, max: 2.0}
         acceleration:
           enable: true
-          x: {min: -5.0, max: 5.0}
-          y: {min: -5.0, max: 5.0}
+          # 加速与减速分开标定：加速仍用 5.0，但底盘实测只能提供约
+          # 1.4–2.6 m/s² 的减速度（20261018_194203 bag）。原先 x/y 的 min 也是
+          # -5.0，QP 认为刹车很便宜，最后一个控制周期才收速，实车必然过冲。
+          # -2.0 取实测区间上沿；想更保守就调到 -1.5。
+          x: {min: -2.0, max: 5.0}
+          y: {min: -2.0, max: 5.0}
           omega: {min: -4.0, max: 4.0}

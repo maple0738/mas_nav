@@ -89,6 +89,8 @@ public:
   double progress() const { return progress_; }
   std::optional<uint8_t> label() const { return label_; }
   RegionPhase phase() const { return phase_; }
+  // Current forward trajectory tangent minus LIO yaw; output degrees [-180, 180].
+  std::optional<double> trajectoryHeadingErrorDegrees(double lio_yaw_rad) const;
 
 private:
   uint8_t normal_mode_{};
@@ -106,6 +108,7 @@ private:
   RegionPhase phase_{RegionPhase::NORMAL};
   std::shared_ptr<const RegionPlan> plan_;
   std::optional<size_t> held_segment_;
+  std::optional<size_t> alignment_segment_;
   std::optional<Eigen::Vector2d> last_position_odom_;
 };
 

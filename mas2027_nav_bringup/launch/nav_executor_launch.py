@@ -183,7 +183,9 @@ def _launch_setup(context):
         output="screen",
         emulate_tty=True,
         condition=IfCondition(use_nav_serial),
-        parameters=[{"device": nav_serial_device}],
+        parameters=[{
+            "device": nav_serial_device,
+        }],
     )
     rviz = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(launch_dir, "rviz_launch.py")),
@@ -225,7 +227,7 @@ def generate_launch_description():
         DeclareLaunchArgument("use_sim_time", default_value="False"),
         # RViz 默认关闭，需要图形窗口时显式传 use_rviz:=True。
         DeclareLaunchArgument("use_rviz", default_value="false"),
-        # CDC1 直接发送 vx/vy/w/nav_state；该固件协议没有 mode 字段。
+        # CDC1 发送 vx/vy、小 yaw ref 和 follow_gimbal 跟随模式请求；底盘角速度由下位机生成。
         # 只观察导航时用 use_nav_serial:=False 关掉硬件输出。
         DeclareLaunchArgument("use_nav_serial", default_value="True"),
         DeclareLaunchArgument(

@@ -46,6 +46,9 @@ struct LocalPathSeed
   bool used_dynamic_detour{false};
   // 原路径只有净空不足时，找到并采用了满足优化器软目标净空的绕行种子。
   bool used_clearance_detour{false};
+  // 稠密参考线本身低于窄道硬地板时，在局部栅格内搜索并替换为满足该地板的路径。
+  // 这条路径仍需通过 MINCO 轨迹门和执行前指令门。
+  bool used_narrow_clearance_repair{false};
   // 当前 ROGMap 窗口内无路可绕，种子停在障碍前的安全点；即使不是任务终点也必须用零末速度。
   bool stop_at_local_end{false};
   // 已生成绕行路径或安全停车前缀但种子仍未过校验：据此区分"修复后被否决"与笼统的 COLLISION。
@@ -75,6 +78,10 @@ public:
 
   void setClearanceDetourEnabled(bool enabled) { clearance_detour_enabled_ = enabled; }
 
+  /// 窄道稀疏化：稀疏折线的跳跃段必须保留不低于该地板的净空。它不是轨迹硬门，
+  /// 只避免把绕过窄口的稠密折线简化成切角弦，导致 MINCO 在该段反复降到 floor 以下。
+  void setNarrowPassage(bool enable, double minimum_clearance);
+
   /// 短距离脱困前缀（第四层兜底）参数：enable=false 即完全恢复"三层兜底"行为；min_length/buffer
   /// 是障碍前至少保留的净空与收尾余量，长度上限固定为 collision_dist（整段在近场豁免半径内）。
   void setEscapeOptions(bool enable, double min_length, double buffer);
@@ -89,8 +96,8 @@ public:
 
 private:
   /// 种子 / 绕行 / 停车前缀共用的「完整净空要求」= collision_dist_ 减 ESDF 抖动余量
-  /// （effectiveClearanceThreshold）：必须与发布前校验、20 Hz 监视、MPC 指令门是同一个有效阈值，
-  /// 四道门不一致会规划放行、执行刹车，切勿再下调；近场半径仍用 collision_dist_（车体安全半径）。
+  /// （effectiveClearanceThreshold）：必须与发布前整条轨迹检查、执行前指令门同值，
+  /// 否则会规划放行、执行刹车；近场半径仍用 collision_dist_（车体安全半径）。
   double fullClearanceRequirement() const
   {
     return mas2027_nav_executor::effectiveClearanceThreshold(collision_dist_);
@@ -117,7 +124,8 @@ private:
       terrain_segment_free,
     SeedRejectInfo * reject_info = nullptr,
     bool enforce_clearance = false,
-    double preferred_clearance = 0.0) const;
+    double preferred_clearance = 0.0,
+    double clearance_override = 0.0) const;
 
   /// 默认按软口径逐段检查；传入 preferred_clearance 时，额外要求绕行候选达到软目标净空。
   bool pathClear(const std::vector<Eigen::Vector3d> & path,
@@ -139,7 +147,8 @@ private:
       terrain_segment_free,
     std::vector<Eigen::Vector3d> & detour,
     SeedRejectInfo * reject_info = nullptr,
-    double preferred_clearance = 0.0) const;
+    double preferred_clearance = 0.0,
+    double hard_clearance_floor = 0.0) const;
 
   bool buildSafeStoppingPrefix(const Eigen::Vector3d & start,
     const std::vector<Eigen::Vector3d> & path,
@@ -183,6 +192,8 @@ private:
   double traj_goal_tolerance_{0.5};
   double collision_dist_{0.30};
   double preferred_clearance_{0.35};
+  bool narrow_passage_enable_{false};
+  double narrow_passage_clearance_{0.0};
   bool clearance_detour_enabled_{true};
   bool escape_enable_{true};
   double escape_min_length_{0.08};

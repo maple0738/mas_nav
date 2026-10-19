@@ -3,14 +3,19 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace mas2027_nav_executor {
 
-/// 【唯一定义处】ESDF 逐帧抖动余量：四道净空门须取值一致，否则重现“规划放行、执行刹车”的假否决。
-/// 取值不得再下调：0.05 曾把有效硬阈值压到车体半宽以下并导致实车撞墙；量级保持在“几毫米~2 cm”。
+/// 【唯一定义处】ESDF 逐帧抖动余量：发布前整条轨迹与执行前指令两道硬门共用此值，
+/// 否则重现“规划放行、执行刹车”的假否决。0.05 曾把有效硬阈值压到车体半宽以下并导致撞墙。
 inline constexpr double kEsdfJitterTolerance = 0.02;
 
-/// 完整净空要求 → 各门实际使用的有效阈值。四道门都必须经此函数取值。
+/// ESDF 插值与日志格式化会制造“实测 0.259999、阈值 0.260000”的伪否决。
+/// 该容差只用于浮点比较，不改变任何配置阈值；1 mm 远小于地图分辨率 5 cm。
+inline constexpr double kClearanceComparisonTolerance = 0.001;
+
+/// 完整净空要求 → 两道硬门实际使用的有效阈值。
 inline double effectiveClearanceThreshold(double full_requirement)
 {
   return std::max(0.0, full_requirement - kEsdfJitterTolerance);
@@ -38,17 +43,70 @@ struct ClearanceRequirement
   bool nearFieldEnabled() const { return near_field > 1e-6; }
 };
 
+/// 指令净空的制动模型。减速度和延迟须来自底盘实测；deceleration<=0 关闭速度项。
+struct ClearanceBrakingParams
+{
+  double deceleration{0.0};
+  double reaction_time{0.0};
+
+  bool valid() const
+  {
+    return std::isfinite(deceleration) && deceleration > 0.0 &&
+      std::isfinite(reaction_time) && reaction_time >= 0.0;
+  }
+};
+
+inline double brakingClearance(double speed, const ClearanceBrakingParams & params)
+{
+  if (!params.valid() || !std::isfinite(speed)) return 0.0;
+  const double v = std::abs(speed);
+  return v * params.reaction_time + v * v / (2.0 * params.deceleration);
+}
+
+/// ESDF gradient points away from the nearest obstacle. Only motion toward it
+/// consumes stopping clearance. A flat gradient has no defined approach
+/// direction; the command gate still checks ESDF at every point of its short
+/// horizon, where a directional gradient can become available.
+inline double obstacleApproachSpeed(
+  double vx, double vy, double gradient_x, double gradient_y)
+{
+  const double speed = std::hypot(vx, vy);
+  const double gradient_norm = std::hypot(gradient_x, gradient_y);
+  if (!std::isfinite(speed) || !std::isfinite(gradient_norm)) {
+    return speed;
+  }
+  if (gradient_norm < 1e-3) {
+    return 0.0;
+  }
+  return std::max(0.0, -(vx * gradient_x + vy * gradient_y) / gradient_norm);
+}
+
+/// 从可用 ESDF 净空反求允许速度；非法参数关闭封顶，非法净空交由硬门拒绝。
+inline double clearanceSpeedLimit(double clearance, const ClearanceBrakingParams & params)
+{
+  if (!params.valid() || !std::isfinite(clearance)) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const double a_tau = params.deceleration * params.reaction_time;
+  return std::sqrt(a_tau * a_tau + 2.0 * params.deceleration *
+    std::max(0.0, clearance)) - a_tau;
+}
+
 /// 组装判据。current_clearance_ok 为 false（拿不到当前净空）时不放宽：全程按 required 判。
+/// `minimum_near_required` 是窄道续行的硬地板；只有调用方已经确认机器人当前就在
+/// 窄道内时才应传入，避免把普通近场豁免变成全局降阈值。
 inline ClearanceRequirement makeClearanceRequirement(
   double required, double near_field, double current_clearance, bool current_clearance_ok,
-  double slack = 0.02)
+  double slack = 0.02, double minimum_near_required = 0.0)
 {
   ClearanceRequirement gate;
   gate.required = std::max(0.0, required);
   gate.near_field = std::max(0.0, near_field);
   const double safe_slack = std::max(0.0, slack);
   if (current_clearance_ok && std::isfinite(current_clearance)) {
-    gate.near_required = std::min(gate.required, std::max(0.0, current_clearance - safe_slack));
+    const double lowered = std::max({0.0, current_clearance - safe_slack,
+      std::max(0.0, minimum_near_required)});
+    gate.near_required = std::min(gate.required, lowered);
   } else {
     gate.near_required = gate.required;
   }

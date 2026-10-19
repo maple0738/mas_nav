@@ -4,6 +4,7 @@
 #include <string>
 
 #include "mas2027_nav_executor/common/environment/terrain_grid.hpp"
+#include "mas2027_nav_executor/common/environment/clearance_gate.hpp"
 #include "mas2027_nav_executor/path_executor/mpc/mpc_types.hpp"
 #include "mas2027_nav_executor/path_executor/state/execution_state.hpp"
 #include "rog_map/map_query_interface.hpp"
@@ -36,11 +37,15 @@ ExecutorStatus checkCommandSafety(
   const std::shared_ptr<tf2_ros::Buffer> & tf,
   const std::string & odom_frame,
   double rog_map_clearance,
+  bool narrow_passage_enable,
+  double narrow_passage_clearance,
+  bool narrow_passage_ahead,
   double rog_map_timeout_s,
   double dt,
   const minco_controller::State & current,
   const minco_controller::Control & control,
   const rclcpp::Time & stamp,
-  CommandSafetyDetail * detail = nullptr);
+  CommandSafetyDetail * detail = nullptr,
+  const ClearanceBrakingParams & braking = {});
 
 }  // namespace mas2027_nav_executor

@@ -31,6 +31,10 @@ public:
   {
     return task_manager_ && task_manager_->acceptsTrajectory(stamp);
   }
+  bool hasActiveGoal() const
+  {
+    return task_manager_ && task_manager_->hasActiveGoal();
+  }
   rclcpp_lifecycle::LifecycleNode::SharedPtr node() const { return node_; }
   std::shared_ptr<rog_map::MapQueryInterface> mapQuery() const;
   // Pin one immutable global map version for a complete future global search.

@@ -413,8 +413,12 @@ void ProbMap::updateProbMap(
      原实现用 static bool 只在首帧清一次，机器人一移动或旋转就会重新落进未观测区；
      改为「传感器每移动超过半个体素就重清一次」，使车体所在的一圈始终是自由空间。
      注意 getLocalIndexHash 不做边界检查，越界写入会踩内存，故先用 insideLocalMap 过滤。 */
-  if (!near_field_cleared_ ||
-    (sensor_pos - last_near_field_clear_pos_).norm() > 0.5 * cfg_.resolution) {
+  // This forced-free sphere only compensates for UNKNOWN-as-occupied inside
+  // the raycaster's blind radius. When unknown is already traversable, the
+  // sphere has no purpose and can erase a genuinely observed nearby wall.
+  if (cfg_.unknown_as_occupied &&
+    (!near_field_cleared_ ||
+    (sensor_pos - last_near_field_clear_pos_).norm() > 0.5 * cfg_.resolution)) {
     near_field_cleared_ = true;
     last_near_field_clear_pos_ = sensor_pos;
     for (double dx = -cfg_.raycast_range_min; dx <= cfg_.raycast_range_min; dx += cfg_.resolution) {

@@ -17,6 +17,7 @@ endif()
 install(PROGRAMS
   scripts/measure_lidar_mount.py
   scripts/measure_lidar_mount.sh
+  scripts/record_nav_diagnostics.sh
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY launch/

@@ -238,6 +238,7 @@ RegionController::RegionController(uint8_t normal_mode, double normal_speed,
 void RegionController::setPlan(std::shared_ptr<const RegionPlan> plan)
 {
   if (plan_ == plan) return;
+  alignment_segment_.reset();
   if (plan_ && plan && plan_->trajectory_id == plan->trajectory_id) {
     // The online semantic map can change while the trajectory stays the same.
     // Preserve path progress but reselect the active segment from the new plan.
@@ -266,6 +267,7 @@ void RegionController::setPlan(std::shared_ptr<const RegionPlan> plan)
 
 uint8_t RegionController::update(const Eigen::Vector2d & position_odom)
 {
+  alignment_segment_.reset();
   if (!plan_ || plan_->positions_odom.size() < 2 || !position_odom.allFinite()) return mode_;
   const double moved = last_position_odom_ ?
     (position_odom - *last_position_odom_).norm() : 0.25;
@@ -276,6 +278,7 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom)
   if (held_segment_) {
     const auto & held = plan_->segments[*held_segment_];
     if (progress_ < held.release_s) {
+      alignment_segment_ = held_segment_;
       mode_ = held.mode;
       target_speed_limit_ = held.max_speed;
       target_acceleration_limit_ = held.max_acceleration;
@@ -291,6 +294,7 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom)
     const auto & segment = plan_->segments[i];
     if (progress_ < segment.prepare_s) break;
     if (progress_ < segment.active_s) {
+      alignment_segment_ = i;
       target_speed_limit_ = segment.max_speed;
       target_acceleration_limit_ = segment.max_acceleration;
       label_ = segment.label;
@@ -299,6 +303,7 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom)
       return mode_;
     }
     if (progress_ < segment.release_s) {
+      alignment_segment_ = i;
       held_segment_ = i;
       mode_ = segment.mode;
       target_speed_limit_ = segment.max_speed;
@@ -316,6 +321,31 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom)
   label_.reset();
   phase_ = RegionPhase::NORMAL;
   return mode_;
+}
+
+std::optional<double> RegionController::trajectoryHeadingErrorDegrees(double lio_yaw_rad) const
+{
+  if (!plan_ || !std::isfinite(lio_yaw_rad) ||
+    !alignment_segment_ || *alignment_segment_ >= plan_->segments.size() ||
+    plan_->positions_odom.size() != plan_->arc_lengths.size()) return std::nullopt;
+  // Follow the current MINCO path tangent, including changes inside a curved region.
+  // At a vertex prefer the outgoing segment; at the end retain the last nonzero tangent.
+  const double target_s = progress_;
+  for (size_t i = 1; i < plan_->positions_odom.size(); ++i) {
+    if (plan_->arc_lengths[i] <= target_s + 1e-6) continue;
+    const Eigen::Vector2d direction = plan_->positions_odom[i] - plan_->positions_odom[i - 1];
+    if (!direction.allFinite() || direction.squaredNorm() <= 1e-12) continue;
+    const double offset = std::atan2(direction.y(), direction.x()) - lio_yaw_rad;
+    constexpr double kRadiansToDegrees = 180.0 / 3.14159265358979323846;
+    return std::atan2(std::sin(offset), std::cos(offset)) * kRadiansToDegrees;
+  }
+  for (size_t i = plan_->positions_odom.size(); i > 1; --i) {
+    const Eigen::Vector2d direction = plan_->positions_odom[i - 1] - plan_->positions_odom[i - 2];
+    if (!direction.allFinite() || direction.squaredNorm() <= 1e-12) continue;
+    const double offset = std::atan2(direction.y(), direction.x()) - lio_yaw_rad;
+    return std::atan2(std::sin(offset), std::cos(offset)) * (180.0 / 3.14159265358979323846);
+  }
+  return std::nullopt;
 }
 
 void RegionController::tickProfile(double dt)

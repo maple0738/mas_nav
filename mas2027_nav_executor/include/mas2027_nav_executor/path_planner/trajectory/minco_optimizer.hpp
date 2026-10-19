@@ -44,35 +44,20 @@ public:
     double rho{0.01};
     double smooth_eps{0.01};
 
-    /// 速度感知净空（可选，默认关）：开启后位置罚项目标净空不再是固定 safe_dist，而是与
-    /// 发布前校验/运行时监视同口径（见 ClearanceModel）；关闭时行为与固定 safe_dist 一致。
-    bool speed_aware_clearance{false};
-    double clearance_collision_dist{0.30};
-    double clearance_react_time{0.35};
-    double clearance_monitor_margin{0.0};
-    /// 优化器软目标相对硬判据的余量，见 ClearanceModel::optimizer_margin。
-    double clearance_optimizer_margin{0.05};
-
     VecDf magnitudeBounds, penaltyWeights;
     int integral_res{16};
     double opt_accuracy{1e-4};
 
     bool print_optimizer_log{true};
-  } cfg_;
 
-  /// 速度感知净空模型：目标净空与发布前校验/运行时监视同口径，即
-  ///   required(v) = collision_dist + max(|v| * react_time, monitor_margin)；
-  /// 单独抽成结构体是因为罚函数是静态成员，只能靠传参拿到这些值。
-  struct ClearanceModel
-  {
-    bool enabled{false};
-    double collision_dist{0.30};
-    double react_time{0.35};
-    double monitor_margin{0.0};
-    /// 优化器软目标相对硬判据的余量，必须为正：优化器只能渐近逼近软目标，若软目标恰好
-    /// 等于硬判据，解会稳定地差几毫米被 validateTrajectory 否掉（窄道处表现为「卡一下」）。
-    double optimizer_margin{0.05};
-  };
+    // Two-stage optimizer: PRE shapes the trajectory, FINELY refines it with
+    // direction-aware ESDF gradients. The cold/hot-start boundary state is
+    // unchanged; stage 2 reuses stage 1 as its initial guess.
+    bool two_stage_enable{false};
+    double stage1_time_balance_weight{10.0};
+    double stage1_time_balance_ratio{0.10};
+    bool stage2_directional_gradient_enable{true};
+  } cfg_;
 
   // === Constructor & Lifecycle ===
   MincoOptimizer(const Config & cfg) : cfg_(cfg)
@@ -85,9 +70,6 @@ public:
     opt_vars_.rho = cfg_.rho;
     opt_vars_.smooth_eps = cfg_.smooth_eps;
     opt_vars_.integral_res = cfg_.integral_res;
-    opt_vars_.clearance = {cfg_.speed_aware_clearance, cfg_.clearance_collision_dist,
-      cfg_.clearance_react_time, cfg_.clearance_monitor_margin,
-      cfg_.clearance_optimizer_margin};
   }
 
   // === Core Planning Interfaces ===
@@ -102,9 +84,6 @@ public:
     opt_vars_.rho = cfg_.rho;
     opt_vars_.smooth_eps = cfg_.smooth_eps;
     opt_vars_.integral_res = cfg_.integral_res;
-    opt_vars_.clearance = {cfg_.speed_aware_clearance, cfg_.clearance_collision_dist,
-      cfg_.clearance_react_time, cfg_.clearance_monitor_margin,
-      cfg_.clearance_optimizer_margin};
   }
 
   void setInitPsAndTs(const vec_Vec3f & init_ps, const VecDf & init_ts);
@@ -115,9 +94,27 @@ public:
   int lastReturnCode() const { return last_return_code_; }
   double lastObjectiveTotal() const { return last_objective_total_; }
   uint64_t lastQueryFailureCount() const { return last_query_failure_count_; }
+  bool lastFineStageUsed() const { return last_fine_stage_used_; }
+
+  enum class OptimizationStage
+  {
+    SINGLE_STAGE,
+    PRE_OPTIMIZATION,
+    FINELY_OPTIMIZATION
+  };
 
   // --- Trajectory Optimization ---
   double optimize(const std::vector<Eigen::Vector3d> & waypoints,
+    const Eigen::Matrix3d & start_state,
+    const Eigen::Matrix3d & end_state,
+    const VecDf & local_magnitudes,
+    geometry_utils::Trajectory & out_traj,
+    OptimizationStage stage = OptimizationStage::SINGLE_STAGE);
+
+  /// Run stage 1, then use its trajectory/times as stage 2's initial guess.
+  /// If stage 2 fails, return the stage-1 trajectory/cost (still subject to
+  /// the caller's full safety validation).
+  double optimizeTwoStage(const std::vector<Eigen::Vector3d> & waypoints,
     const Eigen::Matrix3d & start_state,
     const Eigen::Matrix3d & end_state,
     const VecDf & local_magnitudes,
@@ -140,8 +137,10 @@ private:
     // Environment map pointer.
     std::shared_ptr<rog_map::MapQueryInterface> map;
 
-    // 速度感知净空（由 Config 复制而来，见 Config::speed_aware_clearance）。
-    ClearanceModel clearance;
+    OptimizationStage stage{OptimizationStage::SINGLE_STAGE};
+    bool fine_directional_gradient{false};
+    double time_balance_weight{0.0};
+    double time_balance_ratio{0.10};
 
     VecDf magnitudeBounds;
     VecDf penaltyWeights;
@@ -195,7 +194,7 @@ private:
     const VecDf & magnitudeBounds,
     const VecDf & local_magnitudes,
     const VecDf & penaltyWeights,
-    const ClearanceModel & clearance,
+    bool fine_directional_gradient,
     double & cost,
     VecDf & partialGradByTimes,
     MatD3f & partialGradByCoeffs,
@@ -219,6 +218,7 @@ private:
   int last_return_code_{0};
   double last_objective_total_{std::numeric_limits<double>::quiet_NaN()};
   uint64_t last_query_failure_count_{0};
+  bool last_fine_stage_used_{false};
 };
 
 }  // namespace minco_planner

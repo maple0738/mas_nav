@@ -16,12 +16,16 @@ ExecutorStatus checkCommandSafety(
   const std::shared_ptr<tf2_ros::Buffer> & tf,
   const std::string & odom_frame,
   double rog_map_clearance,
+  bool narrow_passage_enable,
+  double narrow_passage_clearance,
+  bool narrow_passage_ahead,
   double rog_map_timeout_s,
   double dt,
   const minco_controller::State & current,
   const minco_controller::Control & control,
   const rclcpp::Time & stamp,
-  CommandSafetyDetail * detail)
+  CommandSafetyDetail * detail,
+  const ClearanceBrakingParams & braking)
 {
   auto reject = [detail](ExecutorStatus status, const char * reason, double value = 0.0,
                    double threshold = 0.0) {
@@ -67,14 +71,34 @@ ExecutorStatus checkCommandSafety(
       return reject(ExecutorStatus::TERRAIN_BLOCKED, "tf_unavailable");
     }
   }
-  // 净空判据与规划侧发布/监视门一致：近场半径取车体安全半径 rog_map_clearance。
+  // 净空判据与规划侧发布前整条轨迹检查一致：近场半径取车体安全半径 rog_map_clearance。
   // 场内不比实测净空更差即可，出近场必须满足该阈值；否则贴墙停下会让指令在 t=0 被否决。
-  // 有效阈值须减掉 ESDF 抖动余量 kEsdfJitterTolerance，与发布门/监视门同值，避免指令卡在两门间。
+  // 有效阈值须减掉 ESDF 抖动余量 kEsdfJitterTolerance，与发布门同值。
   const double effective_clearance = effectiveClearanceThreshold(rog_map_clearance);
   const auto current_clearance =
     rog_query->query(Eigen::Vector3d(current.x, current.y, 0.0));
+  const bool current_narrow = narrow_passage_enable && current_clearance.ok &&
+    std::isfinite(current_clearance.distance) &&
+    current_clearance.distance < effective_clearance &&
+    current_clearance.distance >= narrow_passage_clearance;
+  // The committed trajectory can enter the narrow band before the body's own
+  // clearance drops below the full threshold. In that case the executor has
+  // already capped speed; use the same floor for the short command horizon so
+  // the gate does not brake exactly at the corridor mouth. If the current pose
+  // is already tighter than the floor, never grant the ahead relaxation.
+  const bool ahead_narrow = narrow_passage_enable && narrow_passage_ahead &&
+    current_clearance.ok && std::isfinite(current_clearance.distance) &&
+    current_clearance.distance >= narrow_passage_clearance;
+  const bool narrow_continuation = current_narrow || ahead_narrow;
+  const double narrow_gate_clearance = current_narrow ?
+    current_clearance.distance : narrow_passage_clearance;
+  const double command_clearance = narrow_continuation ?
+    std::max(narrow_passage_clearance, narrow_gate_clearance - 0.02) : effective_clearance;
+  const double command_near_field = narrow_continuation ?
+    std::numeric_limits<double>::infinity() : rog_map_clearance;
   const ClearanceRequirement clearance_gate = makeClearanceRequirement(
-    effective_clearance, rog_map_clearance, current_clearance.distance, current_clearance.ok);
+    command_clearance, command_near_field, current_clearance.distance, current_clearance.ok,
+    0.02, narrow_continuation ? narrow_passage_clearance : 0.0);
   const double travel_speed = std::hypot(control.vx, control.vy);
   const int command_steps = std::max(1, static_cast<int>(std::ceil(horizon / dt)));
   for (int i = 0; i <= command_steps; ++i) {
@@ -82,11 +106,30 @@ ExecutorStatus checkCommandSafety(
     const Eigen::Vector3d odom_point(current.x + t * control.vx,
       current.y + t * control.vy, 0.0);
     const auto clearance = rog_query->query(odom_point);
-    if (!clearance.ok || clearance.distance <= clearance_gate.requiredAt(t * travel_speed)) {
+    const double toward_obstacle = obstacleApproachSpeed(
+      control.vx, control.vy, clearance.gradient.x(), clearance.gradient.y());
+    // Near-field relaxation is only for escaping an already tight pose. It
+    // must not reduce the footprint requirement while driving toward a wall.
+    double base_required = braking.valid() && toward_obstacle > 1e-3 ?
+      command_clearance : clearance_gate.requiredAt(t * travel_speed);
+    // Below the physical floor, permit only a command that increases ESDF
+    // distance. Near-field relaxation must not authorize sliding along a wall
+    // while already inside the requested body gap.
+    if (braking.valid() && current_clearance.ok &&
+        current_clearance.distance < narrow_passage_clearance) {
+      const double escape_rate = control.vx * clearance.gradient.x() +
+        control.vy * clearance.gradient.y();
+      if (!(std::isfinite(escape_rate) && escape_rate > 1e-3)) {
+        base_required = std::max(base_required, narrow_passage_clearance);
+      }
+    }
+    const double required = base_required + brakingClearance(toward_obstacle, braking);
+    const bool clearance_ok = clearance.ok &&
+      clearance.distance + kClearanceComparisonTolerance >= required;
+    if (!clearance_ok) {
       return reject(ExecutorStatus::DYNAMIC_BLOCKED,
         clearance.ok ? "clearance" : "clearance_out_of_map",
-        clearance.distance,
-        clearance_gate.requiredAt(t * travel_speed));
+        clearance.distance, required);
     }
   }
   return reject(ExecutorStatus::PUBLISHED, "none");

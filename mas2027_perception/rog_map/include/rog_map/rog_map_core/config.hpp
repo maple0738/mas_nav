@@ -259,6 +259,7 @@ public:
     layer_mask_filter_en = true;
     layer_fill_occ_min = 5;
     layer_denoise_occ_max = 0;
+    body_exclusion_radius = 0.302;
     load("projection.enable", layer_en);
     load("projection.scan_z_min_abs", scan_z_min_abs);
     load("projection.scan_z_max_abs", scan_z_max_abs);
@@ -283,6 +284,8 @@ public:
     load("projection.mask_filter_en", layer_mask_filter_en);
     load("projection.fill_occ_min", layer_fill_occ_min);
     load("projection.denoise_occ_max", layer_denoise_occ_max);
+    load("projection.body_exclusion_radius", body_exclusion_radius);
+    body_exclusion_radius = std::max(0.0, body_exclusion_radius);
     prior_map_enable = false;
     prior_map_yaml_path.clear();
     prior_map_pgm_path.clear();
@@ -550,6 +553,9 @@ public:
   int layer_fill_occ_min{5};
   int layer_denoise_occ_max{0};
   bool passable_as_free{true};
+  // Corner radius of the chassis square used to filter own-body returns in
+  // the registered cloud before raycasting; accumulated occupancy is retained.
+  double body_exclusion_radius{0.302};
   bool prior_map_enable{false};
   string prior_map_yaml_path{};
   string prior_map_pgm_path{};

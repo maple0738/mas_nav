@@ -14,7 +14,7 @@ set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC=$(cd "$HERE/.." && pwd)
-WS=$(cd "$SRC/.." && pwd)
+WS=$(cd "$SRC/../.." && pwd)
 MEASURE_PY=$HERE/measure_lidar_mount.py
 [ -f "$MEASURE_PY" ] || MEASURE_PY=$SRC/scripts/measure_lidar_mount.py
 PARAMS=$SRC/config/small_point_lio_params.yaml
@@ -24,12 +24,15 @@ PIDS=()
 
 cleanup() {
     local pid
+    # Each helper is started with setsid, so $pid is also the process-group id.
+    # Kill the whole group: `ros2 run`/`ros2 launch` can leave the actual node as
+    # an orphan if only the wrapper pid is killed.
     for pid in "${PIDS[@]:-}"; do
-        [ -n "$pid" ] && kill "$pid" 2>/dev/null
+        [ -n "$pid" ] && kill -TERM -"$pid" 2>/dev/null
     done
     sleep 2
     for pid in "${PIDS[@]:-}"; do
-        [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
+        [ -n "$pid" ] && kill -KILL -"$pid" 2>/dev/null
     done
 }
 trap cleanup EXIT INT TERM
@@ -37,7 +40,7 @@ trap cleanup EXIT INT TERM
 start() {
     local name=$1
     shift
-    "$@" >"$LOG_DIR/$name.log" 2>&1 &
+    setsid "$@" >"$LOG_DIR/$name.log" 2>&1 &
     PIDS+=("$!")
     echo "  起 $name (pid $!)  日志 $LOG_DIR/$name.log"
 }
@@ -55,11 +58,16 @@ die() {
     exit 1
 }
 
+command -v setsid >/dev/null 2>&1 || die "缺少 setsid（util-linux），无法可靠清理测量子进程"
 mkdir -p "$LOG_DIR"
 # ROS 的 setup.bash 会读未定义变量，source 期间关掉 set -u
 set +u
 # shellcheck disable=SC1091
 source /opt/ros/jazzy/setup.bash
+if [ ! -f "$WS/install/setup.bash" ]; then
+    echo "失败：找不到 $WS/install/setup.bash。先在仓库根目录构建并 source install/setup.bash"
+    exit 1
+fi
 # shellcheck disable=SC1091
 source "$WS/install/setup.bash"
 set -u
@@ -108,12 +116,16 @@ echo "== 2. 起 TF 和两个 LIO =="
 start rsp ros2 launch mas2027_nav_bringup robot_state_publisher_launch.py
 sleep 3
 
+LEFT_BLIND_CENTER=$(python3 "$MEASURE_PY" --print-blind left) \
+    || die "无法从 URDF 计算左侧雷达 blind_center"
+echo "  左侧 LIO blind_center=$LEFT_BLIND_CENTER"
+
 start lio_right ros2 run small_point_lio small_point_lio_node --ros-args \
     -r __node:=small_point_lio --params-file "$PARAMS" \
     -p lidar_topic:=/mid360_driver/lidar_192_168_1_136 \
     -p imu_topic:=/mid360_driver/imu_192_168_1_136
 
-# 换个节点名，免得两个实例同名；blind_center 用左侧镜像值 -Rx(-α)ᵀ·(0, 0.15, 0.11)
+# 换个节点名，免得两个实例同名；blind_center 从 lidar_back_joint 的当前 URDF 计算。
 # 不要 remap /tf：左 LIO 还得从 robot_state_publisher 的 /tf lookup lidar_back_link。
 # odom_frame 改成 odom_left，避免和右 LIO 抢 odom→base_link（测参只看 /Odometry* 位姿）。
 sed 's/^small_point_lio:/small_point_lio_left:/' "$PARAMS" >"$LEFT_PARAMS"
@@ -123,7 +135,7 @@ start lio_left ros2 run small_point_lio small_point_lio_node --ros-args \
     -p imu_topic:=/mid360_driver/imu_192_168_1_193 \
     -p lidar_frame:=lidar_back_link \
     -p odom_frame:=odom_left \
-    -p 'blind_center:=[0.0, -0.0184, -0.1851]' \
+    -p "blind_center:=$LEFT_BLIND_CENTER" \
     -r /Odometry:=/Odometry_left \
     -r /cloud_registered:=/cloud_registered_left \
     -r /cloud_registered_full:=/cloud_registered_full_left

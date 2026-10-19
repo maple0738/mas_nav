@@ -28,10 +28,15 @@
         # smac_planner_2d_simple.hpp 的代码默认值一致；本项只影响全局折线形状与 MINCO 参考线，
         # 不改变任何净空判据。
         esdf_max_cost: 5.0
-        # 搜索地图 ESDF 到不可通行格的最低中心净空，直接搜索和在线子目标回退共用。
-        # 0.27 比当前轨迹有效硬阈值 0.26 m 高 1 cm，减少全局折线通过后轨迹被拒。
-        # 低于此值的格不参与搜索；此余量不保证平滑后的轨迹安全，仍须逐点校验。
+        # 搜索地图 ESDF 到不可通行格的最低中心净空，直接主搜索和在线子目标回退共用。
+        # 调参基线：0.27 比轨迹有效硬阈值 0.26 m 高 1 cm。ESDF 未预膨胀，
+        # 此距离从车体中心量起；它不能代表底盘原地旋转所需的空间。
+        # 低于此值的格不参与主搜索；此余量不保证平滑后的轨迹安全，仍须逐点校验。
         minimum_clearance: 0.27
+        # 主搜索在 0.27 m 下无解时，用这个更低净空再搜索一次；只用于给局部
+        # 规划器一条可跟踪的参考线。必须 >= narrow_passage_clearance，且只在
+        # narrow_passage_enable=true 时生效；0 表示关闭该回退。
+        relaxed_minimum_clearance: 0.25
       odom_topic: /Odometry
       tolerance: 0.3
       exploration:
@@ -42,32 +47,70 @@
         unknown_as_occupied: false
         prefer_goal_direction: true
       corridor:
-        robot_radius: 0.30
+        # 走廊生成的近似半径；真实旋转外廓单独记录在 swept_radius。
+        robot_radius: 0.28
+        # 实测正方形车体中心到角点的旋转半径 302 mm；对齐直行半宽约 214 mm。
+        # 旋转半径仅用于姿态模式的空间判断，不能作为整条直行轨迹的统一门槛。
+        swept_radius: 0.302
+        # 本轮按历史撞墙参数逐步标定净空；低于实测旋转外廓时须显式开启，
+        # 启动会打印有效门槛与外廓差值。完成标定后恢复为 false。
+        allow_undersized_clearance: true
         extra_margin: 0.05
       minco_optimizer:
         lookahead_dist: 10.0
         traj_goal_tolerance: 0.15
+        # 目标格被占据或净空不足时，沿 start→goal 反方向最多回退这么多米找
+        # 一个可通行的接近点；直线找不到时，再在目标周围同范围内找机器人
+        # 一侧的可通行排出点，避免整个目标被最后一格直接否掉。最终轨迹和
+        # 执行前指令门仍按原阈值验收；0 表示关闭。
+        goal_approach_max_shorten: 1.5
         enable_yaw_opt: true
         max_yaw_dot: 5.0
-        # 优化器位置罚项的软目标净空，只影响优化器，不影响任何硬判据（硬判据阈值来自
-        # collision_dist + v * replan_react_time）。软目标只能被渐近逼近，必须比硬判据高出余量：
-        # 0.33 留 0.07 余量，降到 0.30 时只剩 4 cm，窄处罚项梯度变小、轨迹不再被推回通道中心，
-        # 表现为起步/前进一顿一顿；再动这一项必须单变量并同时看急停频率与 COLLISION 占比。
+        # 优化器位置罚项的软目标净空，只影响优化器，不是硬安全门。
+        # 比 collision_dist 高 0.05 m，给平滑和 ESDF 抖动留余量。
         safe_dist: 0.33
         # 原局部路径仍可通行但净空偏小时，优选满足 safe_dist 的绕行种子；
         # 找不到则继续使用原路径。关闭仅停用这一优选步骤，安全校验阈值不变。
         clearance_detour_enable: true
-        # 有效硬阈值 = collision_dist − kMonitorClearanceTolerance(0.02) = 0.26 m，略小于车体
-        # 外接圆半径 0.306 m，靠 ROGMap 读数偏保守（0.05 m 格子整格即判占据，小 2~5 cm）对上。
-        # 不要再下调：0.27 会把有效阈值压到 0.25，等于重新允许蹭墙；窄道通过性应由降低感知
-        # 延迟与统一判据口径解决。必须与 node.rog_map_clearance 保持一致。
+        # 唯一硬净空：发布前整条轨迹和执行前当前指令共用。
+        # 历史撞墙参数：有效阈值 = collision_dist - ESDF 抖动余量(0.02) = 0.26 m。
+        # 低于实测旋转外接圆半径 0.302 m；只可用于已对齐的直行标定。
         collision_dist: 0.28
-        # 发布前校验与运行时监视共用同一条要求：
-        # required = collision_dist + max(v * replan_react_time, monitor_margin)。
-        # 两者曾用不同阈值，导致轨迹刚发布就被监视器判不安全 → 急停 + 重规划，车走不起来。
-        # 设 0 表示静止时两者都等于 collision_dist，只有真的跑起来才追加制动距离余量；
-        # 整体抬高安全余量前请确认最窄通道净空 > collision_dist + monitor_margin。
-        monitor_margin: 0.0
+        # 窄道续行：机器人实测净空已在 [floor, 有效阈值) 内，或已提交轨迹在
+        # 前方 1.5 m 内进入该区间时启用；不做全局降阈值。整条指令仍要求
+        # >= floor，并由执行器提前限速。若现场出现擦碰应立即关闭。
+        narrow_passage_enable: true
+        # 历史通过参数 0.24 m，低于 0.302 m 旋转外廓；不能在此净空原地旋转。
+        # 轨迹门把任一安全窄点前后 0.50 m 的参考折线视作同一走廊；稠密参考线本身低于地板时，局部
+        # 栅格会先按该地板重搜参考线，找不到才保留原路径交给轨迹门。
+        narrow_passage_clearance: 0.24
+        narrow_passage_speed: 0.5
+        # 向障碍物运动时额外要求 v_toward*reaction_time + v_toward²/(2a)；
+        # 与上述车体静态净空相加。平行墙面行驶不按纵向速度追加制动距离。
+        # deceleration<=0 只关闭动态速度项，车体静态净空仍保持。
+        clearance_braking:
+          deceleration: 1.2
+          reaction_time: 0.20
+        # 目标接近减速带（规划种子与 MPC 参考共用）。20261018_194203 实车标定：
+        # 底盘实际只能提供约 1.4–2.6 m/s² 的减速度（含响应延迟等效 0.6–1.0），
+        # 而原先种子与 MPC 都按 max_acceleration=5.0 编刹车余量，参考线在离目标
+        # 0.3 m 处仍有约 1.1 m/s，实测过冲 0.6–1.1 m 并往复震荡（9 目标只到 5 个）。
+        # 这里按 v <= sqrt(2*deceleration*(剩余弧长 - stop_margin)) 封顶，下限
+        # min_speed 保留爬行；deceleration<=0 关闭该功能。
+        goal_approach:
+          # 实测刹车能力；含反应时间求解 v·τ + v²/(2a) <= 剩余弧长 - stop_margin。
+          deceleration: 1.2
+          reaction_time: 0.20
+          stop_margin: 0.30
+          min_speed: 0.15
+        # 正方形底盘在窄道中应沿通道切线对齐；提前给底盘航向误差，
+        # 进入窄道前先对齐；航向未稳定时停止平移。语义坡道/隧道仍按区域状态对齐。
+        # lookahead 是提前扫描窄段的距离（米）。首次进入对齐后，按里程计累计
+        # 行驶至少 hold_distance 米；之后还需越过最后窄点 0.50 m，且前方连续
+        # 0.75 m 净空高于普通门槛 0.03 m，才退出对齐。
+        narrow_passage_alignment_enable: true
+        narrow_passage_alignment_lookahead: 2.0
+        narrow_passage_alignment_hold_distance: 2.0
         # 失败原因日志策略（仅排障，不影响规划行为）：按计数采样代替时间节流，失败再密也能
         # 保证每 N 次留下一条、样本量可预期，不随现场节奏退化。
         # failure_log_first_n: 0 = 不逐条打；failure_log_every_n: 1 = 每次都打（排障），
@@ -75,10 +118,8 @@
         failure_log_first_n: 10
         failure_log_every_n: 25
         failure_summary_every: 50
-        # 第四层兜底：前三层（正常路径 → ROGMap 局部绕行 → 障碍前完整停车前缀）全失败时，
-        # 退化成一个"不比当前实测净空更差"（减 0.02 m ESDF 抖动余量）、末速度为零的短前缀，
-        # 把车挪出贴死状态。长度上限固定为一个车体半径 collision_dist，整段落在既有近场豁免
-        # 半径内，因此不改动任何安全阈值；enable: false 即恢复三层行为。
+        # 贴死兜底：正常路径 / 局部绕行 / 停车前缀都失败时，发一个不差于当前
+        # 实测净空、末速为零的短前缀，把车挪出贴死状态。
         stuck_escape:
           enable: true
           # 安全段短于此值就不脱困（挪动太小没有意义）；实际可用长度 = 安全段 - buffer。
@@ -86,25 +127,12 @@
           # 收尾余量：前缀在第一个净空不足的采样点之前这么多米处结束。
           buffer: 0.05
         # 种子门只按"实际占据 / 地形不允许 / 查询失效"硬否决，折线净空不足交给 MINCO 优化，
-        # 再由发布前 / 20 Hz 监视 / MPC 指令门按有效阈值验收。机器人当前位置附近（弧长
-        # collision_dist 以内）是它已占住的地方，只要求"不比当前实测净空更差"；离开该段后
-        # 必须满足 required，否则贴着墙停车就再也发不出轨迹。
+        # 再由发布前整条轨迹 / 执行前指令门验收。机器人当前位置附近（弧长 collision_dist
+        # 以内）只要求"不比当前实测净空更差"；离开该段后必须满足 collision_dist。
         replan_period_s: 0.2
-        # 制动距离预算：required = collision_dist + max(v * replan_react_time, monitor_margin)。
-        # 该项让净空要求随速度增长，作用在整条轨迹上，因此同时是速度上限
-        # v < (可用净空 − collision_dist) / replan_react_time；略超上限就会在最窄处被否，
-        # 形成「加速 → 否决 → 急停 → 再加速」的极限环（现场表现为一卡一卡）。
-        # 上游 navi_minco_bit 没有这一项，碰撞校验用固定 collision_dist；设 0 即对齐上游，
-        # 代价是高速下不预留制动距离。若实车高速制动不及，从 0.05 起逐步回调。
-        replan_react_time: 0.0
-        # 速度感知净空：优化器的 ESDF 位置罚项改用 collision_dist + v * replan_react_time +
-        # clearance_optimizer_margin，意在窄处主动减速而不是规划完再被检查器否掉。
-        # 默认关闭：目标净空在 v > 0.33 m/s 后一律高于原固定值，且 penalty_weight_pos(50000)
-        # 远大于 penalty_weight_time(100)，优化器用降速而非绕开来降低位置惩罚，结果全程变慢。
-        speed_aware_clearance: false
-        # 优化器软目标相对硬判据的余量（仅在 speed_aware_clearance 开启时生效）。
-        clearance_optimizer_margin: 0.05
-        safety_lookahead_time: 1.2
+        # 热启动时只把旧轨迹最近这一段作为新轨迹的初值前缀；过长会让旧路线
+        # 拖住新规划，过短则重规划位置/速度容易跳变。0 表示不使用旧前缀。
+        replan_continuity_time_s: 0.3
         # 轨迹总上限；普通路段由 region_control.normal_max_speed 限为 3.0，
         # 坡道可按 region_control.slope.max_speed 提到 4.0。
         max_velocity: 4.0
@@ -115,6 +143,17 @@
         decay_power: 1.3
         opt_accuracy: 0.001
         print_optimizer_log: false
+        # 两次 MINCO（参考中科大 2025 技术报告 5.5.4.2）：PRE 先稳定轨迹形状，
+        # FINELY 以 PRE 结果为初值并使用去掉沿轨迹方向分量的 ESDF 梯度。
+        # 仍保留现有冷/热启动：状态连续性和旧轨迹前缀不由两次优化替代。
+        two_stage_enable: true
+        # PRE 阶段把各段时间约束在平均段时间的 ±ratio 附近，避免窄道前后
+        # 控制点距离被拉大。weight=0 关闭该软约束。
+        stage1_time_balance_weight: 10.0
+        stage1_time_balance_ratio: 0.10
+        # FINELY 阶段只保留位置梯度的法向分量，避免在窄隧道内沿轨迹方向
+        # 把控制点推走；关闭后恢复单阶段的原始 ESDF 梯度。
+        stage2_directional_gradient_enable: true
         # MINCO 时间正则 rho：cost += rho * ΣT，是轨迹速度的主要旋钮。100 为旧工程与 native
         # 最新提交共用的值；500 会把规划峰值推到约 2.51 m/s，底盘跟不上导致速度误差门反复重规划。
         penalty_weight_time: 100.0
@@ -213,6 +252,9 @@
           scan_z_min_abs: -1.2
           scan_z_max_abs: 2.75
           unknown_as_occupied: false
+          # 以车体外接圆半径还原方形轮廓，仅过滤入图前落在自身轮廓内的回波；
+          # 不再清除已投影的墙体占据。0 表示关闭自车回波过滤。
+          body_exclusion_radius: 0.302
           min_observed_voxels: 1
           surface_height_delta_max: 0.08
           # Correct only ambiguous low spans supported on all sides by a

@@ -1,0 +1,95 @@
+# QoS overrides for record_nav_diagnostics.sh.
+# The ROGMap visualization topics are best_effort/volatile; rosbag's default
+# reliable subscription would otherwise record zero samples. The accumulated
+# online maps and plan topics are transient_local, so keep the latest sample
+# even when the recorder starts before the executor finishes configuring.
+/cloud_registered_full:
+  history: keep_last
+  depth: 5
+  reliability: best_effort
+  durability: volatile
+/Odometry:
+  history: keep_last
+  depth: 50
+  reliability: best_effort
+  durability: volatile
+/rog_map/occupied:
+  history: keep_last
+  depth: 1
+  reliability: best_effort
+  durability: volatile
+/rog_map/raw_occupied:
+  history: keep_last
+  depth: 1
+  reliability: best_effort
+  durability: volatile
+/rog_map/layer_type:
+  history: keep_last
+  depth: 1
+  reliability: best_effort
+  durability: volatile
+/rog_map/layer_value:
+  history: keep_last
+  depth: 1
+  reliability: best_effort
+  durability: volatile
+/rog_map/terrain_label:
+  history: keep_last
+  depth: 1
+  reliability: best_effort
+  durability: volatile
+/rog_map/layer_height_delta:
+  history: keep_last
+  depth: 1
+  reliability: best_effort
+  durability: volatile
+/rog_map/field:
+  history: keep_last
+  depth: 1
+  reliability: best_effort
+  durability: volatile
+/tf_static:
+  history: keep_last
+  depth: 100
+  reliability: reliable
+  durability: transient_local
+/nav_executor/online_global_map:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/nav_executor/online_terrain_map:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/nav_executor/online_terrain_uphill:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/nav_executor/minco_path:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/nav_executor/global_plan:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/nav_executor/debug/minco_trajectory:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/nav_executor/debug/global_plan:
+  history: keep_last
+  depth: 10
+  reliability: reliable
+  durability: transient_local
+/nav_executor/debug/safe_corridor:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local

@@ -291,6 +291,13 @@ bool PathPlanner::acceptGoal(const geometry_msgs::msg::PoseStamped & goal)
     RCLCPP_WARN(node_->get_logger(), "Ignoring goal: ROGMap is not clear at the robot pose");
     return false;
   }
+  if (planner_->usesOnlineMapOnly() && planner_->goalKnownInvalid(start, goal_in_planning)) {
+    RCLCPP_WARN(node_->get_logger(),
+      "Ignoring goal (%.2f, %.2f): confirmed occupied in the live and accumulated "
+      "maps, with no safe approach/ejection within the observed window",
+      goal_in_planning.pose.position.x, goal_in_planning.pose.position.y);
+    return false;
+  }
   task_manager_->submitGoal(goal_in_planning);
   RCLCPP_INFO(node_->get_logger(), "Queued goal (%.2f, %.2f) in %s; waiting for global search and MINCO",
     goal_in_planning.pose.position.x, goal_in_planning.pose.position.y,

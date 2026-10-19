@@ -15,7 +15,7 @@ mid360_driver:
     enable_lidar_merge: true # 驱动内将两台雷达融合后发布到 lidar_topic
     merge_front_ip: "192.168.1.136" # 参考雷达，点坐标保持不变
     merge_back_ip: "192.168.1.193" # 此雷达点转换到参考雷达坐标系
-    merge_extrinsic_back_to_front: [0.0, 0.200484459, -0.223172538, -1.677800, 0.0, 0.0] # 左→右：T_lidar_link^{-1}*T_lidar_back；手性对称 R=Rx(-2α)，α=0.8389；[x,y,z,roll,pitch,yaw]
+    merge_extrinsic_back_to_front: [0.001984, 0.253449, -0.289179, -1.746395, 0.000000, 0.000000] # 左→右：T_lidar_link^{-1}*T_lidar_back；2026-10-18 实测；[x,y,z,roll,pitch,yaw]
     # 配对窗口：两路帧的最小点时间戳之差超过它就丢更旧的那帧，绝不发半帧；两路同定时器切帧，
     # 差值主要来自两台雷达时钟偏移，无 PTP 时（time_type=0，每 IP 只在首包算一次 delta）留 50.0 容纳慢漂。
     merge_max_interval_ms: 50.0
@@ -53,8 +53,8 @@ small_point_lio:
     # 点云过滤
     point_filter_num: 1                               # 每 N 个点保留一个点
     # 盲区球心，雷达坐标系，单位米：base_link 原点在 lidar_link 中的坐标，由 URDF lidar_joint 的
-    # xyz/rpy 反解 -Rx(-α)ᵀ·t 得到（模长 |t|=0.1860）；球心偏了会把车体点送进 LIO 导致 z 上漂。
-    blind_center: [ 0.000, 0.0184, -0.1851 ]
+    # xyz/rpy 反解 -Rx(-α)ᵀ·t 得到（2026-10-18 实测模长 |t|=0.2269）；球心偏了会把车体点送进 LIO 导致 z 上漂。
+    blind_center: [ -0.0156, 0.0477, -0.2213 ]
     # 盲区半径（以 blind_center 为球心），单位米：0.38 = 底盘 0.5x0.5 的对角半径 0.354 加余量，
     # 刚好裹住车身和 lakibeam（距车心 0.241），不多裁近场地面；max_distance 仍以雷达原点量，那是量程不是盲区。
     min_distance: 0.38                                # 最小有效距离，单位米
@@ -66,7 +66,7 @@ small_point_lio:
     # 重力向量（雷达系，单位 g）= 静止时 IMU 加速度均值取反；fix_gravity_direction=true 时只用模长
     # 缩放 IMU 加速度，方向在启动时重估。模长 0.9956 是 IMU 标度误差，不要手改：它决定滤波器内部
     # 加速度的单位，改了等于把 acceleration_cov / ba_cov / satu_acc 重新标定一遍。
-    gravity: [ -0.001711, -0.740676, -0.665347 ]
+    gravity: [ -0.028780, -0.748963, -0.656425 ]
     fix_gravity_direction: true                       # 启动时保持静止：用前 200 帧 IMU 均值估计内部世界的重力方向，供滤波和 odom 水平化使用
     check_satu: true                                  # 是否检查 IMU 饱和
     satu_acc: 3.0                                     # 加速度计饱和阈值，当前 IMU 单位为 g

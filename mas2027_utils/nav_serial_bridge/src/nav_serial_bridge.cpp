@@ -34,7 +34,7 @@ public:
     command_sub_ = create_subscription<interfaces::msg::ChassisCommand>(
       "/nav_executor/chassis_cmd", rclcpp::QoS(1),
       [this](interfaces::msg::ChassisCommand::ConstSharedPtr msg) {
-        if (!std::isfinite(msg->vx) || !std::isfinite(msg->vy) || !std::isfinite(msg->w)) {
+        if (!std::isfinite(msg->vx) || !std::isfinite(msg->vy)) {
           vx_ = 0.0f;
           vy_ = 0.0f;
           has_command_ = false;
@@ -44,6 +44,13 @@ public:
         }
         vx_ = msg->vx;
         vy_ = msg->vy;
+        follow_gimbal_ = msg->follow_gimbal && std::isfinite(msg->small_yaw_ref);
+        small_yaw_ref_ = follow_gimbal_ ?
+          std::remainder(msg->small_yaw_ref, 360.0f) : 0.0f;
+        if (msg->follow_gimbal && !follow_gimbal_) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                               "Non-finite small-yaw reference; clearing follow_gimbal request");
+        }
         last_command_ = std::chrono::steady_clock::now();
         has_command_ = true;
       });
@@ -55,7 +62,7 @@ public:
   ~NavSerialBridge() override
   {
     if (fd_ >= 0) {
-      const auto stop = nav_serial_bridge::make_command(0.0f, 0.0f);
+      const auto stop = nav_serial_bridge::make_command(0.0f, 0.0f, 0.0f, false);
       const ssize_t written = ::write(fd_, stop.data(), stop.size());
       if (written != static_cast<ssize_t>(stop.size())) {
         RCLCPP_WARN(get_logger(), "Could not send final zero-translation frame");
@@ -177,7 +184,9 @@ private:
     const bool fresh = has_command_ && now - last_command_ <= kCommandTimeout;
     const float vx = fresh ? vx_ : 0.0f;
     const float vy = fresh ? vy_ : 0.0f;
-    const auto frame = nav_serial_bridge::make_command(vx, vy);
+    const bool follow = fresh && follow_gimbal_;
+    const float ref = fresh ? small_yaw_ref_ : 0.0f;
+    const auto frame = nav_serial_bridge::make_command(vx, vy, ref, follow);
     const ssize_t written = ::write(fd_, frame.data(), frame.size());
     if (written != static_cast<ssize_t>(frame.size())) {
       ++failed_tx_frames_;
@@ -226,6 +235,8 @@ private:
   int fd_{-1};
   float vx_{0.0f};
   float vy_{0.0f};
+  float small_yaw_ref_{0.0f};
+  bool follow_gimbal_{false};
   bool has_command_{false};
   std::chrono::steady_clock::time_point last_command_{};
   std::chrono::steady_clock::time_point last_connect_attempt_{};
