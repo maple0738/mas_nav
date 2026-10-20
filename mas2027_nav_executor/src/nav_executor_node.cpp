@@ -304,13 +304,14 @@ public:
     if (executor_params.narrow_passage_enable &&
       std::isfinite(swept_radius) && swept_radius > 0.0 &&
       std::isfinite(executor_params.narrow_passage_clearance) &&
-      executor_params.narrow_passage_clearance < swept_radius + rotation_margin &&
+      executor_params.narrow_passage_clearance <
+        swept_radius / std::sqrt(2.0) + rotation_margin &&
       !allow_undersized_clearance) {
       throw std::invalid_argument(
         "planner.minco_optimizer.narrow_passage_clearance=" +
         std::to_string(executor_params.narrow_passage_clearance) +
-        " m must be >= planner.corridor.swept_radius=" +
-        std::to_string(swept_radius) + " m + rotation margin=" +
+        " m must be >= aligned square half-width=" +
+        std::to_string(swept_radius / std::sqrt(2.0)) + " m + clearance margin=" +
         std::to_string(rotation_margin) + " m");
     }
     if (control_rate_hz_ <= 0.0 || planner_frequency_ <= 0.0 || config.dt <= 0.0 ||
@@ -810,16 +811,25 @@ private:
         std::isfinite(input.odom->pose.pose.position.x) &&
         std::isfinite(input.odom->pose.pose.position.y)) {
         const double lio_yaw = tf2::getYaw(q);
-        heading_error = region_controller_->trajectoryHeadingErrorDegrees(lio_yaw);
-        semantic_alignment = heading_error.has_value();
-        if (!heading_error) {
-          // 5.5.5.4.4: narrowness is a geometric property, not a terrain label.
-          // Align the chassis to the first low-clearance trajectory tangent
-          // before the body reaches the corridor mouth; translation continues
-          // at the executor's narrow speed cap while the lower board rotates.
+        // Once the square has entered a geometric narrow section, keep its
+        // latched corridor heading even if a terrain label also requests a
+        // semantic heading. Switching targets inside the slot would rotate
+        // the corners and repeatedly revoke heading readiness.
+        if (path_executor_->narrowPassageAlignmentActive()) {
           heading_error = path_executor_->narrowPassageHeadingErrorDegrees(
             *input.trajectory, input.odom->pose.pose.position.x,
             input.odom->pose.pose.position.y, lio_yaw);
+        }
+        if (!heading_error) {
+          heading_error = region_controller_->trajectoryHeadingErrorDegrees(lio_yaw);
+          semantic_alignment = heading_error.has_value();
+          if (!heading_error) {
+            // 5.5.5.4.4: align only where both sides of a low-clearance route
+            // are constrained, before the body reaches the corridor mouth.
+            heading_error = path_executor_->narrowPassageHeadingErrorDegrees(
+              *input.trajectory, input.odom->pose.pose.position.x,
+              input.odom->pose.pose.position.y, lio_yaw);
+          }
         }
       }
     }

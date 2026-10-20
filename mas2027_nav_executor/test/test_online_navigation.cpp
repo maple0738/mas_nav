@@ -6,7 +6,10 @@
 #include <utility>
 #include <vector>
 
+#include "rog_map/query_adapter.hpp"
+
 #include "mas2027_nav_executor/path_executor/monitoring/command_safety.hpp"
+#include "mas2027_nav_executor/common/environment/online_global_map.hpp"
 #include "mas2027_nav_executor/path_planner/search/global_path_searcher.hpp"
 #include "mas2027_nav_executor/path_planner/search/route_commitment.hpp"
 #include "mas2027_nav_executor/path_planner/trajectory/local_path_processor.hpp"
@@ -58,9 +61,23 @@ public:
     distance = std::min(clearance, observed_end - p.x());
     if (!cell_clearances.empty()) distance = std::min(distance, cell_clearances[y * sizeX() + x]);
     grad = {-1.0, 0.0, 0.0};
+    if (diagonal_midpoint_hazard &&
+        std::hypot(p.x() - 1.30, p.y() - 2.30) < 0.03) {
+      distance = 0.225;
+    }
+    if (endpoint_cell_center_hazard &&
+        std::hypot(p.x() - 1.55, p.y() - 2.55) < 0.015) {
+      distance = 0.225;
+    }
     if (narrow_hazard && p.x() > 0.70 && p.x() < 0.90) {
       distance = 0.20 + std::abs(p.y() - 2.05);
       grad = {0.0, p.y() >= 2.05 ? 1.0 : -1.0, 0.0};
+    }
+    if (corridor_walls && p.x() > 0.50 && p.x() < 1.70) {
+      const double south = std::abs(p.y() - (2.0 - corridor_half_width));
+      const double north = std::abs(p.y() - (2.0 + corridor_half_width));
+      distance = corridor_single_wall ? south : std::min(south, north);
+      grad = {0.0, corridor_single_wall || south < north ? 1.0 : -1.0, 0.0};
     }
     return true;
   }
@@ -71,6 +88,11 @@ public:
   double observed_end{4.0};
   bool field_valid{true};
   bool narrow_hazard{false};
+  bool diagonal_midpoint_hazard{false};
+  bool endpoint_cell_center_hazard{false};
+  bool corridor_walls{false};
+  bool corridor_single_wall{false};
+  double corridor_half_width{0.25};
   mutable std::vector<double> first_pass_x;
   mutable bool first_pass_complete{false};
 };
@@ -87,7 +109,8 @@ geometry_msgs::msg::PoseStamped pose(double x, double y = 2.05)
 
 struct Search
 {
-  explicit Search(const std::shared_ptr<OnlineQuery> & query, bool use_smac = false) : astar(40, 40)
+  explicit Search(const std::shared_ptr<rog_map::MapQueryInterface> & query,
+    bool use_smac = false) : astar(40, 40)
   {
     minco_planner::PlannerModeParams params;
     params.planner_mode = "EXPLORATION";
@@ -107,6 +130,58 @@ struct Search
   minco_planner::GlobalPathSearcher search;
 };
 
+std::shared_ptr<OnlineQuery> wallWithUnknownEnds()
+{
+  auto q = std::make_shared<OnlineQuery>();
+  for (unsigned int y = 0; y < 40; ++y) {
+    for (unsigned int x = 18; x < 40; ++x) {
+      q->cells[y * 40 + x] = x <= 22 && y >= 8 && y <= 31 ? 254U : 255U;
+    }
+  }
+  q->cell_clearances.assign(1600, 1.0);
+  for (unsigned int y = 0; y < 40; ++y) {
+    for (unsigned int x = 0; x < 18; ++x) {
+      for (unsigned int blocked_y = 0; blocked_y < 40; ++blocked_y) {
+        for (unsigned int blocked_x = 18; blocked_x < 40; ++blocked_x) {
+          q->cell_clearances[y * 40 + x] = std::min(
+            q->cell_clearances[y * 40 + x],
+            0.1 * std::hypot(static_cast<double>(x) - blocked_x,
+              static_cast<double>(y) - blocked_y));
+        }
+      }
+    }
+  }
+  return q;
+}
+
+std::shared_ptr<mas2027_nav_executor::OnlineGlobalMap> rememberedNorthRoute()
+{
+  auto remembered = std::make_shared<mas2027_nav_executor::OnlineGlobalMap>(
+    mas2027_nav_executor::OnlineGlobalMapConfig{}, "odom");
+  rog_map::MapSnapshot observation;
+  observation.sequence = 1U;
+  observation.stamp = 42.0;
+  observation.width = 80;
+  observation.height = 40;
+  observation.resolution = 0.1;
+  observation.types.assign(3200, 1U);
+  observation.values.assign(3200, 0U);
+  for (int y = 0; y < 40; ++y) {
+    for (int x = 0; x < 80; ++x) {
+      if ((x >= 18 && x <= 22 && y >= 8 && y <= 31) ||
+          (x >= 35 && x <= 45 && y < 26)) {
+        observation.types[y * 80 + x] = 3U;
+        observation.values[y * 80 + x] = 254U;
+      }
+    }
+  }
+  remembered->update(observation);
+  observation.sequence = 2U;
+  observation.stamp = 42.2;
+  remembered->update(observation);
+  return remembered;
+}
+
 class OnlineNavigation : public ::testing::Test
 {
 protected:
@@ -123,6 +198,320 @@ TEST_F(OnlineNavigation, PlansToObservedGoalWithoutStaticMapOrTF)
   ASSERT_GE(path.size(), 2U);
   EXPECT_NEAR(path.back().pose.position.x, 2.55, 0.1);
   EXPECT_EQ(path.back().header.frame_id, "odom");
+}
+
+TEST_F(OnlineNavigation, ExploresSideOfWallWhenEverySafeStepInitiallyMovesAwayFromGoal)
+{
+  auto q = wallWithUnknownEnds();
+  // The goal is outside the live window. The wall hides what is behind it,
+  // while its upper and lower ends border unexplored space.
+  Search s(q, true);
+  std::vector<geometry_msgs::msg::PoseStamped> path;
+  const auto start = pose(1.45, 2.05);
+  const auto goal = pose(5.0, 2.05);
+  ASSERT_TRUE(s.search.plan(start, goal, s.context, path));
+  ASSERT_GE(path.size(), 2U);
+  const auto & end = path.back().pose.position;
+  EXPECT_LT(std::min(end.y, 4.0 - end.y), 1.4);
+  EXPECT_GE(std::hypot(end.x - goal.pose.position.x,
+    end.y - goal.pose.position.y), 3.15);
+  for (const auto & point : path) {
+    unsigned int x = 0, y = 0;
+    ASSERT_TRUE(q->worldToMap(point.pose.position.x, point.pose.position.y, x, y));
+    EXPECT_EQ(q->value(x, y), 0U);
+    EXPECT_GE(q->query({point.pose.position.x, point.pose.position.y, 0.0}).distance, 0.27);
+  }
+  EXPECT_FALSE(s.search.lastGoalShifted());
+}
+
+TEST_F(OnlineNavigation, KeepsReachableExplorationSubgoalAcrossRollingReplans)
+{
+  auto q = wallWithUnknownEnds();
+  Search s(q, true);
+  const auto goal = pose(5.0, 2.05);
+  std::vector<geometry_msgs::msg::PoseStamped> first, second;
+  ASSERT_TRUE(s.search.plan(pose(1.45, 1.65), goal, s.context, first));
+  ASSERT_TRUE(s.search.plan(pose(1.45, 2.35), goal, s.context, second));
+  ASSERT_GE(first.size(), 2U);
+  ASSERT_GE(second.size(), 2U);
+  EXPECT_NEAR(first.back().pose.position.x, second.back().pose.position.x, 0.11);
+  EXPECT_NEAR(first.back().pose.position.y, second.back().pose.position.y, 0.11);
+
+  Search uncommitted(q, true);
+  std::vector<geometry_msgs::msg::PoseStamped> opposite;
+  ASSERT_TRUE(uncommitted.search.plan(pose(1.45, 2.35), goal,
+    uncommitted.context, opposite));
+  ASSERT_FALSE(opposite.empty());
+  EXPECT_GT(std::abs(opposite.back().pose.position.y - first.back().pose.position.y), 1.0);
+
+  // A new mission goal must release the earlier direction immediately.
+  const auto changed_goal = pose(5.0, 2.25);
+  std::vector<geometry_msgs::msg::PoseStamped> changed;
+  ASSERT_TRUE(s.search.plan(pose(1.45, 2.35), changed_goal, s.context, changed));
+  Search fresh(q, true);
+  std::vector<geometry_msgs::msg::PoseStamped> expected;
+  ASSERT_TRUE(fresh.search.plan(pose(1.45, 2.35), changed_goal, fresh.context, expected));
+  ASSERT_FALSE(expected.empty());
+  ASSERT_FALSE(changed.empty());
+  EXPECT_NEAR(changed.back().pose.position.x, expected.back().pose.position.x, 0.11);
+  EXPECT_NEAR(changed.back().pose.position.y, expected.back().pose.position.y, 0.11);
+}
+
+TEST_F(OnlineNavigation, CompletedExplorationSubgoalIsNotImmediatelyRevisited)
+{
+  auto q = wallWithUnknownEnds();
+  Search s(q, true);
+  const auto goal = pose(5.0, 2.05);
+  std::vector<geometry_msgs::msg::PoseStamped> first, next;
+  ASSERT_TRUE(s.search.plan(pose(1.45, 1.65), goal, s.context, first));
+  ASSERT_GE(first.size(), 2U);
+  const auto reached = first.back();
+  ASSERT_TRUE(s.search.plan(reached, goal, s.context, next));
+  ASSERT_GE(next.size(), 2U);
+  EXPECT_GE(std::hypot(next.back().pose.position.x - reached.pose.position.x,
+    next.back().pose.position.y - reached.pose.position.y), 0.80);
+}
+
+TEST_F(OnlineNavigation, StalledExplorationSubgoalReleasesItsDirection)
+{
+  auto q = wallWithUnknownEnds();
+  Search s(q, true);
+  const auto start = pose(1.45, 1.65);
+  const auto goal = pose(5.0, 2.05);
+  std::vector<geometry_msgs::msg::PoseStamped> first, next;
+  ASSERT_TRUE(s.search.plan(start, goal, s.context, first));
+  ASSERT_GE(first.size(), 2U);
+  q->stamp += 9.0;
+  ASSERT_TRUE(s.search.plan(start, goal, s.context, next));
+  ASSERT_GE(next.size(), 2U);
+  EXPECT_GE(std::hypot(next.back().pose.position.x - first.back().pose.position.x,
+    next.back().pose.position.y - first.back().pose.position.y), 0.80);
+}
+
+TEST_F(OnlineNavigation, BlockedExplorationSubgoalIsReplannedOnTheLiveMap)
+{
+  auto q = wallWithUnknownEnds();
+  Search s(q, true);
+  const auto start = pose(1.45, 1.65);
+  const auto goal = pose(5.0, 2.05);
+  std::vector<geometry_msgs::msg::PoseStamped> first, next;
+  ASSERT_TRUE(s.search.plan(start, goal, s.context, first));
+  ASSERT_GE(first.size(), 2U);
+  unsigned int mx = 0U, my = 0U;
+  ASSERT_TRUE(q->worldToMap(first.back().pose.position.x,
+    first.back().pose.position.y, mx, my));
+  q->cells[my * q->sizeX() + mx] = 254U;
+  ASSERT_TRUE(s.search.plan(start, goal, s.context, next));
+  ASSERT_GE(next.size(), 2U);
+  EXPECT_GT(std::hypot(next.back().pose.position.x - first.back().pose.position.x,
+    next.back().pose.position.y - first.back().pose.position.y), 0.05);
+  for (const auto & point : next) {
+    ASSERT_TRUE(q->worldToMap(point.pose.position.x, point.pose.position.y, mx, my));
+    EXPECT_TRUE(q->isFree(mx, my));
+  }
+}
+
+TEST_F(OnlineNavigation, PreviouslyObservedSpaceIsNotAnExplorationFrontier)
+{
+  auto q = wallWithUnknownEnds();
+  Search s(q, true);
+  std::vector<geometry_msgs::msg::PoseStamped> path;
+  const auto start = pose(1.45, 2.05);
+  const auto goal = pose(5.0, 2.05);
+  ASSERT_TRUE(s.search.plan(start, goal, s.context, path));
+
+  // The live rolling window has forgotten the region behind the wall, while
+  // the session map confirms that it was already observed. Revisit no longer
+  // counts as information gain for a frontier candidate.
+  auto remembered = std::make_shared<mas2027_nav_executor::OnlineGlobalMap>(
+    mas2027_nav_executor::OnlineGlobalMapConfig{}, "odom");
+  rog_map::MapSnapshot previous;
+  previous.sequence = 1U;
+  previous.stamp = 42.0;
+  previous.width = previous.height = 40;
+  previous.resolution = 0.1;
+  previous.types.assign(1600, 1U);
+  previous.values.assign(1600, 0U);
+  ASSERT_EQ(remembered->update(previous),
+    mas2027_nav_executor::OnlineGlobalMap::UpdateResult::UPDATED);
+  Search with_history(q, true);
+  with_history.search.setOnlineTerrainMap(remembered);
+  path.clear();
+  EXPECT_FALSE(with_history.search.plan(start, goal, with_history.context, path));
+}
+
+TEST_F(OnlineNavigation, RememberedRouteAvoidsLocallyAttractiveDeadEnd)
+{
+  auto live = wallWithUnknownEnds();
+  const auto start = pose(1.45, 1.65);
+  const auto goal = pose(5.0, 2.05);
+  Search without_history(live, true);
+  std::vector<geometry_msgs::msg::PoseStamped> unguided;
+  ASSERT_TRUE(without_history.search.plan(start, goal, without_history.context, unguided));
+  ASSERT_LT(unguided.back().pose.position.y, 1.5);
+
+  // Both sides of the near wall look promising inside the live window. The
+  // southern corridor is known to loop back behind a second wall; the route
+  // around the north side remains connected to the goal in the session map.
+  auto remembered = rememberedNorthRoute();
+
+  const auto history = remembered->snapshot();
+  ASSERT_TRUE(history);
+  unsigned int hsx = 0U, hsy = 0U, hgx = 0U, hgy = 0U;
+  ASSERT_TRUE(history->worldToMap(start.pose.position.x, start.pose.position.y, hsx, hsy));
+  ASSERT_TRUE(history->worldToMap(goal.pose.position.x, goal.pose.position.y, hgx, hgy));
+  ASSERT_TRUE(history->isFree(hsx, hsy));
+  ASSERT_TRUE(history->isFree(hgx, hgy));
+  EXPECT_GT(history->query({start.pose.position.x, start.pose.position.y, 0.0}).distance,
+    0.27);
+  EXPECT_GT(history->query({goal.pose.position.x, goal.pose.position.y, 0.0}).distance,
+    0.27);
+  mas2027_nav_executor::smac::SmacPlanner2DSimple route_search;
+  route_search.configure(rclcpp::get_logger("history_test"));
+  route_search.setParameters(false, 100000, 0.15F);
+  route_search.setMinimumClearance(0.27);
+  route_search.setMap(history);
+  route_search.setESDFQuery(history);
+  mas2027_nav_executor::smac::SmacPlanner2DSimple::CoordinateVector route;
+  ASSERT_TRUE(route_search.createPath(hsx, hsy, hgx, hgy, route));
+  ASSERT_FALSE(route.empty());
+
+  Search guided(live, true);
+  guided.search.setOnlineTerrainMap(remembered);
+  std::vector<geometry_msgs::msg::PoseStamped> path;
+  ASSERT_TRUE(guided.search.plan(start, goal, guided.context, path));
+  ASSERT_GE(path.size(), 2U);
+  EXPECT_GT(path.back().pose.position.y, 2.5);
+  for (const auto & point : path) {
+    unsigned int x = 0U, y = 0U;
+    ASSERT_TRUE(live->worldToMap(point.pose.position.x, point.pose.position.y, x, y));
+    EXPECT_EQ(live->value(x, y), 0U);
+    EXPECT_GE(live->query({point.pose.position.x, point.pose.position.y, 0.0}).distance,
+      0.27);
+  }
+
+  unsigned int blocked_x = 0U, blocked_y = 0U;
+  ASSERT_TRUE(live->worldToMap(path.back().pose.position.x,
+    path.back().pose.position.y, blocked_x, blocked_y));
+  live->cells[blocked_y * live->sizeX() + blocked_x] = 254U;
+  std::vector<geometry_msgs::msg::PoseStamped> replanned;
+  ASSERT_TRUE(guided.search.plan(start, goal, guided.context, replanned));
+  ASSERT_GE(replanned.size(), 2U);
+  for (const auto & point : replanned) {
+    unsigned int x = 0U, y = 0U;
+    ASSERT_TRUE(live->worldToMap(point.pose.position.x, point.pose.position.y, x, y));
+    EXPECT_EQ(live->value(x, y), 0U);
+  }
+}
+
+TEST_F(OnlineNavigation, FailedExplorationAreaIsNotImmediatelySelectedAgain)
+{
+  auto live = wallWithUnknownEnds();
+  Search s(live, true);
+  const auto start = pose(1.45, 1.65);
+  const auto goal = pose(5.0, 2.05);
+  std::vector<geometry_msgs::msg::PoseStamped> first, next;
+  ASSERT_TRUE(s.search.plan(start, goal, s.context, first));
+  ASSERT_LT(first.back().pose.position.y, 1.5);
+  unsigned int x = 0U, y = 0U;
+  ASSERT_TRUE(live->worldToMap(first.back().pose.position.x,
+    first.back().pose.position.y, x, y));
+  live->cells[y * live->sizeX() + x] = 254U;
+  live->stamp += 1.0;
+  ASSERT_TRUE(s.search.plan(start, goal, s.context, next));
+  ASSERT_GE(next.size(), 2U);
+  EXPECT_GT(next.back().pose.position.y, 2.5);
+
+  // Once the exclusion expires and the other side is blocked, the original
+  // area may be tried again if the live map now shows it as traversable.
+  live->cells[y * live->sizeX() + x] = 0U;
+  for (unsigned int north_y = 26U; north_y < 40U; ++north_y) {
+    for (unsigned int north_x = 0U; north_x < 18U; ++north_x) {
+      live->cells[north_y * live->sizeX() + north_x] = 254U;
+    }
+  }
+  live->stamp += 31.0;
+  std::vector<geometry_msgs::msg::PoseStamped> retried;
+  ASSERT_TRUE(s.search.plan(start, goal, s.context, retried));
+  ASSERT_GE(retried.size(), 2U);
+  EXPECT_LT(retried.back().pose.position.y, 1.5);
+}
+
+TEST_F(OnlineNavigation, BriefLossOfRememberedRouteDoesNotReverseDirection)
+{
+  auto live = wallWithUnknownEnds();
+  Search s(live, true);
+  s.search.setOnlineTerrainMap(rememberedNorthRoute());
+  const auto start = pose(1.45, 1.65);
+  const auto goal = pose(5.0, 2.05);
+  std::vector<geometry_msgs::msg::PoseStamped> guided, retry;
+  ASSERT_TRUE(s.search.plan(start, goal, s.context, guided));
+  ASSERT_GT(guided.back().pose.position.y, 2.5);
+
+  // The remembered route disappears for a short interval while a new live
+  // obstacle blocks its next waypoint. The only currently safe frontier is
+  // in the opposite direction; wait before reversing across the same area.
+  s.search.setOnlineTerrainMap(nullptr);
+  for (unsigned int y = 20U; y < 40U; ++y) {
+    for (unsigned int x = 0U; x < 18U; ++x) {
+      live->cells[y * live->sizeX() + x] = 254U;
+    }
+  }
+  live->stamp += 1.0;
+  EXPECT_FALSE(s.search.plan(start, goal, s.context, retry));
+  live->stamp += 9.0;
+  retry.clear();
+  ASSERT_TRUE(s.search.plan(start, goal, s.context, retry));
+  ASSERT_GE(retry.size(), 2U);
+  EXPECT_LT(retry.back().pose.position.y, 1.5);
+}
+
+TEST_F(OnlineNavigation, DoesNotExploreTowardWallWithoutUnknownSpace)
+{
+  auto q = std::make_shared<OnlineQuery>();
+  for (unsigned int y = 0; y < 40; ++y) {
+    for (unsigned int x = 18; x < 40; ++x) q->cells[y * 40 + x] = 254U;
+  }
+  Search s(q, true);
+  std::vector<geometry_msgs::msg::PoseStamped> path;
+  EXPECT_FALSE(s.search.plan(pose(1.75, 2.05), pose(5.0, 2.05), s.context, path));
+}
+
+TEST_F(OnlineNavigation, ExploresUnknownCellsEncodedAsOccupiedInLiveProjection)
+{
+  auto snapshot = std::make_shared<rog_map::MapSnapshot>();
+  snapshot->width = 40; snapshot->height = 40; snapshot->resolution = 0.1;
+  snapshot->stamp = snapshot->field_stamp = 42.0;
+  snapshot->values.assign(1600, 0U);
+  snapshot->types.assign(1600, 1U);
+  snapshot->distances.assign(1600, 1.0);
+  for (unsigned int y = 0; y < 40; ++y) {
+    for (unsigned int x = 0; x < 40; ++x) {
+      const size_t idx = y * 40 + x;
+      if (x >= 18) {
+        const bool wall = x <= 22 && y >= 8 && y <= 31;
+        snapshot->types[idx] = wall ? 3U : 0U;
+        snapshot->values[idx] = 254U;  // Both wall and unknown in online mode.
+        snapshot->distances[idx] = -0.05;
+      } else {
+        snapshot->distances[idx] = std::min(1.0, 0.1 * (18 - x));
+      }
+    }
+  }
+  auto q = std::make_shared<rog_map::QueryAdapter>();
+  q->update(snapshot, nullptr);
+  Search s(q, true);
+  std::vector<geometry_msgs::msg::PoseStamped> path;
+  ASSERT_TRUE(s.search.plan(pose(1.45, 2.05), pose(5.0, 2.05), s.context, path));
+  ASSERT_GE(path.size(), 2U);
+  EXPECT_LT(std::min(path.back().pose.position.y,
+    4.0 - path.back().pose.position.y), 1.4);
+  for (const auto & point : path) {
+    unsigned int x = 0, y = 0;
+    ASSERT_TRUE(q->worldToMap(point.pose.position.x, point.pose.position.y, x, y));
+    EXPECT_EQ(snapshot->types[y * 40 + x], 1U);
+    EXPECT_GE(q->query({point.pose.position.x, point.pose.position.y, 0.0}).distance, 0.27);
+  }
 }
 
 TEST_F(OnlineNavigation, KeepsSafeCommittedRouteAcrossReverseMapDetour)
@@ -233,6 +622,42 @@ TEST_F(OnlineNavigation, TightFreeSeedUsesWiderDetourWhenAvailable)
   EXPECT_FALSE(disabled_seed.used_clearance_detour);
 }
 
+TEST_F(OnlineNavigation, CentersOnlyTwoSidedNarrowReferenceBeforeMinco)
+{
+  auto q = std::make_shared<OnlineQuery>();
+  q->corridor_walls = true;
+  Search s(q);
+  minco_planner::LocalPathProcessor processor;
+  processor.configure(3.0, 2.0, 2.0, 0.15, 0.28, 0.33,
+                      rclcpp::get_logger("online_test"));
+  processor.setNarrowPassage(true, 0.24);
+  processor.setClearanceDetourEnabled(false);
+  const std::vector<geometry_msgs::msg::PoseStamped> path{
+    pose(0.55, 1.98), pose(0.75, 1.98), pose(1.55, 1.98), pose(2.55, 2.00)};
+
+  const auto seed = processor.buildSeed(path, pose(0.55, 1.98), s.context);
+  ASSERT_TRUE(seed.valid);
+  ASSERT_TRUE(seed.used_narrow_centering);
+  bool reached_center = false;
+  for (const auto &point : seed.dense_path) {
+    if (point.x() > 1.0 && point.x() < 1.5 && point.y() >= 1.995) {
+      reached_center = true;
+      EXPECT_GE(q->query(point).distance, 0.24);
+    }
+  }
+  EXPECT_TRUE(reached_center);
+  EXPECT_NEAR(seed.dense_path.back().y(), 2.00, 1.0e-6);
+
+  q->corridor_single_wall = true;
+  const auto one_wall = processor.buildSeed(path, pose(0.55, 1.98), s.context);
+  EXPECT_FALSE(one_wall.used_narrow_centering);
+
+  q->corridor_single_wall = false;
+  q->corridor_half_width = 0.35;
+  const auto open_two_sides = processor.buildSeed(path, pose(0.55, 1.98), s.context);
+  EXPECT_FALSE(open_two_sides.used_narrow_centering);
+}
+
 TEST_F(OnlineNavigation, RepairsADenseReferenceThatCutsInsideTheNarrowFloor)
 {
   auto q = std::make_shared<OnlineQuery>();
@@ -260,6 +685,88 @@ TEST_F(OnlineNavigation, RepairsADenseReferenceThatCutsInsideTheNarrowFloor)
     detoured = detoured || std::abs(point.y() - 2.05) > 0.05;
   }
   EXPECT_TRUE(detoured);
+}
+
+TEST_F(OnlineNavigation, FloorAwareSearchRoutesAroundUnsafeGridEdges)
+{
+  auto q = std::make_shared<OnlineQuery>();
+  q->diagonal_midpoint_hazard = true;
+  q->clearance = 0.25;
+  Search s(q);
+  minco_planner::LocalPathProcessor processor;
+  processor.configure(3.0, 2.0, 2.0, 0.15, 0.28, 0.33,
+                      rclcpp::get_logger("online_test"));
+  processor.setNarrowPassage(true, 0.24);
+  processor.setClearanceDetourEnabled(false);
+  // Cell centers on the diagonal are safe, but the edge between (1.25,2.25)
+  // and (1.35,2.35) crosses a low-clearance pocket. A cell-only A* returns
+  // that shortest route, then rejects it at the final segment check.
+  const std::vector<geometry_msgs::msg::PoseStamped> path{
+    pose(1.05, 2.05), pose(1.55, 2.55)};
+  const auto seed = processor.buildSeed(path, pose(1.05, 2.05), s.context);
+  ASSERT_TRUE(seed.valid);
+  ASSERT_TRUE(seed.used_narrow_clearance_repair);
+  for (size_t i = 1U; i < seed.dense_path.size(); ++i) {
+    const auto &from = seed.dense_path[i - 1U];
+    const auto &to = seed.dense_path[i];
+    const int count = std::max(1, static_cast<int>(
+      std::ceil((to - from).head<2>().norm() / 0.025)));
+    for (int j = 0; j <= count; ++j) {
+      const auto point = from + (static_cast<double>(j) / count) * (to - from);
+      EXPECT_GE(q->query(point).distance + 1.0e-6, 0.24);
+    }
+  }
+}
+
+TEST_F(OnlineNavigation, FloorAwareSearchUsesTheActualLocalEndpoint)
+{
+  auto q = std::make_shared<OnlineQuery>();
+  q->diagonal_midpoint_hazard = true;
+  q->endpoint_cell_center_hazard = true;
+  q->clearance = 0.25;
+  Search s(q);
+  minco_planner::LocalPathProcessor processor;
+  processor.configure(3.0, 2.0, 2.0, 0.15, 0.28, 0.33,
+                      rclcpp::get_logger("online_test"));
+  processor.setNarrowPassage(true, 0.24);
+  processor.setClearanceDetourEnabled(false);
+  // The endpoint itself is safe, while the center of its grid cell is not.
+  const std::vector<geometry_msgs::msg::PoseStamped> path{
+    pose(1.05, 2.05), pose(1.52, 2.52)};
+  const auto seed = processor.buildSeed(path, pose(1.05, 2.05), s.context);
+  ASSERT_TRUE(seed.valid);
+  ASSERT_TRUE(seed.used_narrow_clearance_repair);
+  EXPECT_NEAR(seed.dense_path.back().x(), 1.52, 1.0e-6);
+  EXPECT_NEAR(seed.dense_path.back().y(), 2.52, 1.0e-6);
+}
+
+TEST_F(OnlineNavigation, FloorAwareRepairAcceptsCellsBetweenFloorAndFullThreshold)
+{
+  auto q = std::make_shared<OnlineQuery>();
+  q->cell_clearances.assign(1600, 0.25);
+  for (unsigned int x = 8; x <= 12; ++x) {
+    q->cell_clearances[20 * 40 + x] = 0.23;
+  }
+  Search s(q);
+  minco_planner::LocalPathProcessor processor;
+  processor.configure(3.0, 2.0, 2.0, 0.15, 0.28, 0.33,
+                      rclcpp::get_logger("online_test"));
+  processor.setNarrowPassage(true, 0.24);
+  processor.setClearanceDetourEnabled(false);
+  const std::vector<geometry_msgs::msg::PoseStamped> path{
+    pose(0.55), pose(1.55), pose(2.55)};
+
+  const auto seed = processor.buildSeed(path, pose(0.55), s.context);
+  ASSERT_TRUE(seed.valid);
+  EXPECT_TRUE(seed.used_narrow_clearance_repair);
+  ASSERT_GE(seed.dense_path.size(), 2U);
+  EXPECT_TRUE(std::any_of(seed.dense_path.begin(), seed.dense_path.end(),
+    [](const Eigen::Vector3d & point) { return point.y() < 2.0; }));
+
+  q->cell_clearances[20 * 40 + 5] = 0.23;
+  const auto tight_start_seed = processor.buildSeed(path, pose(0.55), s.context);
+  ASSERT_TRUE(tight_start_seed.valid);
+  EXPECT_TRUE(tight_start_seed.used_narrow_clearance_repair);
 }
 
 TEST_F(OnlineNavigation, TightSeedKeepsOriginalRouteWhenWiderDetourIsImpossible)

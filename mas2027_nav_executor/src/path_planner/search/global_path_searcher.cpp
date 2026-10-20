@@ -2,6 +2,7 @@
 #include "mas2027_nav_executor/common/environment/terrain_map_query.hpp"
 #include "mas2027_nav_executor/common/environment/terrain_semantics.hpp"
 #include "mas2027_nav_executor/common/environment/online_global_map.hpp"
+#include "rog_map/projection_layer.hpp"
 #include "rog_map/query_adapter.hpp"
 
 #include <algorithm>
@@ -611,6 +612,20 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
     return false;
   }
 
+  const auto & goal_position = goal_rog.pose.position;
+  if (!online_exploration_goal_ ||
+    std::hypot(goal_position.x - online_exploration_goal_->pose.position.x,
+      goal_position.y - online_exploration_goal_->pose.position.y) > 1e-3 ||
+    goal_rog.header.stamp.sec != online_exploration_goal_->header.stamp.sec ||
+    goal_rog.header.stamp.nanosec != online_exploration_goal_->header.stamp.nanosec) {
+    online_exploration_goal_ = goal_rog;
+    committed_online_subgoal_.reset();
+    committed_online_from_history_ = false;
+    completed_online_subgoals_.clear();
+    failed_online_subgoals_.clear();
+    suspended_history_subgoal_.reset();
+  }
+
   std::function<bool()> cancel_checker = []() {
     return !rclcpp::ok();
   };
@@ -746,6 +761,9 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
           direct_plan,
           latest_global_path,
           online_edge)) {
+      committed_online_subgoal_.reset();
+      committed_online_from_history_ = false;
+      suspended_history_subgoal_.reset();
       return true;
     }
     RCLCPP_WARN(logger_,
@@ -860,6 +878,83 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
   open.push(QueueNode{updated_start_idx, 0.0});
 
   const Eigen::Vector2d start_xy(start_rog.pose.position.x, start_rog.pose.position.y);
+  const double snapshot_stamp = query->snapshotStampSeconds();
+  constexpr double subgoal_reached_distance = 0.40;
+  if (suspended_history_subgoal_ &&
+      (!std::isfinite(snapshot_stamp) || snapshot_stamp <= 0.0 ||
+       snapshot_stamp < suspended_history_stamp_ ||
+       snapshot_stamp - suspended_history_stamp_ > 8.0 ||
+       (start_xy - *suspended_history_subgoal_).norm() <= subgoal_reached_distance)) {
+    suspended_history_subgoal_.reset();
+  }
+  const auto recently_completed = [this, snapshot_stamp](const Eigen::Vector2d & candidate) {
+    const bool completed = std::any_of(
+      completed_online_subgoals_.begin(), completed_online_subgoals_.end(),
+      [&candidate](const Eigen::Vector2d & completed) {
+        return (candidate - completed).norm() < 0.80;
+      });
+    const bool failed = std::any_of(
+      failed_online_subgoals_.begin(), failed_online_subgoals_.end(),
+      [&candidate, snapshot_stamp](const FailedOnlineSubgoal & entry) {
+        return std::isfinite(snapshot_stamp) && snapshot_stamp >= entry.stamp &&
+          snapshot_stamp - entry.stamp < 30.0 &&
+          (candidate - entry.position).norm() < 1.20;
+      });
+    return completed || failed;
+  };
+  const auto reject_subgoal = [this, snapshot_stamp](bool lost_live_connectivity) {
+    if (!committed_online_subgoal_) return;
+    if (committed_online_from_history_ && lost_live_connectivity) {
+      suspended_history_subgoal_ = *committed_online_subgoal_;
+      suspended_history_stamp_ = snapshot_stamp;
+      RCLCPP_WARN(logger_, "[MincoPlanner] Accumulated-route subgoal (%.2f, %.2f) "
+        "lost live connectivity; holding its direction for up to 8 s.",
+        committed_online_subgoal_->x(), committed_online_subgoal_->y());
+    } else if (std::isfinite(snapshot_stamp) && snapshot_stamp > 0.0) {
+      failed_online_subgoals_.push_back({*committed_online_subgoal_, snapshot_stamp});
+      if (failed_online_subgoals_.size() > 64U) {
+        failed_online_subgoals_.erase(failed_online_subgoals_.begin());
+      }
+      RCLCPP_WARN(logger_, "[MincoPlanner] Exploration subgoal (%.2f, %.2f) "
+        "%s; avoiding its 1.20 m area for 30 s.",
+        committed_online_subgoal_->x(), committed_online_subgoal_->y(),
+        lost_live_connectivity ? "lost live connectivity" : "stalled");
+    }
+    committed_online_subgoal_.reset();
+    committed_online_from_history_ = false;
+  };
+  const auto complete_subgoal = [this]() {
+    completed_online_subgoals_.push_back(*committed_online_subgoal_);
+    if (completed_online_subgoals_.size() > 64U) {
+      completed_online_subgoals_.erase(completed_online_subgoals_.begin());
+    }
+    committed_online_subgoal_.reset();
+    committed_online_from_history_ = false;
+  };
+  if (committed_online_subgoal_) {
+    const double remaining = (start_xy - *committed_online_subgoal_).norm();
+    if (remaining <= subgoal_reached_distance) {
+      complete_subgoal();
+    } else if (std::isfinite(snapshot_stamp) && snapshot_stamp > 0.0) {
+      if (snapshot_stamp < committed_online_progress_stamp_ ||
+        remaining < committed_online_best_distance_ - 0.20) {
+        committed_online_best_distance_ = remaining;
+        committed_online_progress_stamp_ = snapshot_stamp;
+      } else if (snapshot_stamp - committed_online_progress_stamp_ > 8.0) {
+        RCLCPP_WARN(logger_, "[MincoPlanner] Exploration subgoal (%.2f, %.2f) "
+          "made no 0.20 m progress for 8 s; trying another observed frontier.",
+          committed_online_subgoal_->x(), committed_online_subgoal_->y());
+        reject_subgoal(false);
+      }
+    }
+  }
+  const auto holds_history_direction = [this, &start_xy](const Eigen::Vector2d & candidate) {
+    if (!suspended_history_subgoal_) return true;
+    const Eigen::Vector2d forward = *suspended_history_subgoal_ - start_xy;
+    const Eigen::Vector2d step = candidate - start_xy;
+    return forward.norm() <= 1e-6 || step.norm() <= 1e-6 ||
+      step.dot(forward) >= 0.10 * step.norm() * forward.norm();
+  };
   const Eigen::Vector2d goal_dir =
     (Eigen::Vector2d(goal_rog.pose.position.x, goal_rog.pose.position.y) - start_xy);
   Eigen::Vector2d goal_dir_norm = Eigen::Vector2d::Zero();
@@ -898,7 +993,8 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
       if (direction.norm() > 1e-6) score += 0.2 * (1.0 - direction.normalized().dot(goal_dir_norm));
     }
     const double minimum_advance = std::max(0.5, 2.0 * tolerance_);
-    if ((candidate - start_xy).norm() >= minimum_advance &&
+    if (!recently_completed(candidate) && holds_history_direction(candidate) &&
+      (candidate - start_xy).norm() >= minimum_advance &&
       remaining < goal_dir.norm() - 0.1 && score < best_score) {
       const auto clearance = query->query({wx, wy, 0.0});
       if (clearance.ok && std::isfinite(clearance.distance) &&
@@ -934,10 +1030,232 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
     }
   }
 
+  // The session map remembers corridors after they leave the rolling window.
+  // Use a known-free route to the mission goal to choose the next waypoint;
+  // only the live search above may authorize the segment sent to the robot.
+  // In particular, a short Euclidean step toward a previously seen dead end
+  // must not outrank the beginning of a longer corridor around the wall.
+  size_t remembered_candidate_idx = map_size;
+  if (remembered && use_smac_ && smac_) {
+    unsigned int hsx = 0U, hsy = 0U, hgx = 0U, hgy = 0U;
+    if (remembered->worldToMap(start_xy.x(), start_xy.y(), hsx, hsy) &&
+        remembered->worldToMap(goal_position.x, goal_position.y, hgx, hgy) &&
+        remembered->isFree(hsx, hsy) && remembered->isFree(hgx, hgy)) {
+      const double clearance = smac_->minimumClearance();
+      constexpr double endpoint_shift = 0.6;
+      if (projectStartToSearchableCell(remembered, hsx, hsy, clearance, endpoint_shift) &&
+          projectStartToSearchableCell(remembered, hgx, hgy, clearance, endpoint_shift)) {
+        smac_->setMap(remembered);
+        smac_->setESDFQuery(remembered);
+        smac_->setEdgeFilter([remembered](unsigned int ax, unsigned int ay,
+            unsigned int bx, unsigned int by) {
+          double x1 = 0.0, y1 = 0.0, x2 = 0.0, y2 = 0.0;
+          remembered->mapToWorld(ax, ay, x1, y1);
+          remembered->mapToWorld(bx, by, x2, y2);
+          return remembered->terrainTransition(x1, y1, x2, y2);
+        });
+        mas2027_nav_executor::smac::SmacPlanner2DSimple::CoordinateVector route;
+        if (smac_->createPath(hsx, hsy, hgx, hgy, route, cancel_checker)) {
+          // SMAC returns goal-to-start. The first live-reachable point is the
+          // farthest safe lookahead near the remembered route. The cumulative
+          // and live clearance fields can differ, so permit a small lateral
+          // offset instead of requiring the same grid center in both maps.
+          constexpr double route_corridor = 0.45;
+          const int corridor_cells = static_cast<int>(std::ceil(route_corridor / resolution));
+          for (const auto & cell : route) {
+            double wx = 0.0, wy = 0.0;
+            remembered->mapToWorld(static_cast<unsigned int>(cell.x),
+              static_cast<unsigned int>(cell.y), wx, wy);
+            unsigned int lx = 0U, ly = 0U;
+            if (!query->worldToMap(wx, wy, lx, ly)) continue;
+            double nearest = std::numeric_limits<double>::infinity();
+            size_t route_idx = map_size;
+            for (int dy = -corridor_cells; dy <= corridor_cells; ++dy) {
+              for (int dx = -corridor_cells; dx <= corridor_cells; ++dx) {
+                const int cx = static_cast<int>(lx) + dx;
+                const int cy = static_cast<int>(ly) + dy;
+                if (cx < 0 || cy < 0 || cx >= static_cast<int>(nx) ||
+                    cy >= static_cast<int>(ny)) continue;
+                const size_t live_idx = index_of(static_cast<unsigned int>(cx),
+                  static_cast<unsigned int>(cy));
+                if (!closed[live_idx]) continue;
+                double candidate_x = 0.0, candidate_y = 0.0;
+                query->mapToWorld(static_cast<unsigned int>(cx),
+                  static_cast<unsigned int>(cy), candidate_x, candidate_y);
+                const Eigen::Vector2d candidate(candidate_x, candidate_y);
+                const double offset = std::hypot(candidate_x - wx, candidate_y - wy);
+                if (offset > route_corridor || offset >= nearest ||
+                    (candidate - start_xy).norm() < std::max(0.5, 2.0 * tolerance_) ||
+                    recently_completed(candidate)) continue;
+                const auto field = query->query({candidate_x, candidate_y, 0.0});
+                if (!field.ok || !std::isfinite(field.distance) ||
+                    field.distance < online_subgoal_clearance_) continue;
+                nearest = offset;
+                route_idx = live_idx;
+              }
+            }
+            if (route_idx < map_size) {
+              best_idx = route_idx;
+              remembered_candidate_idx = route_idx;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Preserve the current observed waypoint while it is still connected to
+  // the robot in this map snapshot. A better-scoring point on the other side
+  // of a wall must not reverse the robot on every rolling-map update.
+  if (committed_online_subgoal_) {
+    unsigned int cx = 0U, cy = 0U;
+    if (query->worldToMap(committed_online_subgoal_->x(),
+        committed_online_subgoal_->y(), cx, cy)) {
+      const size_t committed_idx = index_of(cx, cy);
+      const auto field = query->query({committed_online_subgoal_->x(),
+        committed_online_subgoal_->y(), 0.0});
+      if (closed[committed_idx] && field.ok && std::isfinite(field.distance) &&
+        field.distance >= online_subgoal_clearance_) {
+        best_idx = committed_idx;
+      } else {
+        reject_subgoal(true);
+      }
+    } else {
+      reject_subgoal(true);
+    }
+  }
+
+  // A previously valid accumulated route can disappear for a few snapshots.
+  // The ordinary Euclidean candidate was scored before the commitment was
+  // checked, so reject an immediate reversal after a live-map invalidation.
+  if (best_idx < map_size && best_idx != remembered_candidate_idx) {
+    double candidate_x = 0.0, candidate_y = 0.0;
+    query->mapToWorld(static_cast<unsigned int>(best_idx % nx),
+      static_cast<unsigned int>(best_idx / nx), candidate_x, candidate_y);
+    const Eigen::Vector2d candidate(candidate_x, candidate_y);
+    if (recently_completed(candidate) || !holds_history_direction(candidate)) {
+      best_idx = map_size;
+    }
+  }
+
   if (best_idx >= map_size) {
-    RCLCPP_ERROR(logger_, "[MincoPlanner] Online search has no reachable observed subgoal with goal progress and clearance "
-      "(route_clearance=%.3f subgoal_clearance=%.3f).", route_clearance, online_subgoal_clearance_);
-    return false;
+    // A wall can hide the destination while every safe first step around it
+    // temporarily increases the Euclidean goal distance. In that case move
+    // toward an observed, reachable standoff from an unknown boundary. The
+    // unknown cells guide exploration; neither the route nor its endpoint may
+    // enter them. Propagate through known free cells so a frontier on the far
+    // side of a wall does not attract a candidate through that wall.
+    constexpr double frontier_standoff = 0.85;
+    std::vector<double> frontier_dist(map_size, std::numeric_limits<double>::infinity());
+    std::priority_queue<QueueNode, std::vector<QueueNode>, std::greater<QueueNode>> frontier_open;
+    // In the online launch UNKNOWN is deliberately assigned cost 254, the
+    // same cost as a wall. Use the projection's cell type to distinguish them.
+    const bool have_live_types = semantic && semantic->types.size() == map_size;
+    const auto is_unknown = [&](size_t idx) {
+      const bool live_unknown = have_live_types ?
+        semantic->types[idx] == static_cast<uint8_t>(rog_map::CellType::UNKNOWN) :
+        costs[idx] == 255U;
+      if (!live_unknown || !remembered) return live_unknown;
+      double wx = 0.0, wy = 0.0;
+      query->mapToWorld(static_cast<unsigned int>(idx % nx),
+        static_cast<unsigned int>(idx / nx), wx, wy);
+      unsigned int hx = 0U, hy = 0U;
+      return !remembered->worldToMap(wx, wy, hx, hy) ||
+        remembered->value(hx, hy) == 255U;
+    };
+    for (size_t idx = 0; idx < map_size; ++idx) {
+      if (!smacTraversableCost(costs[idx], false)) continue;
+      const unsigned int x = static_cast<unsigned int>(idx % nx);
+      const unsigned int y = static_cast<unsigned int>(idx / nx);
+      if (!online_edge(x, y, x, y)) continue;
+      for (size_t direction = 0; direction < 4U; ++direction) {
+        const auto & offset = offsets[direction];
+        const int near_x = static_cast<int>(x) + offset[0];
+        const int near_y = static_cast<int>(y) + offset[1];
+        if (near_x < 0 || near_y < 0 || near_x >= static_cast<int>(nx) ||
+          near_y >= static_cast<int>(ny)) continue;
+        if (is_unknown(index_of(static_cast<unsigned int>(near_x),
+            static_cast<unsigned int>(near_y)))) {
+          frontier_dist[idx] = 0.0;
+          frontier_open.push(QueueNode{idx, 0.0});
+          break;
+        }
+      }
+    }
+    while (!frontier_open.empty()) {
+      if (cancel_checker && cancel_checker()) return false;
+      const QueueNode current = frontier_open.top();
+      frontier_open.pop();
+      if (current.cost > frontier_dist[current.idx] ||
+        current.cost > frontier_standoff) continue;
+      const unsigned int cx = static_cast<unsigned int>(current.idx % nx);
+      const unsigned int cy = static_cast<unsigned int>(current.idx / nx);
+      for (const auto & offset : offsets) {
+        const int next_x = static_cast<int>(cx) + offset[0];
+        const int next_y = static_cast<int>(cy) + offset[1];
+        if (next_x < 0 || next_y < 0 || next_x >= static_cast<int>(nx) ||
+          next_y >= static_cast<int>(ny)) continue;
+        const unsigned int x = static_cast<unsigned int>(next_x);
+        const unsigned int y = static_cast<unsigned int>(next_y);
+        const size_t idx = index_of(x, y);
+        if (!smacTraversableCost(costs[idx], false) ||
+          !online_edge(cx, cy, x, y)) continue;
+        const bool diagonal = std::abs(offset[0]) + std::abs(offset[1]) == 2;
+        if (diagonal && (!smacTraversableCost(costs[index_of(x, cy)], false) ||
+          !smacTraversableCost(costs[index_of(cx, y)], false))) continue;
+        const double next_dist = current.cost +
+          (diagonal ? 1.41421356237 : 1.0) * resolution;
+        if (next_dist < frontier_dist[idx] && next_dist <= frontier_standoff) {
+          frontier_dist[idx] = next_dist;
+          frontier_open.push(QueueNode{idx, next_dist});
+        }
+      }
+    }
+
+    double best_frontier_score = std::numeric_limits<double>::infinity();
+    const double minimum_advance = std::max(0.5, 2.0 * tolerance_);
+    for (size_t idx = 0; idx < map_size; ++idx) {
+      if (!closed[idx] || frontier_dist[idx] > frontier_standoff) continue;
+      double wx = 0.0, wy = 0.0;
+      query->mapToWorld(static_cast<unsigned int>(idx % nx),
+        static_cast<unsigned int>(idx / nx), wx, wy);
+      const Eigen::Vector2d candidate(wx, wy);
+      if ((candidate - start_xy).norm() < minimum_advance) continue;
+      if (recently_completed(candidate)) continue;
+      if (!holds_history_direction(candidate)) continue;
+      const auto clearance = query->query({wx, wy, 0.0});
+      if (!clearance.ok || !std::isfinite(clearance.distance) ||
+        clearance.distance < online_subgoal_clearance_) continue;
+      const double score = frontier_dist[idx] +
+        0.25 * (candidate - Eigen::Vector2d(
+          goal_rog.pose.position.x, goal_rog.pose.position.y)).norm() +
+        0.15 * dist[idx];
+      if (score < best_frontier_score) {
+        best_frontier_score = score;
+        best_idx = idx;
+      }
+    }
+    if (best_idx >= map_size) {
+      if (suspended_history_subgoal_) {
+        RCLCPP_WARN_THROTTLE(logger_, *rclcpp::Clock::make_shared(), 2000,
+          "[MincoPlanner] Accumulated-route direction hold has no live-safe forward "
+          "subgoal; stopping this refresh rather than reversing toward a stale frontier.");
+      } else {
+        RCLCPP_ERROR(logger_, "[MincoPlanner] Online search has no reachable observed subgoal "
+          "with safe goal progress or an explorable frontier "
+          "(route_clearance=%.3f subgoal_clearance=%.3f).",
+          route_clearance, online_subgoal_clearance_);
+      }
+      return false;
+    }
+    double frontier_x = 0.0, frontier_y = 0.0;
+    query->mapToWorld(static_cast<unsigned int>(best_idx % nx),
+      static_cast<unsigned int>(best_idx / nx), frontier_x, frontier_y);
+    RCLCPP_INFO_THROTTLE(logger_, *rclcpp::Clock::make_shared(), 2000,
+      "[MincoPlanner] Goal progress is blocked; advancing to observed frontier "
+      "standoff (%.2f, %.2f), %.2f m from unknown, to reveal a route.",
+      frontier_x, frontier_y, frontier_dist[best_idx]);
   }
 
   std::vector<size_t> reversed;
@@ -971,7 +1289,26 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
     pose.pose.orientation.w = 1.0;
     latest_global_path.push_back(pose);
   }
-  return latest_global_path.size() >= 2U;
+  if (latest_global_path.size() < 2U) return false;
+  double subgoal_x = 0.0, subgoal_y = 0.0;
+  query->mapToWorld(static_cast<unsigned int>(best_idx % nx),
+    static_cast<unsigned int>(best_idx / nx), subgoal_x, subgoal_y);
+  const Eigen::Vector2d selected(subgoal_x, subgoal_y);
+  const bool new_subgoal = !committed_online_subgoal_ ||
+    (selected - *committed_online_subgoal_).norm() > query->resolution();
+  if (new_subgoal) {
+    RCLCPP_INFO(logger_, "[MincoPlanner] Committing observed exploration subgoal "
+      "(%.2f, %.2f) until reached or blocked%s.", subgoal_x, subgoal_y,
+      best_idx == remembered_candidate_idx ? " along the accumulated-map route" : "");
+    committed_online_best_distance_ = (selected - start_xy).norm();
+    committed_online_progress_stamp_ = query->snapshotStampSeconds();
+  }
+  if (new_subgoal) {
+    committed_online_from_history_ = best_idx == remembered_candidate_idx;
+  }
+  if (best_idx == remembered_candidate_idx) suspended_history_subgoal_.reset();
+  committed_online_subgoal_ = selected;
+  return true;
 }
 
 bool GlobalPathSearcher::makePlan(const geometry_msgs::msg::Pose & start,

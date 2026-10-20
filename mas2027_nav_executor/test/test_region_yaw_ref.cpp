@@ -272,6 +272,42 @@ TEST(GimbalFollowAdapter, HoldsLastAngleAcrossAPlannerGapAndResumesFromIt)
   EXPECT_DOUBLE_EQ(adapter.commandDegrees(), 0.0);
 }
 
+TEST(GimbalFollowAdapter, PlannerGapPreservesReadyHeadingAndReverseSelection)
+{
+  GimbalFollowAdapter adapter(GimbalFollowParams{});
+  // Facing the reverse path axis is ready after the normal 0.3 s settle.
+  EXPECT_TRUE(adapter.updateHeading(180.0, 0.1).reverse_heading);
+  EXPECT_FALSE(adapter.updateHeading(180.0, 0.1).heading_ready);
+  EXPECT_TRUE(adapter.updateHeading(180.0, 0.1).heading_ready);
+  const auto held = adapter.hold();
+  EXPECT_TRUE(held.follow_gimbal);
+  EXPECT_FALSE(held.heading_ready);  // The node still commands zero translation.
+  EXPECT_TRUE(held.reverse_heading);
+  EXPECT_TRUE(adapter.updateHeading(180.0, 0.05).heading_ready);
+
+  adapter.hold();
+  // A changed measured heading must revoke readiness on the first resumed tick.
+  const auto misaligned = adapter.updateHeading(165.0, 0.05);
+  EXPECT_TRUE(misaligned.reverse_heading);
+  EXPECT_FALSE(misaligned.heading_ready);
+  adapter.hold();
+  // The reverse choice keeps its 10 degree hysteresis through another gap.
+  EXPECT_TRUE(adapter.updateHeading(85.0, 0.05).reverse_heading);
+}
+
+TEST(GimbalFollowAdapter, ReversingTravelOnTheSameAxisKeepsHeadingReady)
+{
+  GimbalFollowAdapter adapter(GimbalFollowParams{});
+  adapter.updateHeading(0.0, 0.1);
+  adapter.updateHeading(0.0, 0.1);
+  ASSERT_TRUE(adapter.updateHeading(0.0, 0.1).heading_ready);
+  const auto reversed = adapter.updateHeading(180.0, 0.05);
+  EXPECT_TRUE(reversed.reverse_heading);
+  EXPECT_NEAR(reversed.heading_error_deg, 0.0, 1.0e-8);
+  EXPECT_TRUE(reversed.heading_ready);
+  EXPECT_FALSE(adapter.updateHeading(165.0, 0.05).heading_ready);
+}
+
 TEST(GimbalFollowAdapter, ReversingTheRequestedTurnCanLeaveTheAngleLimit)
 {
   GimbalFollowParams params;

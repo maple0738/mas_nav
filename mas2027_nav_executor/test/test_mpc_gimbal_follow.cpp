@@ -39,6 +39,10 @@ public:
     return result;
   }
 };
+double betweenSideWalls(const Eigen::Vector3d & pos, double half_width)
+{
+  return std::min(std::abs(pos.x() - half_width), std::abs(pos.x() + half_width));
+}
 minco_controller::MPCConfig config()
 {
   minco_controller::MPCConfig c; c.dt = 0.05; c.horizon = 20;
@@ -128,6 +132,44 @@ TEST(MpcGimbalFollow, SafeNarrowSamplesSurviveOneBelowFloorAhead)
   const auto result = executor.computeCommand(input());
   EXPECT_EQ(result.status, ExecutorStatus::PUBLISHED);
   EXPECT_TRUE(result.secondary_reference_narrow);
+}
+
+TEST(MpcGimbalFollow, BrakesToNarrowSpeedAtTheEntranceInsteadOfAcrossTheLookahead)
+{
+  auto map = std::make_shared<FreeMap>();
+  map->distance_fn = [](const Eigen::Vector3d & point) {
+    return point.y() >= 1.0 ? 0.25 : 0.40;
+  };
+  auto c = fastConfig();
+  c.horizon = 40;
+  c.use_acc_constraints = false;
+  auto p = params();
+  p.narrow_passage_enable = true;
+  p.narrow_passage_clearance = 0.24;
+  p.narrow_passage_speed = 0.5;
+  p.clearance_braking.deceleration = 1.2;
+  p.clearance_braking.reaction_time = 0.2;
+  auto run_at = [&](double y) {
+    PathExecutor executor(c, p, nullptr, nullptr, map);
+    auto in = input();
+    auto odom = std::make_shared<nav_msgs::msg::Odometry>(*in.odom);
+    odom->pose.pose.position.y = y;
+    in.odom = odom;
+    return executor.computeCommand(in);
+  };
+  const auto approach = run_at(0.0);
+  const auto entrance = run_at(0.9);
+  const auto inside = run_at(1.0);
+  ASSERT_EQ(approach.status, ExecutorStatus::PUBLISHED);
+  ASSERT_EQ(entrance.status, ExecutorStatus::PUBLISHED);
+  ASSERT_EQ(inside.status, ExecutorStatus::PUBLISHED);
+  EXPECT_GT(approach.command.linear.y, 0.7);
+  EXPECT_LE(entrance.command.linear.y, 0.50001);
+  EXPECT_LE(inside.command.linear.y, 0.50001);
+  p.clearance_braking.deceleration = 0.0;
+  const auto no_braking_model = run_at(0.0);
+  ASSERT_EQ(no_braking_model.status, ExecutorStatus::PUBLISHED);
+  EXPECT_LE(no_braking_model.command.linear.y, 0.50001);
 }
 
 TEST(MpcGimbalFollow, SecondSolveUsesTheOriginalAccelerationAnchor)
@@ -428,7 +470,7 @@ TEST(MpcGimbalFollow, NarrowPassageAlignmentUsesEntryTangent)
 {
   auto map = std::make_shared<FreeMap>();
   map->distance_fn = [](const Eigen::Vector3d & pos) {
-      return pos.y() < 0.3 ? 0.30 : 0.25;
+      return pos.y() < 0.3 ? 0.40 : betweenSideWalls(pos, 0.25);
     };
   PathExecutorParams p = params();
   p.narrow_passage_enable = true;
@@ -447,11 +489,176 @@ TEST(MpcGimbalFollow, NarrowPassageAlignmentUsesEntryTangent)
   EXPECT_FALSE(executor.narrowPassageHeadingErrorDegrees(*in.trajectory, 0.0, 0.0, 0.0));
 }
 
+TEST(MpcGimbalFollow, NarrowHeadingIgnoresSmallAlternatingWaypointOffsets)
+{
+  auto map = std::make_shared<FreeMap>();
+  map->distance_fn = [](const Eigen::Vector3d & pos) {
+      return pos.y() < 0.3 ? 0.45 : betweenSideWalls(pos, 0.25);
+    };
+  auto p = params();
+  p.narrow_passage_enable = true;
+  p.narrow_passage_clearance = 0.24;
+  p.narrow_passage_alignment_enable = true;
+  PathExecutor executor(config(), p, nullptr, nullptr, map);
+  auto trajectory = *input().trajectory;
+  for (size_t i = 0; i < trajectory.cmds.size(); ++i) {
+    trajectory.cmds[i].position.x = i % 2U == 0U ? -0.005 : 0.005;
+  }
+  const auto error = executor.narrowPassageHeadingErrorDegrees(
+    trajectory, 0.0, 0.0, 0.0);
+  ASSERT_TRUE(error.has_value());
+  EXPECT_NEAR(*error, 90.0, 5.0);
+}
+
+TEST(MpcGimbalFollow, NarrowAlignmentKeepsEntryHeadingAcrossReplans)
+{
+  auto map = std::make_shared<FreeMap>();
+  map->distance_fn = [](const Eigen::Vector3d & pos) {
+      return pos.y() < 0.3 ? 0.40 : betweenSideWalls(pos, 0.25);
+    };
+  auto p = params();
+  p.narrow_passage_enable = true;
+  p.narrow_passage_clearance = 0.24;
+  p.narrow_passage_alignment_enable = true;
+  PathExecutor executor(config(), p, nullptr, nullptr, map);
+  const auto straight = *input().trajectory;
+  const auto first = executor.narrowPassageHeadingErrorDegrees(straight, 0.0, 0.0, 0.0);
+  ASSERT_TRUE(first.has_value());
+  EXPECT_NEAR(*first, 90.0, 1.0e-6);
+
+  // A refreshed path aims into a diagonal corridor. While the previous
+  // narrow alignment is active, that new tangent must not rotate the square
+  // body inside the slot. Once released, the new section can select its own
+  // heading on entry.
+  map->distance_fn = [](const Eigen::Vector3d & pos) {
+      if (pos.y() < 0.15) return 0.40;
+      const double normal = (pos.y() - pos.x()) / std::sqrt(2.0);
+      return std::min(std::abs(normal - 0.25), std::abs(normal + 0.25));
+    };
+  auto diagonal = straight;
+  for (auto & command : diagonal.cmds) {
+    command.position.x = command.position.y;
+  }
+  const auto held = executor.narrowPassageHeadingErrorDegrees(diagonal, 0.0, 0.0, 0.0);
+  ASSERT_TRUE(held.has_value());
+  EXPECT_NEAR(*held, 90.0, 1.0e-6);
+
+  executor.resetNarrowPassageAlignment();
+  const auto new_entry = executor.narrowPassageHeadingErrorDegrees(diagonal, 0.0, 0.0, 0.0);
+  ASSERT_TRUE(new_entry.has_value());
+  EXPECT_NEAR(*new_entry, 45.0, 1.0e-6);
+}
+
+TEST(MpcGimbalFollow, NarrowAlignmentAllowsReverseTravelOnTheSameBodyAxis)
+{
+  auto map = std::make_shared<FreeMap>();
+  map->distance_fn = [](const Eigen::Vector3d & pos) {
+      return pos.y() < 0.3 ? 0.40 : betweenSideWalls(pos, 0.25);
+    };
+  auto p = params();
+  p.narrow_passage_enable = true;
+  p.narrow_passage_clearance = 0.24;
+  p.narrow_passage_alignment_enable = true;
+  PathExecutor executor(config(), p, nullptr, nullptr, map);
+  const auto straight = *input().trajectory;
+  ASSERT_TRUE(executor.narrowPassageHeadingErrorDegrees(straight, 0.0, 0.0, kPi / 2));
+
+  auto return_path = straight;
+  const double end_y = straight.cmds.back().position.y;
+  for (auto & command : return_path.cmds) {
+    command.position.y = end_y - command.position.y;
+  }
+  const auto reversed = executor.narrowPassageHeadingErrorDegrees(
+    return_path, 0.0, end_y, kPi / 2);
+  ASSERT_TRUE(reversed.has_value());
+  EXPECT_NEAR(std::abs(*reversed), 180.0, 1.0e-6);
+}
+
+TEST(MpcGimbalFollow, DistantTwoSidedNarrowPointDoesNotAlignInOpenSpace)
+{
+  auto map = std::make_shared<FreeMap>();
+  map->distance_fn = [](const Eigen::Vector3d & pos) {
+      return pos.y() < 1.0 ? 0.55 : betweenSideWalls(pos, 0.25);
+    };
+  auto p = params();
+  p.narrow_passage_enable = true;
+  p.narrow_passage_clearance = 0.24;
+  p.narrow_passage_alignment_enable = true;
+  p.narrow_passage_alignment_lookahead = 2.0;
+  PathExecutor executor(config(), p, nullptr, nullptr, map);
+  const auto trajectory = *input().trajectory;
+  EXPECT_FALSE(executor.narrowPassageHeadingErrorDegrees(trajectory, 0.0, 0.0, 0.0));
+  EXPECT_FALSE(executor.narrowPassageAlignmentActive());
+  const auto near_entry = executor.narrowPassageHeadingErrorDegrees(
+    trajectory, 0.0, 0.6, 0.0);
+  ASSERT_TRUE(near_entry.has_value());
+  EXPECT_TRUE(executor.narrowPassageAlignmentActive());
+}
+
+TEST(MpcGimbalFollow, OneSidedWallDoesNotTriggerNarrowAlignment)
+{
+  auto map = std::make_shared<FreeMap>();
+  map->distance_fn = [](const Eigen::Vector3d & pos) {
+      return pos.y() < 0.3 ? 0.40 : std::abs(pos.x() - 0.25);
+    };
+  auto p = params();
+  p.narrow_passage_enable = true;
+  p.narrow_passage_clearance = 0.24;
+  p.narrow_passage_alignment_enable = true;
+  PathExecutor executor(config(), p, nullptr, nullptr, map);
+  EXPECT_FALSE(executor.narrowPassageHeadingErrorDegrees(*input().trajectory, 0.0, 0.0, 0.0));
+  EXPECT_FALSE(executor.narrowPassageAlignmentActive());
+}
+
+TEST(MpcGimbalFollow, OffCenterTwoSidedSlotStillTriggersAlignment)
+{
+  auto map = std::make_shared<FreeMap>();
+  map->distance_fn = [](const Eigen::Vector3d & pos) {
+      return pos.y() < 0.3 ? 0.40 :
+        std::min(std::abs(pos.x() + 0.35), std::abs(pos.x() - 0.60));
+    };
+  auto p = params();
+  p.narrow_passage_enable = true;
+  p.narrow_passage_clearance = 0.24;
+  p.narrow_passage_alignment_enable = true;
+  PathExecutor executor(config(), p, nullptr, nullptr, map);
+  auto trajectory = *input().trajectory;
+  for (auto & command : trajectory.cmds) command.position.x = -0.10;
+  const auto error = executor.narrowPassageHeadingErrorDegrees(trajectory, -0.10, 0.0, 0.0);
+  ASSERT_TRUE(error.has_value());
+  EXPECT_NEAR(*error, 90.0, 1.0e-6);
+}
+
+TEST(MpcGimbalFollow, WideTwoSidedSlotDoesNotTriggerAlignedBodyNarrowThreshold)
+{
+  auto map = std::make_shared<FreeMap>();
+  map->distance_fn = [](const Eigen::Vector3d & pos) {
+      return pos.y() < 0.3 ? 0.40 : betweenSideWalls(pos, 0.35);
+    };
+  auto p = params();
+  p.narrow_passage_enable = true;
+  p.narrow_passage_clearance = 0.24;
+  p.narrow_passage_alignment_enable = true;
+  PathExecutor executor(config(), p, nullptr, nullptr, map);
+  EXPECT_FALSE(executor.narrowPassageHeadingErrorDegrees(*input().trajectory, 0.0, 0.0, 0.0));
+  EXPECT_FALSE(executor.narrowPassageAlignmentActive());
+
+  map->distance_fn = [](const Eigen::Vector3d & pos) {
+      return pos.y() < 0.3 ? 0.40 : betweenSideWalls(pos, 0.30);
+    };
+  EXPECT_FALSE(executor.narrowPassageHeadingErrorDegrees(*input().trajectory, 0.0, 0.0, 0.0));
+
+  map->distance_fn = [](const Eigen::Vector3d & pos) {
+      return pos.y() < 0.3 ? 0.40 : betweenSideWalls(pos, 0.29);
+    };
+  EXPECT_TRUE(executor.narrowPassageHeadingErrorDegrees(*input().trajectory, 0.0, 0.0, 0.0));
+}
+
 TEST(MpcGimbalFollow, NarrowAlignmentStaysLatchedUntilPastTheCorridor)
 {
   auto map = std::make_shared<FreeMap>();
   map->distance_fn = [](const Eigen::Vector3d & pos) {
-      return pos.y() >= 0.5 && pos.y() <= 1.0 ? 0.25 : 0.40;
+      return pos.y() >= 0.5 && pos.y() <= 1.0 ? betweenSideWalls(pos, 0.25) : 0.40;
     };
   auto p = params();
   p.narrow_passage_enable = true;
@@ -491,7 +698,7 @@ TEST(MpcGimbalFollow, NarrowAlignmentStaysLatchedUntilPastTheCorridor)
   EXPECT_FALSE(executor.narrowPassageHeadingErrorDegrees(replanned, 0.0, 2.05, 0.0));
 
   map->distance_fn = [](const Eigen::Vector3d & pos) {
-      return pos.y() >= 0.5 && pos.y() <= 1.0 ? 0.25 : 0.40;
+      return pos.y() >= 0.5 && pos.y() <= 1.0 ? betweenSideWalls(pos, 0.25) : 0.40;
     };
   ASSERT_TRUE(executor.narrowPassageHeadingErrorDegrees(trajectory, 0.0, 0.0, 0.0));
   executor.resetNarrowPassageAlignment();
@@ -504,7 +711,7 @@ TEST(MpcGimbalFollow, ReleasesAfterTwoMetersWithoutChasingADistantNextNarrowPoin
   auto map = std::make_shared<FreeMap>();
   map->distance_fn = [](const Eigen::Vector3d & pos) {
       return (pos.y() >= 0.5 && pos.y() <= 1.0) ||
-             (pos.y() >= 3.2 && pos.y() <= 3.5) ? 0.25 : 0.40;
+             (pos.y() >= 3.2 && pos.y() <= 3.5) ? betweenSideWalls(pos, 0.25) : 0.40;
     };
   auto p = params();
   p.narrow_passage_enable = true;
@@ -533,11 +740,38 @@ TEST(MpcGimbalFollow, ReleasesAfterTwoMetersWithoutChasingADistantNextNarrowPoin
   EXPECT_TRUE(executor.narrowPassageHeadingErrorDegrees(trajectory, 0.0, 2.80, 0.0));
 }
 
+TEST(MpcGimbalFollow, KeepsAlignmentAcrossAShortWideGapBetweenNarrowSections)
+{
+  auto map = std::make_shared<FreeMap>();
+  map->distance_fn = [](const Eigen::Vector3d & pos) {
+      return (pos.y() >= 0.5 && pos.y() <= 2.5) ||
+             (pos.y() >= 3.1 && pos.y() <= 3.5) ? betweenSideWalls(pos, 0.25) : 0.40;
+    };
+  auto p = params();
+  p.narrow_passage_enable = true;
+  p.narrow_passage_clearance = 0.24;
+  p.narrow_passage_alignment_enable = true;
+  p.narrow_passage_alignment_hold_distance = 2.0;
+  PathExecutor executor(config(), p, nullptr, nullptr, map);
+  auto trajectory = *input().trajectory;
+  for (int i = 31; i <= 80; ++i) {
+    auto command = trajectory.cmds.back();
+    command.position.y = i * 0.05;
+    trajectory.cmds.push_back(command);
+  }
+  ASSERT_TRUE(executor.narrowPassageHeadingErrorDegrees(trajectory, 0.0, 0.0, 0.0));
+  for (int i = 1; i <= 26; ++i) {
+    executor.updateNarrowPassageAlignmentPose(0.0, i * 0.1);
+  }
+  EXPECT_TRUE(executor.narrowPassageHeadingErrorDegrees(trajectory, 0.0, 2.55, 0.0));
+  EXPECT_TRUE(executor.narrowPassageAlignmentActive());
+}
+
 TEST(MpcGimbalFollow, CompletedGoalReleasesOnlyAfterTheTwoMeterHold)
 {
   auto map = std::make_shared<FreeMap>();
   map->distance_fn = [](const Eigen::Vector3d & pos) {
-      return pos.y() >= 0.5 && pos.y() <= 1.0 ? 0.25 : 0.40;
+      return pos.y() >= 0.5 && pos.y() <= 1.0 ? betweenSideWalls(pos, 0.25) : 0.40;
     };
   auto p = params();
   p.narrow_passage_enable = true;
@@ -560,7 +794,10 @@ TEST(MpcGimbalFollow, CompletedGoalReleasesOnlyAfterTheTwoMeterHold)
 TEST(MpcGimbalFollow, CompletedGoalKeepsAlignmentUntilCornersCanRotate)
 {
   auto map = std::make_shared<FreeMap>();
-  map->distance_fn = [](const Eigen::Vector3d &) {return 0.35;};
+  map->distance_fn = [](const Eigen::Vector3d & pos) {
+      return pos.y() >= 0.5 && pos.y() <= 1.0 ? betweenSideWalls(pos, 0.25) :
+        betweenSideWalls(pos, 0.35);
+    };
   auto p = params();
   p.narrow_passage_enable = true;
   p.narrow_passage_clearance = 0.24;
@@ -569,12 +806,8 @@ TEST(MpcGimbalFollow, CompletedGoalKeepsAlignmentUntilCornersCanRotate)
   p.swept_radius = 0.302;
   p.rotation_margin = 0.05;
   PathExecutor executor(config(), p, nullptr, nullptr, map);
-  // A 0.35 m slot accepts the normal trajectory gate but is too tight to
-  // release free spin with the measured corner radius and margin.
-  ASSERT_TRUE(executor.narrowPassageHeadingErrorDegrees(*input().trajectory, 0.0, 0.0, 0.0));
-  map->distance_fn = [](const Eigen::Vector3d & pos) {
-      return pos.y() >= 0.5 && pos.y() <= 1.0 ? 0.25 : 0.35;
-    };
+  // The 0.25 m section starts alignment; the 0.35 m exit is still too tight
+  // to hand free spin back to the lower board.
   ASSERT_TRUE(executor.narrowPassageHeadingErrorDegrees(*input().trajectory, 0.0, 0.0, 0.0));
   for (int i = 1; i <= 20; ++i) {
     executor.updateNarrowPassageAlignmentPose(0.0, i * 0.1);
@@ -703,6 +936,16 @@ TEST(MpcGimbalFollow, AlreadyInsideBodyGapCanOnlyMoveOutward)
     0.5, 0.05, current, control, stamp, nullptr, braking), ExecutorStatus::DYNAMIC_BLOCKED);
 }
 
+TEST(MpcGimbalFollow, ClearanceBrakePreservesWallParallelVelocity)
+{
+  double vx = -0.20;
+  double vy = 0.50;
+  ASSERT_TRUE(limitObstacleApproachVelocity(vx, vy, 1.0, 0.0, 0.03));
+  EXPECT_NEAR(vx, -0.03, 1.0e-9);
+  EXPECT_NEAR(vy, 0.50, 1.0e-9);
+  EXPECT_FALSE(limitObstacleApproachVelocity(vx, vy, 0.0, 0.0, 0.03));
+}
+
 TEST(MpcGimbalFollow, ClearanceBrakeCapsCommandBeforeHardGate)
 {
   auto map = std::make_shared<FreeMap>();
@@ -723,6 +966,59 @@ TEST(MpcGimbalFollow, ClearanceBrakeCapsCommandBeforeHardGate)
   const auto unguarded_output = unguarded.computeCommand(input());
   ASSERT_EQ(unguarded_output.status, ExecutorStatus::PUBLISHED);
   EXPECT_GT(unguarded_output.command.linear.y, guarded_output.command.linear.y + 0.05);
+}
+
+TEST(MpcGimbalFollow, ClearanceBrakeRechecksTheSlowedCommandHorizon)
+{
+  auto map = std::make_shared<FreeMap>();
+  map->distance_fn = [](const Eigen::Vector3d & point) {return 0.37 - point.x();};
+  map->gradient_fn = [](const Eigen::Vector3d &) {
+      return Eigen::Vector3d(-1.0, 0.0, 0.0);
+    };
+  auto in = input();
+  auto trajectory = std::make_shared<interfaces::msg::MpcPositionCommand>(*in.trajectory);
+  for (auto & command : trajectory->cmds) command.position.x = 0.10;
+  in.trajectory = trajectory;
+  auto c = fastConfig();
+  c.use_acc_constraints = false;
+  auto p = params();
+  auto open_map = std::make_shared<FreeMap>();
+  PathExecutor open(c, p, nullptr, nullptr, open_map);
+  const auto unscaled = open.computeCommand(in);
+  ASSERT_EQ(unscaled.status, ExecutorStatus::PUBLISHED);
+  EXPECT_LT(0.37 - 0.35 * unscaled.command.linear.x, 0.26);
+  p.clearance_braking = {1.2, 0.20};
+  PathExecutor executor(c, p, nullptr, nullptr, map);
+  const auto output = executor.computeCommand(in);
+  ASSERT_EQ(output.status, ExecutorStatus::PUBLISHED);
+  EXPECT_TRUE(output.clearance_braking_capped);
+  // The original 0.35 s projection reaches the wall, while a reduced command
+  // can still move toward the path without crossing the 0.26 m hard limit.
+  EXPECT_GT(output.command.linear.x, p.deadzone_speed);
+  EXPECT_LT(output.command.linear.x, unscaled.command.linear.x);
+}
+
+TEST(MpcGimbalFollow, ClearanceBrakeKeepsAlongWallCommandWhenLateralSpeedIsLimited)
+{
+  auto map = std::make_shared<FreeMap>();
+  map->distance_fn = [](const Eigen::Vector3d & point) {return 0.37 - point.x();};
+  map->gradient_fn = [](const Eigen::Vector3d &) {
+      return Eigen::Vector3d(-1.0, 0.0, 0.0);
+    };
+  auto in = input();
+  auto trajectory = std::make_shared<interfaces::msg::MpcPositionCommand>(*in.trajectory);
+  for (auto & command : trajectory->cmds) command.position.x = 0.10;
+  in.trajectory = trajectory;
+  auto c = fastConfig();
+  c.use_acc_constraints = false;
+  auto p = params();
+  p.clearance_braking = {1.2, 0.20};
+  PathExecutor executor(c, p, nullptr, nullptr, map);
+  const auto output = executor.computeCommand(in);
+  ASSERT_EQ(output.status, ExecutorStatus::PUBLISHED);
+  EXPECT_TRUE(output.clearance_braking_capped);
+  EXPECT_GT(output.command.linear.y, 0.4);
+  EXPECT_LT(output.command.linear.x, 0.25);
 }
 
 TEST(MpcGimbalFollow, NarrowCellBrakeCapUsesTheCommandGatesNearFieldBase)

@@ -1409,10 +1409,11 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
 
   // 滑窗末端不是终点，不能设零末速度，否则会在 ROGMap 边缘反复刹停；只在到终点或被封死时要求零速。
   const double dist_to_goal = (end_state.col(0) - global_goal).head<2>().norm();
-  const double v_curr = std::max(0.0, start_state.col(1).head<2>().norm());
   const double amax = std::max(0.0, minco_config.max_acc);
   const bool command_stop = local_end_is_goal || stop_at_local_end;
-  if (!command_stop) {
+  const auto end_velocity_for = [&](const Eigen::Matrix3d & candidate_start) -> Eigen::Vector3d {
+    if (command_stop) return Eigen::Vector3d::Zero();
+    const double v_curr = std::max(0.0, candidate_start.col(1).head<2>().norm());
     Eigen::Vector3d tangent(1.0, 0.0, 0.0);
     if (sparse_path.size() >= 2) {
       tangent = sparse_path.back() - sparse_path[sparse_path.size() - 2];
@@ -1438,12 +1439,9 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
     }
     const double v_cmd =
       std::min({minco_config.max_vel, v_max_kinematic, dist_to_goal, local_end_vmax});
-    end_state.col(1) = tangent * v_cmd;
-    end_state.col(2).setZero();
-  } else {
-    end_state.col(1).setZero();
-    end_state.col(2).setZero();
-  }
+    return tangent * v_cmd;
+  };
+  end_state.col(1) = end_velocity_for(start_state);
 
   // Remove near-start redundant points from sparse_path.
   while (sparse_path.size() > 2) {
@@ -1456,6 +1454,11 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
 
   // 7.5 Initial guess Ps/Ts for optimizer (all cases).
   const int N = static_cast<int>(sparse_path.size()) - 1;
+  const bool used_shifted_prefix = state == PlanningState::HOT_START &&
+    has_shifted_seed && replan_continuity_time_s_ > 0.0 && N > 1 &&
+    mas2027_nav_executor::selectReplanContinuityPrefix(
+      sparse_path, shifted_waypoints, shifted_durations,
+      replan_continuity_time_s_) > 0;
   VecDf local_vmaxs(N);
   if (N > 0) {
     vec_Vec3f init_ps;
@@ -1482,9 +1485,50 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
       std::chrono::duration<double, std::milli>(opt_start_steady - replan_start).count();
   }
   auto opt_start_time = rclcpp::Clock().now().seconds();
-  const double final_cost = minco_config.two_stage_enable ?
+  double final_cost = minco_config.two_stage_enable ?
     minco_optimizer_->optimizeTwoStage(sparse_path, start_state, end_state, local_vmaxs, opt_traj) :
     minco_optimizer_->optimize(sparse_path, start_state, end_state, local_vmaxs, opt_traj);
+  const int initial_optimizer_code = minco_optimizer_->lastReturnCode();
+  Eigen::Vector3d measured_velocity = Eigen::Vector3d::Zero();
+  if (!std::isfinite(final_cost) && state == PlanningState::HOT_START) {
+    measured_velocity = getCurrentSpeed();
+  }
+  if (!std::isfinite(final_cost) && state == PlanningState::HOT_START &&
+      measured_velocity.allFinite()) {
+    // A shifted prefix may no longer match a rerouted path. More importantly,
+    // the old trajectory's predicted velocity/acceleration can differ from
+    // odometry after a collision gate or heading hold has stopped translation.
+    // Retry once with this cycle's path and measured velocity. The candidate
+    // still passes the complete trajectory validation before publication.
+    Eigen::Matrix3d measured_start = start_state;
+    measured_start.col(1) = measured_velocity;
+    measured_start.col(2).setZero();
+    Eigen::Matrix3d measured_end = end_state;
+    measured_end.col(1) = end_velocity_for(measured_start);
+    vec_Vec3f fresh_points;
+    VecDf fresh_times(N);
+    VecDf fresh_vmaxs(N);
+    PTAllocation(sparse_path, measured_start, command_stop, PlanningState::COLD_START, false,
+      vec_Vec3f{}, VecDf{}, fresh_points, fresh_times, fresh_vmaxs);
+    minco_optimizer_->setInitPsAndTs(fresh_points, fresh_times);
+    traj_opt::Trajectory retry_traj;
+    const double retry_cost = minco_config.two_stage_enable ?
+      minco_optimizer_->optimizeTwoStage(
+        sparse_path, measured_start, measured_end, fresh_vmaxs, retry_traj) :
+      minco_optimizer_->optimize(
+        sparse_path, measured_start, measured_end, fresh_vmaxs, retry_traj);
+    if (std::isfinite(retry_cost)) {
+      final_cost = retry_cost;
+      opt_traj = std::move(retry_traj);
+      start_state = measured_start;
+      end_state = measured_end;
+      state = PlanningState::COLD_START;
+      RCLCPP_INFO_THROTTLE(logger_, *rclcpp::Clock::make_shared(), 2000,
+        "[MincoPlanner] Measured-velocity path seed recovered a failed hot-start optimization "
+        "(initial_code=%d shifted_prefix=%s)", initial_optimizer_code,
+        used_shifted_prefix ? "true" : "false");
+    }
+  }
   if (perf) {
     perf->optimizer_time_ms =
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - opt_start_steady).count();
@@ -1510,7 +1554,9 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
 
     if (has_last_traj && !isTrajectoryTimeExpired(rclcpp::Clock().now().seconds())) {
       RCLCPP_WARN(logger_,
-        "[MincoPlanner] Optimization failed; keeping the previous unexpired trajectory");
+        "[MincoPlanner] Optimization failed (initial_code=%d retry_code=%d); "
+        "keeping the previous unexpired trajectory",
+        initial_optimizer_code, minco_optimizer_->lastReturnCode());
     }
     return finish(false, "OPTIMIZER_FAILED");
   }

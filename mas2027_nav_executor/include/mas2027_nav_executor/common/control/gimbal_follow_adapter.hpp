@@ -51,6 +51,7 @@ public:
     if (!heading_error_deg || !std::isfinite(*heading_error_deg) || !std::isfinite(dt) || dt <= 0.0) {
       reverse_heading_ = false;
       following_ = false;  // No heading: never integrate, even when the test flag stays set.
+      holding_ = false;
       settled_s_ = 0.0;
       heading_ready_ = false;
       heading_error_deg_ = 0.0;
@@ -69,12 +70,9 @@ public:
       if (!reverse && std::abs(forward_error) > 90.0 + band) reverse = true;
       if (reverse && std::abs(forward_error) < 90.0 - band) reverse = false;
     }
-    if (reverse != reverse_heading_) {
-      heading_ready_ = false;
-      settled_s_ = 0.0;
-    }
     reverse_heading_ = reverse;
     following_ = true;
+    holding_ = false;
     has_command_ = true;
     const double error = std::remainder(forward_error + (reverse ? 180.0 : 0.0), 360.0);
     heading_error_deg_ = error;
@@ -92,21 +90,19 @@ public:
   /// trajectories. The lower board owns the angle loop, so dropping follow and
   /// sending ref=0 here makes it resume its free spin and loses the alignment
   /// baseline. The held output stays in follow mode with zero translation at
-  /// the node. No new angle is integrated until updateHeading() supplies a path.
+  /// the node. Keep the measured readiness and direction hysteresis so a
+  /// short planner gap does not restart settling when the same path resumes.
+  /// No new angle is integrated until updateHeading() supplies a path.
   GimbalFollowOutput hold()
   {
-    following_ = false;
-    reverse_heading_ = false;
-    settled_s_ = 0.0;
-    heading_ready_ = false;
-    heading_error_deg_ = 0.0;
-    return {true, false, 0.0};
+    holding_ = true;
+    return {true, false, 0.0, reverse_heading_};
   }
   bool hasCommand() const { return has_command_; }
   double commandDegrees() const { return command_deg_; }
   double integrateMpcYawRate(double omega_rad_s, double dt)
   {
-    if (following_ && std::isfinite(omega_rad_s) && std::isfinite(dt) && dt > 0.0) {
+    if (following_ && !holding_ && std::isfinite(omega_rad_s) && std::isfinite(dt) && dt > 0.0) {
       constexpr double kRadiansToDegrees = 180.0 / 3.14159265358979323846;
       double rate_deg_s = omega_rad_s * kRadiansToDegrees;
       if (std::abs(heading_error_deg_) > params_.heading_deadband_deg) {
@@ -122,6 +118,6 @@ public:
 private:
   GimbalFollowParams params_;
   double command_deg_{}, settled_s_{}, heading_error_deg_{};
-  bool heading_ready_{}, following_{}, reverse_heading_{}, has_command_{};
+  bool heading_ready_{}, following_{}, holding_{}, reverse_heading_{}, has_command_{};
 };
 }  // namespace mas2027_nav_executor

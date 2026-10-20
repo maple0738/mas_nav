@@ -1,6 +1,7 @@
 #include "mas2027_nav_executor/path_executor/path_executor.hpp"
 
 #include "mas2027_nav_executor/common/environment/clearance_gate.hpp"
+#include "mas2027_nav_executor/common/environment/narrow_passage_geometry.hpp"
 #include "mas2027_nav_executor/path_executor/monitoring/command_safety.hpp"
 
 #include <algorithm>
@@ -158,36 +159,42 @@ ExecutorOutput PathExecutor::computeCommand(const ExecutorInput & input)
     effective_config.ay_max = std::min(effective_config.ay_max, limit);
   }
   solver_->setConfig(effective_config);
-  // Narrow-corridor continuation: if the robot is already inside the narrow
-  // band, or the committed trajectory enters it within a short lookahead, cap
-  // speed now and let the command gate use the narrow floor. Looking only at
-  // the current clearance makes the robot brake at the corridor mouth because
-  // the MPC horizon sees the tight point one tick before the body does.
+  // Narrow-corridor continuation: find the first narrow sample on the committed
+  // route. Keep the narrow floor active ahead of the entrance, but use the
+  // measured braking envelope to arrive there at narrow_passage_speed instead
+  // of driving the entire lookahead at that speed.
   // This remains local to the committed narrow route; open-space driving uses
   // the full threshold.
   const double full_clearance =
     effectiveClearanceThreshold(params_.rog_map_clearance);
   bool current_narrow = false;
+  bool current_narrow_eligible = false;
   double current_narrow_clearance = 0.0;
   if (params_.narrow_passage_enable && rog_query_) {
     const auto current_clearance =
       rog_query_->query(Eigen::Vector3d(current.x, current.y, 0.0));
-    current_narrow = current_clearance.ok &&
+    current_narrow_eligible = current_clearance.ok &&
       std::isfinite(current_clearance.distance) &&
-      current_clearance.distance < full_clearance &&
       current_clearance.distance >= params_.narrow_passage_clearance;
+    current_narrow = current_narrow_eligible &&
+      current_clearance.distance < full_clearance;
     if (current_narrow) current_narrow_clearance = current_clearance.distance;
   }
   bool narrow_ahead = false;
+  double narrow_entrance_distance = std::numeric_limits<double>::infinity();
+  double nearest_command_offset = 0.0;
   if (params_.narrow_passage_enable && rog_query_ &&
       nearest_command_index < transformed_commands.size()) {
     constexpr double kNarrowPassageLookahead = 1.5;
     double ahead_distance = 0.0;
     bool safe_narrow_ahead = false;
     Eigen::Vector2d previous(current.x, current.y);
+    const auto & nearest = transformed_commands[nearest_command_index].position;
+    nearest_command_offset = (Eigen::Vector2d(nearest.x, nearest.y) - previous).norm();
     for (size_t index = nearest_command_index; index < transformed_commands.size(); ++index) {
       const auto & command = transformed_commands[index];
       const Eigen::Vector2d point(command.position.x, command.position.y);
+      const double previous_distance = ahead_distance;
       ahead_distance += (point - previous).norm();
       previous = point;
       if (ahead_distance > kNarrowPassageLookahead) {
@@ -197,9 +204,13 @@ ExecutorOutput PathExecutor::computeCommand(const ExecutorInput & input)
       if (!clearance.ok || !std::isfinite(clearance.distance)) {
         break;
       }
-      safe_narrow_ahead = safe_narrow_ahead ||
-        (clearance.distance >= params_.narrow_passage_clearance &&
-        clearance.distance < full_clearance);
+      if (clearance.distance >= params_.narrow_passage_clearance &&
+          clearance.distance < full_clearance) {
+        safe_narrow_ahead = true;
+        // The threshold may be crossed anywhere between the previous sample
+        // and this one. Use the preceding distance for conservative braking.
+        narrow_entrance_distance = std::min(narrow_entrance_distance, previous_distance);
+      }
     }
     narrow_ahead = safe_narrow_ahead;
   }
@@ -301,7 +312,21 @@ ExecutorOutput PathExecutor::computeCommand(const ExecutorInput & input)
   }
   if (narrow_continuation) {
     const double speed = std::hypot(control.vx, control.vy);
-    const double cap = std::min(params_.narrow_passage_speed, input.region_speed_limit);
+    double cap = params_.narrow_passage_speed;
+    if (!current_narrow && current_narrow_eligible && narrow_ahead &&
+        params_.clearance_braking.valid() &&
+        std::isfinite(rog_query_->resolution()) && rog_query_->resolution() > 0.0) {
+      const double decel = params_.clearance_braking.deceleration;
+      const double delay = params_.clearance_braking.reaction_time;
+      const double target = params_.narrow_passage_speed;
+      const double distance = std::max(0.0,
+        narrow_entrance_distance - nearest_command_offset - rog_query_->resolution());
+      // distance >= (v - target) * delay + (v^2 - target^2)/(2 * decel)
+      cap = std::sqrt((target + decel * delay) * (target + decel * delay) +
+        2.0 * decel * distance) -
+        decel * delay;
+    }
+    cap = std::min(cap, input.region_speed_limit);
     if (std::isfinite(cap) && cap > 0.0 && speed > cap) {
       const double scale = cap / speed;
       control.vx *= scale;
@@ -310,40 +335,84 @@ ExecutorOutput PathExecutor::computeCommand(const ExecutorInput & input)
     }
   }
 
-  // Bound the actual instruction as well as the MPC reference. Sampling the
-  // unscaled short horizon is conservative: after scaling, the command cannot
-  // travel farther along the same ray before the next control tick.
+  // Bound the actual instruction as well as the MPC reference. A low ESDF
+  // value at the end of the *unscaled* command horizon must not force the
+  // current command to zero when a slower command would stop short of it.
+  // Check the horizon again at each candidate speed; the command gate below
+  // still performs its independent final safety check.
   if (params_.clearance_braking.valid() && rog_query_) {
     const double speed = std::hypot(control.vx, control.vy);
     if (speed > 1e-6) {
       const double horizon = std::max(config_.dt, 0.35);
       const int steps = std::max(1, static_cast<int>(std::ceil(horizon / config_.dt)));
-      double cap = speed;
       double limiting_distance = std::numeric_limits<double>::quiet_NaN();
-      for (int i = 0; i <= steps; ++i) {
-        const double t = horizon * static_cast<double>(i) / steps;
-        const auto clearance = rog_query_->query(Eigen::Vector3d(
-          current.x + t * control.vx, current.y + t * control.vy, 0.0));
-        if (!clearance.ok || !std::isfinite(clearance.distance)) continue;
-        const double toward = obstacleApproachSpeed(
-          control.vx, control.vy, clearance.gradient.x(), clearance.gradient.y());
-        if (toward <= 1e-6) continue;
-        const double approach_fraction = toward / speed;
-        const double allowed = clearanceSpeedLimit(
-          std::max(0.0, clearance.distance - command_base_clearance -
-            kClearanceComparisonTolerance), params_.clearance_braking);
-        if (allowed / approach_fraction < cap) {
-          cap = allowed / approach_fraction;
-          limiting_distance = clearance.distance;
+      const auto braking_safe = [&](double vx, double vy, double * limiting,
+          Eigen::Vector2d * gradient, double * allowed_toward) {
+        for (int i = 0; i <= steps; ++i) {
+          const double t = horizon * static_cast<double>(i) / steps;
+          const auto clearance = rog_query_->query(Eigen::Vector3d(
+            current.x + t * vx, current.y + t * vy, 0.0));
+          if (!clearance.ok || !std::isfinite(clearance.distance)) continue;
+          const double toward = obstacleApproachSpeed(
+            vx, vy,
+            clearance.gradient.x(), clearance.gradient.y());
+          if (toward <= 1e-6) continue;
+          const double allowed = clearanceSpeedLimit(
+            std::max(0.0, clearance.distance - command_base_clearance -
+              kClearanceComparisonTolerance), params_.clearance_braking);
+          if (toward > allowed) {
+            if (limiting) *limiting = clearance.distance;
+            if (gradient) *gradient = clearance.gradient.head<2>();
+            if (allowed_toward) *allowed_toward = allowed;
+            return false;
+          }
         }
-      }
-      if (cap < speed) {
-        const double scale = cap / speed;
-        control.vx *= scale;
-        control.vy *= scale;
+        return true;
+      };
+      Eigen::Vector2d gradient = Eigen::Vector2d::Zero();
+      double allowed_toward = 0.0;
+      if (!braking_safe(control.vx, control.vy, &limiting_distance,
+          &gradient, &allowed_toward)) {
+        double candidate_vx = control.vx;
+        double candidate_vy = control.vy;
+        bool projected = false;
+        for (int iteration = 0; iteration < 8; ++iteration) {
+          if (!limitObstacleApproachVelocity(candidate_vx, candidate_vy,
+              gradient.x(), gradient.y(), allowed_toward)) {
+            break;
+          }
+          projected = true;
+          if (braking_safe(candidate_vx, candidate_vy, nullptr,
+              &gradient, &allowed_toward)) {
+            break;
+          }
+        }
+        // Conflicting walls or a discontinuous field may leave no projected
+        // command that passes the whole horizon. Fall back to the existing
+        // scalar search; the final command gate still checks every output.
+        if (!projected || !braking_safe(candidate_vx, candidate_vy, nullptr,
+            nullptr, nullptr)) {
+          candidate_vx = control.vx;
+          candidate_vy = control.vy;
+          double safe_scale = 0.0;
+          double unsafe_scale = 1.0;
+          for (int iteration = 0; iteration < 10; ++iteration) {
+            const double middle = 0.5 * (safe_scale + unsafe_scale);
+            if (braking_safe(middle * control.vx, middle * control.vy,
+                nullptr, nullptr, nullptr)) {
+              safe_scale = middle;
+            } else {
+              unsafe_scale = middle;
+            }
+          }
+          candidate_vx *= safe_scale;
+          candidate_vy *= safe_scale;
+        }
+        control.vx = candidate_vx;
+        control.vy = candidate_vy;
         output.clearance_braking_capped = true;
         output.clearance_braking_distance_m = limiting_distance;
-        output.clearance_braking_allowed_speed = cap;
+        output.clearance_braking_allowed_speed = std::hypot(control.vx, control.vy);
         solver_->setLastControl(Eigen::Vector3d(control.vx, control.vy, control.omega));
       }
     }
@@ -421,17 +490,61 @@ std::optional<double> PathExecutor::narrowPassageHeadingErrorDegrees(
   }
 
   const double full_clearance = effectiveClearanceThreshold(params_.rog_map_clearance);
-  const double alignment_clearance = rotationClearanceRequirement();
+  const double alignment_clearance = alignedBodyClearanceRequirement();
   // Do not align to the robot's current tight cell alone. If the route opens
   // immediately after a wall-hugging start, rotating the chassis toward that
   // old tangent causes unnecessary oscillation. Require a low-clearance point
   // slightly ahead; inside a real corridor the next samples still qualify.
   constexpr double kMinimumAlignmentAhead = 0.15;
+  // The longer lookahead keeps an active alignment aware of an upcoming
+  // section, but a distant point must not rotate the chassis while the robot
+  // is still traversing open space.
   constexpr double kNearNarrowDistance = 0.50;
+  constexpr double kExitNarrowDistance = 0.75;
   constexpr double kExitClearanceHysteresis = 0.03;
   double traveled = 0.0;
   size_t first_narrow = commands.size();
   double nearest_narrow_distance = std::numeric_limits<double>::infinity();
+  Eigen::Vector2d first_narrow_tangent = Eigen::Vector2d::Zero();
+  const auto tangent_at = [&](size_t index) {
+    // A single MINCO segment can change direction sharply when the local
+    // route is refreshed. Use a short chord around the narrow sample so
+    // small waypoint shifts do not repeatedly cancel heading readiness.
+    constexpr double kTangentHalfWindow = 0.15;
+    size_t before = index;
+    size_t after = index;
+    double before_length = 0.0;
+    double after_length = 0.0;
+    while (before > 0U && before_length < kTangentHalfWindow) {
+      before_length += std::hypot(
+        commands[before].position.x - commands[before - 1U].position.x,
+        commands[before].position.y - commands[before - 1U].position.y);
+      --before;
+    }
+    while (after + 1U < commands.size() && after_length < kTangentHalfWindow) {
+      after_length += std::hypot(
+        commands[after + 1U].position.x - commands[after].position.x,
+        commands[after + 1U].position.y - commands[after].position.y);
+      ++after;
+    }
+    const Eigen::Vector2d smoothed(
+      commands[after].position.x - commands[before].position.x,
+      commands[after].position.y - commands[before].position.y);
+    if (smoothed.squaredNorm() > 1.0e-12) return smoothed.normalized().eval();
+    for (size_t i = index; i > 0U; --i) {
+      const Eigen::Vector2d delta(
+        commands[i].position.x - commands[i - 1U].position.x,
+        commands[i].position.y - commands[i - 1U].position.y);
+      if (delta.squaredNorm() > 1.0e-12) return delta.normalized().eval();
+    }
+    for (size_t i = index + 1U; i < commands.size(); ++i) {
+      const Eigen::Vector2d delta(
+        commands[i].position.x - commands[i - 1U].position.x,
+        commands[i].position.y - commands[i - 1U].position.y);
+      if (delta.squaredNorm() > 1.0e-12) return delta.normalized().eval();
+    }
+    return Eigen::Vector2d::Zero().eval();
+  };
   for (size_t i = nearest; i < commands.size(); ++i) {
     if (i > nearest) {
       traveled += std::hypot(
@@ -448,9 +561,17 @@ std::optional<double> PathExecutor::narrowPassageHeadingErrorDegrees(
     }
     if (clearance.distance >= params_.narrow_passage_clearance &&
       clearance.distance < alignment_clearance) {
+      const Eigen::Vector2d tangent = tangent_at(i);
+      if (tangent.squaredNorm() <= 1.0e-12 || !hasOpposingSideObstacles(
+          *rog_query_, Eigen::Vector2d(commands[i].position.x, commands[i].position.y),
+          tangent, clearance.distance)) {
+        continue;
+      }
       nearest_narrow_distance = std::min(nearest_narrow_distance, traveled);
-      if (first_narrow == commands.size() && traveled >= kMinimumAlignmentAhead) {
+      if (first_narrow == commands.size() &&
+        traveled >= kMinimumAlignmentAhead && traveled <= kNearNarrowDistance) {
         first_narrow = i;
+        first_narrow_tangent = tangent;
       }
     }
   }
@@ -461,7 +582,7 @@ std::optional<double> PathExecutor::narrowPassageHeadingErrorDegrees(
     current_clearance.ok && std::isfinite(current_clearance.distance) &&
     current_clearance.distance >=
       std::max(full_clearance + kExitClearanceHysteresis, rotationClearanceRequirement()) &&
-    nearest_narrow_distance > kNearNarrowDistance) {
+    nearest_narrow_distance > kExitNarrowDistance) {
     releaseNarrowPassageAlignment();
     return std::nullopt;
   }
@@ -475,35 +596,21 @@ std::optional<double> PathExecutor::narrowPassageHeadingErrorDegrees(
     }
   }
 
-  Eigen::Vector2d tangent = Eigen::Vector2d::Zero();
-  if (first_narrow < commands.size()) {
-    for (size_t i = first_narrow; i > 0U; --i) {
-      const Eigen::Vector2d delta(
-        commands[i].position.x - commands[i - 1U].position.x,
-        commands[i].position.y - commands[i - 1U].position.y);
-      if (delta.squaredNorm() > 1.0e-12) {
-        tangent = delta.normalized();
-        break;
-      }
-    }
-    if (tangent.squaredNorm() <= 1.0e-12) {
-      for (size_t i = first_narrow + 1U; i < commands.size(); ++i) {
-        const Eigen::Vector2d delta(
-          commands[i].position.x - commands[i - 1U].position.x,
-          commands[i].position.y - commands[i - 1U].position.y);
-        if (delta.squaredNorm() > 1.0e-12) {
-          tangent = delta.normalized();
-          break;
-        }
-      }
-    }
-  }
-  if (tangent.squaredNorm() > 1.0e-12 && first_narrow < commands.size()) {
+  if (first_narrow_tangent.squaredNorm() > 1.0e-12 && first_narrow < commands.size()) {
     if (!narrow_alignment_active_) {
       last_alignment_pose_ = {current_x, current_y};
       narrow_alignment_traveled_m_ = 0.0;
+      // A square body must keep one heading through this constrained section.
+      // Replanning can change the first narrow waypoint and its tangent even
+      // while the walls and chassis have not moved. Latch the entry tangent
+      // until the corridor has genuinely ended and free spin is safe again.
+      last_narrow_tangent_ = first_narrow_tangent;
+    } else if (last_narrow_tangent_.dot(first_narrow_tangent) < -0.5) {
+      // Returning through the same slot reverses travel direction but keeps
+      // the same body axis. Flip only the tangent sign so the adapter can
+      // select reverse travel without turning the square in place.
+      last_narrow_tangent_ = -last_narrow_tangent_;
     }
-    last_narrow_tangent_ = tangent;
     narrow_alignment_active_ = true;
     narrow_alignment_rearm_near_only_ = false;
   }
@@ -555,6 +662,17 @@ double PathExecutor::rotationClearanceRequirement() const
   // EDT measures occupied cell centers; include the half diagonal of a cell.
   const double resolution = rog_query_ ? rog_query_->resolution() : 0.0;
   return params_.swept_radius + params_.rotation_margin +
+    (std::isfinite(resolution) && resolution > 0.0 ?
+      resolution / std::sqrt(2.0) : 0.0);
+}
+
+double PathExecutor::alignedBodyClearanceRequirement() const
+{
+  // For a square body, corner radius / sqrt(2) is the half width while it
+  // travels aligned with the corridor. EDT measures occupied cell centers;
+  // retain the map-cell uncertainty and the configured clearance margin.
+  const double resolution = rog_query_ ? rog_query_->resolution() : 0.0;
+  return params_.swept_radius / std::sqrt(2.0) + params_.rotation_margin +
     (std::isfinite(resolution) && resolution > 0.0 ?
       resolution / std::sqrt(2.0) : 0.0);
 }
@@ -639,7 +757,15 @@ bool PathExecutor::applyClearanceSpeedCap(
       std::max(0.0, clearance.distance - base_clearance -
         kClearanceComparisonTolerance), params_.clearance_braking);
     if (toward > allowed_toward) {
-      point.vel *= allowed_toward / toward;
+      double vx = point.vel.x();
+      double vy = point.vel.y();
+      if (limitObstacleApproachVelocity(
+          vx, vy, clearance.gradient.x(), clearance.gradient.y(), allowed_toward)) {
+        point.vel = Eigen::Vector2d(vx, vy);
+      } else {
+        // An unusable gradient cannot identify the wall tangent.
+        point.vel *= allowed_toward / toward;
+      }
       capped = true;
     }
   }

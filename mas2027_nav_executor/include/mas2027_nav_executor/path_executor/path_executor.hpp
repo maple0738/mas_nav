@@ -28,16 +28,17 @@ struct PathExecutorParams
   /// Narrow-corridor continuation: activates when the measured current
   /// clearance is below the full effective threshold but above this floor, or
   /// when the committed trajectory enters such a band within a short
-  /// lookahead. The latter starts the speed cap before the body reaches the
-  /// corridor mouth; it never grants the floor if the current pose is already
-  /// below it.
+  /// lookahead. The latter uses a braking envelope to reach narrow_passage_speed
+  /// at the corridor mouth; it never grants the floor if the current pose is
+  /// already below it.
   bool narrow_passage_enable{false};
   double narrow_passage_clearance{0.0};
   double narrow_passage_speed{0.5};
   /// Additional clearance for stopping when moving toward an obstacle.
   ClearanceBrakingParams clearance_braking{};
-  /// 几何窄道底盘对齐：不依赖语义 label，在轨迹进入窄带前按轨迹切线
-  /// 给底盘提供航向误差；实际是否允许反向由 gimbal_follow 参数决定。
+  /// 几何窄道底盘对齐：不依赖语义 label。只有轨迹两侧法向探测都显示
+  /// 障碍靠近时才按切线对齐；单侧贴墙仍由独立的 ESDF 净空门处理。
+  /// 实际是否允许反向由 gimbal_follow 参数决定。
   bool narrow_passage_alignment_enable{false};
   double narrow_passage_alignment_lookahead{2.0};
   double narrow_passage_alignment_hold_distance{2.0};
@@ -79,7 +80,8 @@ public:
 
   /// 几何窄道对齐的航向误差（度）：沿已提交轨迹向前扫描至
   /// `narrow_passage_alignment_lookahead`，找到第一个净空落在
-  /// `[narrow_passage_clearance, effective threshold)` 的轨迹点，返回该处
+  /// `[narrow_passage_clearance, aligned-body clearance)` 且左右两侧均有
+  /// 障碍靠近的轨迹点，返回该处
   /// 轨迹切线相对 `current_yaw` 的角度误差。进入后至少保持指定的实际
   /// 行驶里程；之后实测位置恢复宽路且近前方没有窄点时退出。
   /// 短暂地图波动时沿用最后切线。
@@ -133,6 +135,7 @@ private:
     bool follow_gimbal, bool reverse_heading) const;
 
   double rotationClearanceRequirement() const;
+  double alignedBodyClearanceRequirement() const;
 
   minco_controller::MPCConfig config_;
   PathExecutorParams params_;

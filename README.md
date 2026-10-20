@@ -2,7 +2,7 @@
 
 ROS 2 Jazzy，运行链路统一为独立 `nav_executor`：不依赖 Nav2 server、Behavior Tree、Costmap 插件、
 `minco_planner` / `minco_controller` 插件包。唯一入口 `mas2027_nav_bringup/nav_executor_launch.py`。
-本文件是链路、TF、话题与排障总说明；按日期的专题文档在 `docs/`。
+本文件是链路、TF、话题与排障总说明；专题文档见[在线导航](docs/online_navigation.md)、[现场记录与调试](docs/field_debugging.md)和[RoboMaster 无图导航优化方案](docs/robomaster_no_map_navigation.md)。
 
 ## 组件职责
 
@@ -83,7 +83,7 @@ effective_clearance = max(0, collision_dist - kEsdfJitterTolerance)
 
 失败原因按 `failure_log_first_n`(10) 逐条、每 `failure_log_every_n`(25) 次采样、每 `failure_summary_every`(50) 次汇总。`LOCAL_SEED_INVALID` / `..._AFTER_REPAIR` = 没进优化器；`OPTIMIZER_FAILED` = 不收敛；`COLLISION` / `TERRAIN_COLLISION` = 硬校验被否。局部兜底全败时 `Live obstacle blocks the local route...` 会带 `*_reject=` 现场与自动判读 `verdict=`：`GEOMETRY` 连近场规则都过不了（拒绝正确，别动阈值）、`SEED_GATE_STRICTER` 只被更严的种子门否掉、`PREFIX_TOO_SHORT` 卡安全段长度、`TERRAIN` 死在 terrain/动态层、`NONE` 未捕获。
 
-反复急停时先看 `Braking:` 的 `reason=`：`rog_map_stale` / `tf_unavailable` 是数据新鲜度问题，`clearance` 是执行侧指令净空，`terrain_transition` 是地形方向门；不要直接减小 `collision_dist`。细节见 `docs/refusal_triage_2026-09-16.md`。
+反复急停时先看 `Braking:` 的 `reason=`：`rog_map_stale` / `tf_unavailable` 是数据新鲜度问题，`clearance` 是执行侧指令净空，`terrain_transition` 是地形方向门；不要直接减小 `collision_dist`。窄道碰撞与轨迹拒绝的现场核对步骤见[现场记录与调试](docs/field_debugging.md#窄道碰撞与轨迹拒绝)。
 
 ## ROGMap 与 RViz
 
@@ -151,7 +151,7 @@ ros2 launch mas2027_nav_bringup nav_executor_launch.py
 
 导航从特殊地形入口前的 `PREPARING` 阶段开始发送 `follow_gimbal=1` 和角度制 `small_yaw_ref`，经过 `ARMED`、`COMMITTED`、`INSIDE` 和 `RELEASING` 阶段持续跟随，到释放点后清除请求。普通路段不请求跟随。无轨迹/许可、失效输入或串口指令超时会清除跟随请求并停止平移；串口桥退出前发送零速度、无跟随请求的最后一帧。
 
-特殊地形跟随按轨迹轴线对齐：`gimbal_follow.allow_reverse=true`，在轨迹切线及其反方向中选择较近朝向；正反方向切换使用 10° 滞回。`base_link` 的 +X 就是云台正方向，因此 +X 或 -X 与轨迹共线即可，不要求车头一定朝前；同一 MPC 的整个预测窗采用相同选择，MINCO 位置和世界系速度不反号。角度指令由 MPC 角速度前馈加上 LIO 实测轴线误差修正（`heading_error_gain_s=1.0`、`heading_deadband_deg=0.5`、`max_heading_rate_deg_s=120`），所以安全门只停止平移时仍会继续把云台轴线转回轨迹。跟随阶段等待所选轴线误差进入 5°并稳定 0.3 s；健康 MPC 周期承接上一拍命令继续加速，仅在失效/拒绝时锚到实测速度。普通路段上限仍为 3 m/s，角速度/角加速度限制仍为 ±2 rad/s、±4 rad/s²。详见 [倒车跟随与响应速度](docs/reverse_follow_speed_2026-10-17.md)。
+特殊地形跟随按轨迹轴线对齐：`gimbal_follow.allow_reverse=true`，在轨迹切线及其反方向中选择较近朝向；正反方向切换使用 10° 滞回。`base_link` 的 +X 就是云台正方向，因此 +X 或 -X 与轨迹共线即可，不要求车头一定朝前；同一 MPC 的整个预测窗采用相同选择，MINCO 位置和世界系速度不反号。角度指令由 MPC 角速度前馈加上 LIO 实测轴线误差修正（`heading_error_gain_s=1.0`、`heading_deadband_deg=0.5`、`max_heading_rate_deg_s=120`），所以安全门只停止平移时仍会继续把云台轴线转回轨迹。跟随阶段等待所选轴线误差进入 5°并稳定 0.3 s；健康 MPC 周期承接上一拍命令继续加速，仅在失效/拒绝时锚到实测速度。普通路段上限仍为 3 m/s，角速度/角加速度限制仍为 ±2 rad/s、±4 rad/s²。跟随阶段及参数见[区域控制说明](mas2027_nav_executor/docs/region_control.md)。
 
 `force_follow_gimbal` 启动参数已删除；跟随请求完全由特殊地形区域阶段控制。修改跟随控制参数需重启导航，不需要改下位机。
 
@@ -284,5 +284,5 @@ ros2 run tf2_ros tf2_echo map odom && ros2 run tf2_ros tf2_echo odom base_link
 
 点目标后没有轨迹：依次确认 ROGMap 已收到点云与里程计、目标在当前滑窗可达范围内、`/opt_path`
 有发布；MPC 输入过期、TF 失败或求解失败时执行器发零速。实车复跑要保留地图与轨迹证据时，先按
-[现场导航运行记录](docs/field_run_recording.md) 启动记录器。修改记录见
+按[现场记录与调试](docs/field_debugging.md#现场录包)启动记录器；[在线导航说明](docs/online_navigation.md)解释无先验模式。修改记录见
 [`docs/change-history.md`](docs/change-history.md)。

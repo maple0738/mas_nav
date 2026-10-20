@@ -132,7 +132,7 @@ ref_angle_deg += rate * control_dt
 
 CDC1 仍为 16 字节：0xB5 + float32 vx + float32 vy + float32 small_yaw_ref + uint8 follow_gimbal + CRC16；不发送 w、nav_state 或 mode。跟随时 ROS w 仅用于 MPC 角速度观测。串口桥仍为 50 Hz、300 ms 超时；启动、超时和退出前最后一帧清除跟随标志/角度并清零平移。
 
-Foxglove 中 gimbal_heading_error_deg 表示 LIO 云台轴线到较近轨迹轴线的误差，符号只表示转到哪一侧，不代表前进/倒车；gimbal_heading_ready 表示该误差稳定。两者都不是底盘对齐回执。参见 [倒车跟随与响应速度](../../docs/reverse_follow_speed_2026-10-17.md)。
+Foxglove 中 gimbal_heading_error_deg 表示 LIO 云台轴线到较近轨迹轴线的误差，符号只表示转到哪一侧，不代表前进/倒车；gimbal_heading_ready 表示该误差稳定。两者都不是底盘对齐回执。`gimbal_follow.allow_reverse=true` 允许正反轴对齐，`reverse_switch_hysteresis_deg=10` 防止方向抖动；关闭 `allow_reverse` 才要求正向轴线。`heading_error_gain_s`、`heading_deadband_deg`、`max_heading_rate_deg_s` 控制实测误差修正，修改后需重启导航。尚未通过实车验证云台和底盘的对齐精度。
 
 ## 7. 使用与限制
 

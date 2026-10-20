@@ -2,6 +2,10 @@
 #define MINCO_PLANNER__GLOBAL_PATH_SEARCHER_HPP_
 
 #include <mutex>
+#include <optional>
+#include <vector>
+
+#include <Eigen/Core>
 
 #include "minco_core/header.hpp"
 #include "mas2027_nav_executor/common/environment/terrain_grid.hpp"
@@ -111,6 +115,23 @@ private:
   bool last_goal_invalid_{false};
   bool last_goal_blocked_retryable_{false};
   bool last_goal_shifted_{false};
+  // Keep one reachable observed subgoal across rolling-map replans. Remember
+  // completed and failed areas for this mission goal, and briefly preserve a
+  // remembered-route direction when live connectivity changes.
+  std::optional<geometry_msgs::msg::PoseStamped> online_exploration_goal_;
+  std::optional<Eigen::Vector2d> committed_online_subgoal_;
+  bool committed_online_from_history_{false};
+  double committed_online_best_distance_{0.0};
+  double committed_online_progress_stamp_{0.0};
+  std::vector<Eigen::Vector2d> completed_online_subgoals_;
+  struct FailedOnlineSubgoal
+  {
+    Eigen::Vector2d position;
+    double stamp{0.0};
+  };
+  std::vector<FailedOnlineSubgoal> failed_online_subgoals_;
+  std::optional<Eigen::Vector2d> suspended_history_subgoal_;
+  double suspended_history_stamp_{0.0};
   mutable std::mutex search_mutex_;
   rclcpp::Logger logger_{rclcpp::get_logger("GlobalPathSearcher")};
 };

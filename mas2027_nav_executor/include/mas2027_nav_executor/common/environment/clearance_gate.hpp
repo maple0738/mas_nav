@@ -81,6 +81,30 @@ inline double obstacleApproachSpeed(
   return std::max(0.0, -(vx * gradient_x + vy * gradient_y) / gradient_norm);
 }
 
+/// Remove only the excess velocity toward the nearest obstacle. This keeps
+/// motion along a wall when a small lateral correction reaches its braking
+/// limit. Returns false when the gradient cannot define a safe direction.
+inline bool limitObstacleApproachVelocity(
+  double & vx, double & vy, double gradient_x, double gradient_y,
+  double allowed_toward)
+{
+  const double gradient_norm = std::hypot(gradient_x, gradient_y);
+  if (!std::isfinite(vx) || !std::isfinite(vy) ||
+    !std::isfinite(gradient_norm) || gradient_norm < 1e-3 ||
+    !std::isfinite(allowed_toward) || allowed_toward < 0.0) {
+    return false;
+  }
+  const double unit_x = gradient_x / gradient_norm;
+  const double unit_y = gradient_y / gradient_norm;
+  const double toward = std::max(0.0, -(vx * unit_x + vy * unit_y));
+  if (toward > allowed_toward) {
+    const double correction = toward - allowed_toward;
+    vx += correction * unit_x;
+    vy += correction * unit_y;
+  }
+  return true;
+}
+
 /// 从可用 ESDF 净空反求允许速度；非法参数关闭封顶，非法净空交由硬门拒绝。
 inline double clearanceSpeedLimit(double clearance, const ClearanceBrakingParams & params)
 {

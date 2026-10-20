@@ -49,6 +49,8 @@ struct LocalPathSeed
   // 稠密参考线本身低于窄道硬地板时，在局部栅格内搜索并替换为满足该地板的路径。
   // 这条路径仍需通过 MINCO 轨迹门和执行前指令门。
   bool used_narrow_clearance_repair{false};
+  // 双侧受限的低净空段在进入 MINCO 前沿路径法向小幅移向 ESDF 净空峰值。
+  bool used_narrow_centering{false};
   // 当前 ROGMap 窗口内无路可绕，种子停在障碍前的安全点；即使不是任务终点也必须用零末速度。
   bool stop_at_local_end{false};
   // 已生成绕行路径或安全停车前缀但种子仍未过校验：据此区分"修复后被否决"与笼统的 COLLISION。
@@ -107,6 +109,13 @@ private:
     const std::vector<geometry_msgs::msg::PoseStamped> & global_path,
     const Eigen::Vector3d & cur_pos) const;
 
+  bool centerNarrowRoute(std::vector<Eigen::Vector3d> & path,
+    const Eigen::Vector3d & start,
+    const std::shared_ptr<rog_map::MapQueryInterface> & query,
+    double start_clearance, bool start_clearance_ok,
+    const std::function<bool(const Eigen::Vector3d &, const Eigen::Vector3d &)> &
+      terrain_segment_free) const;
+
   bool clipLocalPathByRogBoundary(
     std::vector<Eigen::Vector3d> & path, const PlannerModeContext & mode_context) const;
 
@@ -136,7 +145,8 @@ private:
     const std::function<bool(const Eigen::Vector3d &, const Eigen::Vector3d &)> &
       terrain_segment_free,
     SeedRejectInfo * reject_info = nullptr,
-    double preferred_clearance = 0.0) const;
+    double preferred_clearance = 0.0,
+    double hard_clearance_floor = 0.0) const;
 
   bool searchDynamicDetour(const Eigen::Vector3d & start,
     const Eigen::Vector3d & goal,

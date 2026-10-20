@@ -1,5 +1,6 @@
 #include "mas2027_nav_executor/path_planner/trajectory/local_path_processor.hpp"
 #include "mas2027_nav_executor/common/environment/clearance_gate.hpp"
+#include "mas2027_nav_executor/common/environment/narrow_passage_geometry.hpp"
 
 #include <algorithm>
 #include <array>
@@ -90,6 +91,140 @@ void LocalPathProcessor::setEscapeOptions(bool enable, double min_length,
   escape_buffer_ = std::max(0.0, buffer);
 }
 
+bool LocalPathProcessor::centerNarrowRoute(
+    std::vector<Eigen::Vector3d> &path, const Eigen::Vector3d &start,
+    const std::shared_ptr<rog_map::MapQueryInterface> &query,
+    double start_clearance, bool start_clearance_ok,
+    const std::function<bool(const Eigen::Vector3d &, const Eigen::Vector3d &)> &
+        terrain_segment_free) const {
+  if (!narrow_passage_enable_ || narrow_passage_clearance_ <= 0.0 ||
+      !query || !start.allFinite() || path.size() < 2U ||
+      !std::isfinite(query->resolution()) || query->resolution() <= 0.0) {
+    return false;
+  }
+
+  // SMAC vertices are checked at cell centres; their connecting chords can
+  // run closer to one wall. Work at no more than one map cell per sample and
+  // keep the measured robot position and local endpoint fixed.
+  const double spacing = std::clamp(query->resolution(), 0.025, 0.05);
+  std::vector<Eigen::Vector3d> samples{start};
+  for (const auto &point : path) {
+    if (!point.allFinite()) return false;
+    const Eigen::Vector3d from = samples.back();
+    const double length = (point - from).head<2>().norm();
+    if (length <= 1.0e-6) continue;
+    const int count = std::max(1, static_cast<int>(std::ceil(length / spacing)));
+    for (int step = 1; step <= count; ++step) {
+      samples.push_back(from + (static_cast<double>(step) / count) * (point - from));
+    }
+  }
+  if (samples.size() < 3U) return false;
+
+  constexpr double kMaximumShift = 0.10;
+  constexpr double kShiftStep = 0.025;
+  constexpr double kMinimumGain = 0.005;
+  constexpr double kOffsetPenalty = 0.10;
+  std::vector<double> shifts(samples.size(), 0.0);
+  std::vector<Eigen::Vector2d> normals(samples.size(), Eigen::Vector2d::Zero());
+  for (size_t i = 1U; i + 1U < samples.size(); ++i) {
+    const Eigen::Vector2d delta = (samples[i + 1U] - samples[i - 1U]).head<2>();
+    if (delta.squaredNorm() <= 1.0e-12) continue;
+    const Eigen::Vector2d tangent = delta.normalized();
+    const Eigen::Vector2d normal(-tangent.y(), tangent.x());
+    normals[i] = normal;
+    const auto center = query->query(samples[i]);
+    if (!center.ok || !std::isfinite(center.distance) ||
+        center.distance < narrow_passage_clearance_ - 0.08 ||
+        center.distance >= fullClearanceRequirement() ||
+        !mas2027_nav_executor::hasOpposingSideObstacles(
+          *query, samples[i].head<2>(), tangent, center.distance)) {
+      continue;
+    }
+    double best_score = center.distance;
+    double best_shift = 0.0;
+    for (int step = -4; step <= 4; ++step) {
+      const double shift = step * kShiftStep;
+      if (std::abs(shift) < 1.0e-9 || std::abs(shift) > kMaximumShift) continue;
+      const Eigen::Vector2d moved = samples[i].head<2>() + shift * normal;
+      unsigned int mx = 0U, my = 0U;
+      if (!query->worldToMap(moved.x(), moved.y(), mx, my) || !query->isFree(mx, my)) {
+        continue;
+      }
+      const auto clearance = query->query(Eigen::Vector3d(moved.x(), moved.y(), 0.0));
+      if (!clearance.ok || !std::isfinite(clearance.distance)) continue;
+      const double score = clearance.distance - kOffsetPenalty * std::abs(shift);
+      if (score > best_score + kMinimumGain) {
+        best_score = score;
+        best_shift = shift;
+      }
+    }
+    shifts[i] = best_shift;
+  }
+
+  // At a corridor exit the bilateral test stops as soon as the walls end.
+  // Keep the last offset briefly in the open area so the route does not move
+  // back toward a wall while it is still inside the narrow section.
+  for (size_t i = 1U; i + 1U < samples.size(); ++i) {
+    if (std::abs(shifts[i]) >= 1.0e-3 || std::abs(shifts[i - 1U]) < 1.0e-3) {
+      continue;
+    }
+    const auto clearance = query->query(samples[i]);
+    if (!clearance.ok || !std::isfinite(clearance.distance) ||
+        clearance.distance < fullClearanceRequirement() + 0.10) {
+      continue;
+    }
+    const double step = 0.5 * (samples[i] - samples[i - 1U]).head<2>().norm();
+    shifts[i] = std::copysign(std::max(0.0, std::abs(shifts[i - 1U]) - step),
+                              shifts[i - 1U]);
+  }
+
+  // Rate-limit the lateral offset in both directions. This eases onto the
+  // ridge from the measured pose and returns to the unchanged local endpoint.
+  for (size_t i = 1U; i + 1U < shifts.size(); ++i) {
+    const double max_change = 0.5 * (samples[i] - samples[i - 1U]).head<2>().norm();
+    shifts[i] = std::clamp(shifts[i], shifts[i - 1U] - max_change,
+      shifts[i - 1U] + max_change);
+  }
+  for (size_t i = shifts.size() - 2U; i > 0U; --i) {
+    const double max_change = 0.5 * (samples[i + 1U] - samples[i]).head<2>().norm();
+    shifts[i] = std::clamp(shifts[i], shifts[i + 1U] - max_change,
+      shifts[i + 1U] + max_change);
+  }
+
+  std::vector<Eigen::Vector3d> centered = samples;
+  size_t moved_count = 0U;
+  double maximum_shift = 0.0;
+  for (size_t i = 1U; i + 1U < centered.size(); ++i) {
+    if (std::abs(shifts[i]) < 1.0e-3) continue;
+    centered[i].head<2>() += shifts[i] * normals[i];
+    ++moved_count;
+    maximum_shift = std::max(maximum_shift, std::abs(shifts[i]));
+  }
+  if (moved_count == 0U) return false;
+
+  // Only altered segments need rechecking here. The existing dense-route
+  // repair and final trajectory/command gates handle unrelated tight cells.
+  for (size_t i = 1U; i < centered.size(); ++i) {
+    if (std::abs(shifts[i - 1U]) < 1.0e-3 && std::abs(shifts[i]) < 1.0e-3) continue;
+    SeedRejectInfo reject;
+    if (!segmentClear(query, centered[i - 1U], centered[i], start,
+          start_clearance, start_clearance_ok, terrain_segment_free, &reject,
+          true, 0.0, narrow_passage_clearance_)) {
+      RCLCPP_INFO_THROTTLE(logger_, *rclcpp::Clock::make_shared(), 2000,
+        "[MincoPlanner] Narrow centering candidate rejected at (%.2f, %.2f): "
+        "clearance %.3f m required %.3f m; keeping the original route.",
+        reject.point.x(), reject.point.y(), reject.clearance, reject.required);
+      return false;
+    }
+  }
+  path.assign(centered.begin() + 1U, centered.end());
+  RCLCPP_INFO_THROTTLE(logger_, *rclcpp::Clock::make_shared(), 2000,
+    "[MincoPlanner] Centered %zu two-sided narrow-route samples by at most %.3f m "
+    "before MINCO; trajectory and command clearance gates remain active.",
+    moved_count, maximum_shift);
+  return true;
+}
+
 LocalPathSeed LocalPathProcessor::buildSeed(
     const std::vector<geometry_msgs::msg::PoseStamped> &global_path,
     const geometry_msgs::msg::PoseStamped &current_pose,
@@ -133,6 +268,10 @@ LocalPathSeed LocalPathProcessor::buildSeed(
   const double start_clearance =
       start_clearance_ok ? start_query.distance : 0.0;
 
+  seed.used_narrow_centering = centerNarrowRoute(
+    seed.dense_path, cur_pos, query, start_clearance, start_clearance_ok,
+    terrain_segment_free);
+
   if (start_clearance_ok && start_clearance < 0.0) {
     unsigned int mx = 0, my = 0;
     const bool inside = query->worldToMap(cur_pos.x(), cur_pos.y(), mx, my);
@@ -154,10 +293,7 @@ LocalPathSeed LocalPathProcessor::buildSeed(
   // If no such route exists, the trajectory/command gates still reject any
   // unsafe candidate.
   bool dense_below_narrow_floor = false;
-  if (narrow_passage_enable_ && narrow_passage_clearance_ > 0.0 &&
-      start_clearance_ok &&
-      start_clearance + mas2027_nav_executor::kClearanceComparisonTolerance >=
-      narrow_passage_clearance_) {
+  if (narrow_passage_enable_ && narrow_passage_clearance_ > 0.0 && start_clearance_ok) {
     Eigen::Vector3d previous = cur_pos;
     for (const auto &point : seed.dense_path) {
       SeedRejectInfo reject;
@@ -483,14 +619,16 @@ bool LocalPathProcessor::pathClear(
     double start_clearance, bool start_clearance_ok,
     const std::function<bool(const Eigen::Vector3d &, const Eigen::Vector3d &)>
         &terrain_segment_free,
-    SeedRejectInfo *reject_info, double preferred_clearance) const {
+    SeedRejectInfo *reject_info, double preferred_clearance,
+    double hard_clearance_floor) const {
   if (path.size() < 2U) {
     return false;
   }
   for (size_t i = 1U; i < path.size(); ++i) {
     if (!segmentClear(query, path[i - 1U], path[i], planning_start,
                       start_clearance, start_clearance_ok, terrain_segment_free,
-                      reject_info, preferred_clearance > 0.0, preferred_clearance)) {
+                      reject_info, preferred_clearance > 0.0 || hard_clearance_floor > 0.0,
+                      preferred_clearance, hard_clearance_floor)) {
       return false;
     }
   }
@@ -567,8 +705,20 @@ bool LocalPathProcessor::searchDynamicDetour(
     return false;
   }
   traversable[index(sx, sy)] = query->isFree(sx, sy) ? 1 : 0;
-  if (!cellTraversable(sx, sy) || !cellTraversable(gx, gy)) {
+  if (!cellTraversable(sx, sy)) {
     return false;
+  }
+  if (!cellTraversable(gx, gy)) {
+    // The local endpoint can lie away from its cell center. If that measured
+    // point passes the same continuous gate, allow the target cell only as an
+    // endpoint; incoming edges are checked against the actual goal below.
+    if (!query->isFree(gx, gy) ||
+        !segmentClear(query, goal, goal, start, start_clearance,
+                      start_clearance_ok, terrain_segment_free, nullptr,
+                      true, preferred_clearance, hard_clearance_floor)) {
+      return false;
+    }
+    traversable[index(gx, gy)] = 1;
   }
 
   const size_t source = index(sx, sy);
@@ -610,7 +760,10 @@ bool LocalPathProcessor::searchDynamicDetour(
     }
     const unsigned int x = static_cast<unsigned int>(current % width);
     const unsigned int y = static_cast<unsigned int>(current / width);
-    const Eigen::Vector3d from = cellPoint(x, y);
+    // The returned path replaces the endpoint cell centers with the measured
+    // start and the requested local endpoint. Check those same connectors
+    // during search, not only after selecting a route.
+    const Eigen::Vector3d from = current == source ? start : cellPoint(x, y);
     for (const auto &[dx, dy] : neighbors) {
       const int nx_i = static_cast<int>(x) + dx;
       const int ny_i = static_cast<int>(y) + dy;
@@ -630,11 +783,20 @@ bool LocalPathProcessor::searchDynamicDetour(
                x, static_cast<unsigned int>(static_cast<int>(y) + dy)))) {
         continue;
       }
-      const Eigen::Vector3d to = cellPoint(nx, ny);
-      if (terrain_segment_free && !terrain_segment_free(from, to)) {
+      const size_t next = index(nx, ny);
+      const Eigen::Vector3d to = next == target ? goal : cellPoint(nx, ny);
+      if (preferred_clearance > 0.0 || hard_clearance_floor > 0.0) {
+        // Safe cell centers do not imply a safe chord between them. Reject a
+        // low-clearance edge here so A* can explore another route instead of
+        // returning the shortest route and discarding it at pathClear().
+        if (!segmentClear(query, from, to, start, start_clearance,
+                          start_clearance_ok, terrain_segment_free, nullptr,
+                          true, preferred_clearance, hard_clearance_floor)) {
+          continue;
+        }
+      } else if (terrain_segment_free && !terrain_segment_free(from, to)) {
         continue;
       }
-      const size_t next = index(nx, ny);
       const double step_cost = dx != 0 && dy != 0 ? 1.4142135623730951 : 1.0;
       const double tentative = g_score[current] + step_cost;
       if (tentative >= g_score[next]) {
@@ -644,6 +806,12 @@ bool LocalPathProcessor::searchDynamicDetour(
       parent[next] = static_cast<int>(current);
       open.push(OpenCell{next, tentative + heuristic(nx, ny)});
     }
+  }
+  if (source == target) {
+    detour = {start, goal};
+    return pathClear(detour, start, query, start_clearance, start_clearance_ok,
+                     terrain_segment_free, reject_info, preferred_clearance,
+                     hard_clearance_floor);
   }
   if (source != target && parent[target] < 0) {
     return false;
@@ -666,9 +834,8 @@ bool LocalPathProcessor::searchDynamicDetour(
   detour.front() = start;
   detour.back() = goal;
   return pathClear(detour, start, query, start_clearance, start_clearance_ok,
-                   terrain_segment_free, reject_info,
-                   hard_clearance_floor > 0.0 ? hard_clearance_floor :
-                   preferred_clearance);
+                   terrain_segment_free, reject_info, preferred_clearance,
+                   hard_clearance_floor);
 }
 
 bool LocalPathProcessor::buildSafeStoppingPrefix(
