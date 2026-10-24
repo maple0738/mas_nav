@@ -1,0 +1,46 @@
+mas2027_decision:
+  ros__parameters:
+    # 安全总开关：false 时节点只跑定时器，不发布任何目标。
+    enabled: false
+    tick_period_s: 0.1
+
+    # 导航接口
+    odom_topic: /Odometry
+    odom_frame: odom
+    goal_frame: map          # 纯无图模式改成 odom
+    goal_topic: /goal_pose
+
+    # 点表（launch 会用 share 目录下的 points.yaml 覆盖该路径）
+    points_file: ""
+    mirror_points: false     # 红蓝方复用同一份点表时置 true（y -> -y）
+
+    # 时间窗（相对比赛开始，秒）
+    heal_start_s: 60.0
+    end_rush_s: 300.0
+
+    # 血量比例
+    heal_enter: 0.30
+    heal_exit: 0.60
+    end_rush_hp: 0.50
+
+    # 弹药
+    low_bullet: 20
+
+    # 基地受击
+    base_attack_drop: 300.0
+    base_clear_s: 5.0
+
+    # 巡逻
+    patrol_period_s: 20.0
+
+    # 目标去重
+    goal_dedupe_m: 0.30
+    goal_republish_s: 3.0
+
+    # 调试输入：裁判系统接通前用 ros2 param set 手动注入
+    debug_game_time_s: -1.0
+    debug_hp_ratio: 1.0
+    debug_bullets: 100
+    debug_ally_base_hp: -1.0
+    debug_ally_outpost_hp: -1.0
+    debug_enemy_outpost_active: false

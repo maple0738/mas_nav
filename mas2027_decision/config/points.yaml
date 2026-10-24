@@ -1,0 +1,18 @@
+# 哨兵点表。用 tools/teach_points.py 示教生成，不要手工量取。
+#
+# 格式：[x, y] 或 [x, y, yaw]，单位 m / rad。
+# 坐标含义由 goal_frame 决定：
+#   map  模式 -> 先验地图坐标（推荐）
+#   odom 模式 -> 相对起始位置的场坐标系坐标
+#
+# 红蓝方复用同一份点表时设 mirror_points:=true（y -> -y，yaw -> -yaw）。
+
+start: [0.0, 0.0, 0.0]
+home: [0.0, 0.0, 0.0]
+heal: [0.0, 0.0, 0.0]
+fort: [0.0, 0.0, 0.0]
+outpost_attack: [0.0, 0.0, 0.0]
+outpost_help: [0.0, 0.0, 0.0]
+patrol_a: [0.0, 0.0, 0.0]
+patrol_b: [0.0, 0.0, 0.0]
+enemy_base: [0.0, 0.0, 0.0]

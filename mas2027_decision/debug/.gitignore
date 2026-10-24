@@ -1,0 +1,10 @@
+# 现场材料不入库
+*.bag
+*.db3
+*.mcap
+*.log
+*.csv
+*.png
+*.jpg
+*.svg
+*.json

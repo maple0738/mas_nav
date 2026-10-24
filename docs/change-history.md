@@ -2,6 +2,21 @@
 
 本文件记录由开发任务产生的代码、配置、脚本、资源和文档变更。新记录追加在最上方，不改写旧记录。
 
+## 2026-10-23 — 为 `mas2027_decision` 补充函数、参数与成员注释
+
+- 行为：给 `mas2027_decision` 的源码补注释，便于逐个文件阅读：`decision_core.hpp/.cpp` 每个函数说明用途、参数含义和返回值；`decision_node.cpp` 的构造流程、每个成员函数、全部 ROS 参数和成员变量加行内注释；`point_table.hpp/.cpp` 的字段与函数参数加注释；`start_anchor.hpp` 的每个方法补参数与单位；`decision_params.hpp` 的每个阈值补含义，并修正"比赛时间未知时按不在任何时间窗内处理"的错误描述——实际实现是回血窗口视为打开、末段冲锋不触发；测试用例前补场景说明。无逻辑改动，阈值默认值和行为保持不变。
+- 验证：本机 g++ 15.2 以 `-std=c++17 -Wall -Wextra` 编译 `src/decision_core.cpp` 并通过既有临时断言程序（回血回差、开局窗口、末段冲锋、基地受击、巡逻切换、弹药不足、起点锚定）；对 `start_anchor.hpp`、`point_table.hpp`、`decision_params.hpp` 做 `-fsyntax-only` 检查通过。未在 ROS 2 Jazzy 下构建；`decision_node.cpp`、`point_table.cpp`（依赖 yaml-cpp 与 ROS 头文件）仍未编译。
+
+## 2026-10-23 — 补充 `mas2027_decision` 类型定义的中文注释
+
+- 行为：在 `mas2027_decision/include/mas2027_decision/types.hpp` 为 `Vec2`、`Waypoint`、`Observation` 的每个字段和 `Intent` 的每个枚举值补充中文注释，说明含义、单位、数据来源以及在决策优先级链中的位置；同时注明 `now_s`（本地时钟，巡逻切换用）与 `game_time_s`（比赛时间，时间窗判断用）的区别。无逻辑改动，枚举值和字段默认值保持不变。
+- 验证：本机 g++ 15.2 以 `-std=c++17 -Wall -Wextra` 重新编译 `src/decision_core.cpp` 并运行既有的临时断言程序（回血回差、开局窗口、末段冲锋、基地受击、巡逻切换、弹药不足、起点锚定），全部通过。未在 ROS 2 Jazzy 下构建；注释改动不影响该包其它未编译部分。
+
+## 2026-10-23 — 新增哨兵决策层包骨架 `mas2027_decision`
+
+- 行为：新建 `mas2027_decision` 包，作为决策层与导航执行器之间的唯一交互入口（只发 `/goal_pose`）。包含：纯逻辑决策核心 `DecisionCore`（优先级链：末段低血冲锋 > 回血 latch（0.30 进入 / 0.60 退出）> 基地受击事件（掉血 300 且保持 5 s）> 弹药不足 > 敌方前哨站 > 支援己方前哨站 > 巡逻）；`Observation` / `Intent` / `Goal` 类型；点表读取与红蓝镜像；`StartAnchor` 起点锚定；ROS 节点订阅 `/Odometry`、10 Hz 决策、目标去重（意图变化 / 移动 0.3 m / 3 s 兜底）后发布 `PoseStamped`，`goal_frame` 可选 `map`（地图锚定）或 `odom`（纯无图），并输出 `/debug/decision_intent`；`tools/teach_points.py` 实车示教点表；`config/`、`launch/`、`test/`、`docs/`、`debug/`（录包/日志/CSV/图/笔记目录与 `.gitignore`）。节点默认 `enabled=false`，不发布目标。未修改导航、定位、电控或其它包的任何代码与参数。
+- 验证：用本机 g++ 15.2 以 `-std=c++17 -Wall -Wextra` 独立编译 `src/decision_core.cpp` 通过；另写临时断言程序覆盖回血回差、开局 60 s 内不回血、末段冲锋、基地受击保持与解除、巡逻目标切换、弹药不足回血点、`StartAnchor` 正反变换，全部通过（期间发现并修正测试用例把本地时钟误当比赛时间的错误）。未在 ROS 2 Jazzy 下用 colcon 构建（当前为 Windows 开发机，无 ROS 环境）；`point_table.cpp`（依赖 yaml-cpp）、`decision_node.cpp`、launch 文件、gtest 用例均未编译/未运行；裁判数据未接入，血量/弹药/基地血量/比赛时间目前只能通过 `debug_*` 参数注入。IDE 的 clangd 报错均为缺少 ROS 头文件路径，构建后应消失。
+
 ## 2026-10-20 — RoboMaster 无图导航区域化优化方案
 
 - 行为：新增 `docs/robomaster_no_map_navigation.md`，把现场运行暴露的“墙后目标导致 frontier 来回跳”问题整理为 RoboMaster 场景下的区域化导航方案：近似 `GoalRegion`、8～14 节点 Zone Graph、累计图 geodesic 评分、绕障分支锁、目标可见性/观察点、比赛时间回退，以及保留实时未知区阻断和 0.24/0.26 m 净空硬门的边界。根 `README.md` 增加方案文档入口。本文只描述建议设计，不代表代码已实现。
