@@ -706,16 +706,23 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
     std::make_shared<const std::vector<uint8_t>>(
       mas2027_nav_executor::buildSlopeSideMask(semantic->width, semantic->height,
         semantic->terrain_labels, semantic->uphill_x, semantic->uphill_y)) : nullptr;
-  const auto online_edge = [remembered, live_sides, query](unsigned int x, unsigned int y,
+  const auto online_edge = [remembered, live_sides, semantic, query](unsigned int x, unsigned int y,
       unsigned int next_x, unsigned int next_y) {
     if (live_sides && live_sides->size() ==
         static_cast<size_t>(query->sizeX()) * query->sizeY()) {
+      const auto is_slope = [&semantic](size_t idx) {
+        return semantic && idx < semantic->terrain_labels.size() &&
+          semantic->terrain_labels[idx] == 5U;
+      };
       const size_t a = static_cast<size_t>(y) * query->sizeX() + x;
       const size_t b = static_cast<size_t>(next_y) * query->sizeX() + next_x;
-      if ((*live_sides)[a] || (*live_sides)[b]) return false;
-      if (x != next_x && y != next_y &&
-          ((*live_sides)[static_cast<size_t>(y) * query->sizeX() + next_x] ||
-           (*live_sides)[static_cast<size_t>(next_y) * query->sizeX() + x])) return false;
+      if (((*live_sides)[a] && !is_slope(a)) || ((*live_sides)[b] && !is_slope(b))) return false;
+      if (x != next_x && y != next_y) {
+        const size_t c1 = static_cast<size_t>(y) * query->sizeX() + next_x;
+        const size_t c2 = static_cast<size_t>(next_y) * query->sizeX() + x;
+        if (((*live_sides)[c1] && !is_slope(c1)) || ((*live_sides)[c2] && !is_slope(c2)))
+          return false;
+      }
     }
     if (remembered) {
       double ax = 0.0, ay = 0.0, bx = 0.0, by = 0.0;

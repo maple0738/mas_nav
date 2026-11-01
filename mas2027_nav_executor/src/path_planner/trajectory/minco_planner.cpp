@@ -27,10 +27,21 @@ namespace {
 constexpr uint64_t kTerrainRejectLogFirstN = 10;
 constexpr uint64_t kTerrainRejectLogEveryN = 50;
 
+bool isSlopeCell(const rog_map::MapSnapshot & map, double wx, double wy)
+{
+  if (map.terrain_labels.empty() || map.width <= 0 || map.height <= 0 ||
+      map.resolution <= 0.0) return false;
+  const int ix = static_cast<int>((wx - map.origin_x) / map.resolution);
+  const int iy = static_cast<int>((wy - map.origin_y) / map.resolution);
+  if (ix < 0 || iy < 0 || ix >= map.width || iy >= map.height) return false;
+  return map.terrain_labels[static_cast<size_t>(iy) * map.width + ix] == 5U;
+}
+
 bool onlineSlopeTransition(const rog_map::MapSnapshot & map,
   const std::vector<uint8_t> & sides,
   const Eigen::Vector3d & from, const Eigen::Vector3d & to)
 {
+  if (isSlopeCell(map, from.x(), from.y()) && isSlopeCell(map, to.x(), to.y())) return true;
   return mas2027_nav_executor::terrainSideTransitionAllowed(map.width, map.height,
     map.resolution, map.origin_x, map.origin_y, sides,
     from.x(), from.y(), to.x(), to.y(), false);
@@ -1198,7 +1209,7 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
   std::optional<MincoPerfSample> perf;
   if (record_perf) {
     perf.emplace();
-    perf->stamp_ros = rclcpp::Clock().now().seconds();
+    perf->stamp_ros = nowTime().seconds();
     perf->stamp_steady_ns = PlannerPerformanceMonitor::steadyNowNs();
     perf->planner_mode = mode_params_.planner_mode;
     std::lock_guard<std::mutex> perf_lock(perf_mutex_);
@@ -1312,7 +1323,9 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
     if (semantic || remembered) {
       terrain_segment_free = [semantic, remembered, live_sides](const Eigen::Vector3d & a,
           const Eigen::Vector3d & b) {
-        return (!semantic || onlineSlopeTransition(*semantic, *live_sides, a, b)) &&
+        const bool both_slope = semantic &&
+          isSlopeCell(*semantic, a.x(), a.y()) && isSlopeCell(*semantic, b.x(), b.y());
+        return (both_slope || !semantic || onlineSlopeTransition(*semantic, *live_sides, a, b)) &&
           (!remembered || remembered->terrainTransition(a.x(), a.y(), b.x(), b.y()));
       };
     }
@@ -1338,7 +1351,7 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
 
   std_msgs::msg::Header header_msg;
   header_msg.frame_id = output_frame_;
-  header_msg.stamp = rclcpp::Clock().now();
+  header_msg.stamp = nowTime();
 
   // 4. Determine state (HOT/COLD).
   PlanningState state = PlanningState::COLD_START;
@@ -1365,7 +1378,7 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
   VecDf shifted_durations;
   bool has_shifted_seed = false;
   if (state == PlanningState::HOT_START) {
-    const double now = rclcpp::Clock().now().seconds() + 0.005;  // small buffer
+    const double now = nowTime().seconds() + 0.005;  // small buffer
     const double t_dur = now - last_traj_start_WT;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -1484,7 +1497,7 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
     perf->local_search_time_ms =
       std::chrono::duration<double, std::milli>(opt_start_steady - replan_start).count();
   }
-  auto opt_start_time = rclcpp::Clock().now().seconds();
+  auto opt_start_time = nowTime().seconds();
   double final_cost = minco_config.two_stage_enable ?
     minco_optimizer_->optimizeTwoStage(sparse_path, start_state, end_state, local_vmaxs, opt_traj) :
     minco_optimizer_->optimize(sparse_path, start_state, end_state, local_vmaxs, opt_traj);
@@ -1552,7 +1565,7 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
       has_last_traj = has_last_traj_;
     }
 
-    if (has_last_traj && !isTrajectoryTimeExpired(rclcpp::Clock().now().seconds())) {
+    if (has_last_traj && !isTrajectoryTimeExpired(nowTime().seconds())) {
       RCLCPP_WARN(logger_,
         "[MincoPlanner] Optimization failed (initial_code=%d retry_code=%d); "
         "keeping the previous unexpired trajectory",
@@ -1561,7 +1574,7 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
     return finish(false, "OPTIMIZER_FAILED");
   }
 
-  auto opt_end_time = rclcpp::Clock().now().seconds();
+  auto opt_end_time = nowTime().seconds();
   double opt_duration = opt_end_time - opt_start_time;
   std::cout << GREEN << "[MincoPlanner] Minco optimization time: "
             << opt_duration << " seconds, "
@@ -1655,7 +1668,7 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
     nav_msgs::msg::Path astar_path_msg;
     {
       std::lock_guard<std::mutex> path_lock(path_mutex_);
-      astar_path_msg.header.stamp = rclcpp::Clock().now();
+      astar_path_msg.header.stamp = nowTime();
       astar_path_msg.header.frame_id = output_frame_;
       astar_path_msg.poses = latest_global_path_;
     }
@@ -1663,7 +1676,7 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
   }
 
   last_traj_ = opt_traj;
-  last_traj_.start_WT = rclcpp::Clock().now().seconds();
+  last_traj_.start_WT = nowTime().seconds();
   has_last_traj_ = true;
   last_yaw_traj_ = yaw_traj;
   last_yaw_traj_.start_WT = last_traj_.start_WT;
@@ -1919,7 +1932,7 @@ MincoPlanner::PlanningState MincoPlanner::determinePlanningState(
     return PlanningState::COLD_START;
   }
 
-  double now = rclcpp::Clock().now().seconds() + 0.005;
+  double now = nowTime().seconds() + 0.005;
   double t_dur = now - last_traj_.start_WT;
   if (t_dur <= 0.0 || t_dur >= last_traj_.getTotalDuration()) {
     std::cout << YELLOW << "[MincoPlanner] Hot Start Rejected: Invalid time duration (t_dur=" << t_dur
@@ -2237,10 +2250,21 @@ bool MincoPlanner::validateTrajectory(
       Eigen::Vector3d previous = traj.getPos(0.0);
       for (int i = 1; i <= intervals; ++i) {
         const Eigen::Vector3d current = traj.getPos(dur * i / intervals);
-        if ((semantic && !onlineSlopeTransition(*semantic, live_sides, previous, current)) ||
-            (remembered && !remembered->terrainTransition(
-              previous.x(), previous.y(), current.x(), current.y()))) {
+        const bool both_slope = semantic &&
+          isSlopeCell(*semantic, previous.x(), previous.y()) &&
+          isSlopeCell(*semantic, current.x(), current.y());
+        const bool live_allowed = both_slope || !semantic ||
+          onlineSlopeTransition(*semantic, live_sides, previous, current);
+        const bool remembered_allowed = !remembered || remembered->terrainTransition(
+          previous.x(), previous.y(), current.x(), current.y());
+        if (!live_allowed || !remembered_allowed) {
           last_validation_failure_reason_ = "TERRAIN_SIDE_ENTRY";
+          if (const auto node = node_.lock()) {
+            RCLCPP_WARN_THROTTLE(logger_, *node->get_clock(), 2000,
+              "Slope side rejection: live=%s remembered=%s segment=(%.3f,%.3f)->(%.3f,%.3f)",
+              live_allowed ? "allow" : "block", remembered_allowed ? "allow" : "block",
+              previous.x(), previous.y(), current.x(), current.y());
+          }
           return false;
         }
         previous = current;
@@ -2289,7 +2313,7 @@ void MincoPlanner::publishEmergencyStop(const geometry_msgs::msg::PoseStamped & 
 
   std_msgs::msg::Header header_msg;
   header_msg.frame_id = output_frame_;
-  header_msg.stamp = rclcpp::Clock().now();
+  header_msg.stamp = nowTime();
 
   Eigen::Matrix3d start_state;
   prepareColdStart(current_pose.pose, start_state, std::vector<Eigen::Vector3d>{});
@@ -2335,7 +2359,7 @@ void MincoPlanner::publishSafeCorridorBox(const PolyhedronH & poly)
   visualization_msgs::msg::MarkerArray arr;
 
   visualization_msgs::msg::Marker box;
-  box.header.stamp = rclcpp::Clock().now();
+  box.header.stamp = nowTime();
   box.header.frame_id = output_frame_;
   box.ns = "safe_corridor";
   box.id = 0;
@@ -2466,9 +2490,15 @@ void MincoPlanner::invalidateGlobalPath()
   last_goal_shifted_ = false;
 }
 
+rclcpp::Time MincoPlanner::nowTime() const
+{
+  const auto node = node_.lock();
+  return node ? node->now() : rclcpp::Clock().now();
+}
+
 double MincoPlanner::nowSeconds() const
 {
-  return rclcpp::Clock().now().seconds();
+  return nowTime().seconds();
 }
 
 bool MincoPlanner::getRobotPose(geometry_msgs::msg::PoseStamped & pose) const
@@ -2582,7 +2612,7 @@ void MincoPlanner::publishEscapeCommand(
 
   std_msgs::msg::Header header_msg;
   header_msg.frame_id = output_frame_;
-  header_msg.stamp = rclcpp::Clock().now();
+  header_msg.stamp = nowTime();
   const double current_yaw = getCurrentYawFromOdom();
   utils::publishEscapeCommand(
     current_pose, escape_vel, current_yaw, opt_path_pub_, opt_trajectory_id_, header_msg);
