@@ -4,6 +4,7 @@
 #include <Eigen/Core>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -17,6 +18,7 @@
 #include "utils/optimization/optimization_utils.h"
 
 #include "minco_core/map_query_interface.hpp"
+#include "mas2027_nav_executor/path_planner/trajectory/runup_cost.hpp"
 
 namespace minco_planner {
 
@@ -33,6 +35,7 @@ public:
   // --- Optimizer Configuration ---
   struct Config
   {
+    mas2027_nav_executor::RunupConfig runup;
     double safe_dist{0.3};
     double max_vel{5.0};
     double max_acc{5.0};
@@ -89,6 +92,16 @@ public:
   void setInitPsAndTs(const vec_Vec3f & init_ps, const VecDf & init_ts);
 
   void setMap(const std::shared_ptr<rog_map::MapQueryInterface> & map) { opt_vars_.map = map; }
+  void setPositionConstraint(std::function<rog_map::QueryResult(const Eigen::Vector3d &)> query)
+  { opt_vars_.position_constraint = std::move(query); }
+
+  void setTerrainSampler(mas2027_nav_executor::TerrainSampler sampler)
+  {
+    opt_vars_.terrain_samplers.clear();
+    if (sampler) opt_vars_.terrain_samplers.push_back(std::move(sampler));
+  }
+  void setTerrainSamplers(std::vector<mas2027_nav_executor::TerrainSampler> samplers)
+  { opt_vars_.terrain_samplers = std::move(samplers); }
 
   int lastIterationCount() const { return last_iteration_count_; }
   int lastReturnCode() const { return last_return_code_; }
@@ -125,6 +138,8 @@ private:
   // --- Optimization Runtime Variables ---
   struct OptVars
   {
+    mas2027_nav_executor::RunupConfig runup;
+    std::vector<mas2027_nav_executor::TerrainSampler> terrain_samplers;
     int piece_num;
     int dim_t;
     int dim_p;
@@ -136,6 +151,7 @@ private:
 
     // Environment map pointer.
     std::shared_ptr<rog_map::MapQueryInterface> map;
+    std::function<rog_map::QueryResult(const Eigen::Vector3d &)> position_constraint;
 
     OptimizationStage stage{OptimizationStage::SINGLE_STAGE};
     bool fine_directional_gradient{false};
@@ -189,6 +205,7 @@ private:
     const MatD3f & coeffs,
     const Mat3Df & waypoint_attractor,
     const std::shared_ptr<rog_map::MapQueryInterface> & map,
+    const std::function<rog_map::QueryResult(const Eigen::Vector3d &)> & position_constraint,
     const double & smooth_eps,
     const int & integral_res,
     const VecDf & magnitudeBounds,

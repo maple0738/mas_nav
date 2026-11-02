@@ -102,7 +102,8 @@ static std::optional<RegionPlan> annotateRegionsImpl(
   const tf2_ros::Buffer & tf_buffer,
   const std::array<RegionRule, 3> & rules,
   const std::string & odom_frame,
-  const nav_msgs::msg::OccupancyGrid * online_labels)
+  const nav_msgs::msg::OccupancyGrid * online_labels,
+  TerrainSampler terrain_sampler_odom)
 {
   if (trajectory.cmds.size() < 2) return std::nullopt;
   const std::string source = trajectory.header.frame_id.empty() ? odom_frame :
@@ -180,6 +181,25 @@ static std::optional<RegionPlan> annotateRegionsImpl(
           std::max(0.0, s - rule->prepare_distance),
           std::max(0.0, s - rule->activation_distance),
           std::max(0.0, s - rule->commit_distance), s, 0.0, 0.0};
+        active->release_distance = rule->release_distance;
+        active->entry_position = to_odom.apply(sample);
+        // Use the physical ramp axis when available, oriented in travel direction.
+        const Eigen::Vector2d travel = to_odom.apply(b)-to_odom.apply(a);
+        auto direction = terrain_sampler_odom ? terrain_sampler_odom(
+          active->entry_position.x(),active->entry_position.y()) : rog_map::TerrainDirectionSample{};
+        if (direction.uphill.norm() < 0.5 && terrain) {
+          const auto p = to_map.apply(sample);
+          direction = terrain->sampleTerrain(p.x(),p.y());
+          Eigen::Matrix2d rotation;
+          const double c = to_odom.c*to_map.c+to_odom.s*to_map.s;
+          const double sn = to_odom.s*to_map.c-to_odom.c*to_map.s;
+          rotation << c,-sn,sn,c;
+          direction.uphill = rotation*direction.uphill;
+        }
+        active->entry_axis = direction.uphill.norm() >= 0.5 ? direction.uphill.normalized() :
+          (travel.norm() > 1e-9 ? Eigen::Vector2d(travel.normalized()) : Eigen::Vector2d::Zero());
+        if (active->entry_axis.dot(travel) < 0) active->entry_axis *= -1;
+
       }
     }
   }
@@ -212,9 +232,10 @@ std::optional<RegionPlan> annotateRegions(
   const tf2_ros::Buffer & tf_buffer,
   const std::array<RegionRule, 3> & rules,
   const std::string & odom_frame,
-  const nav_msgs::msg::OccupancyGrid * online_labels)
+  const nav_msgs::msg::OccupancyGrid * online_labels,
+  TerrainSampler terrain_sampler_odom)
 {
-  return annotateRegionsImpl(trajectory, &terrain, tf_buffer, rules, odom_frame, online_labels);
+  return annotateRegionsImpl(trajectory, &terrain, tf_buffer, rules, odom_frame, online_labels, std::move(terrain_sampler_odom));
 }
 
 std::optional<RegionPlan> annotateOnlineRegions(
@@ -222,9 +243,10 @@ std::optional<RegionPlan> annotateOnlineRegions(
   const tf2_ros::Buffer & tf_buffer,
   const std::array<RegionRule, 3> & rules,
   const std::string & odom_frame,
-  const nav_msgs::msg::OccupancyGrid * online_labels)
+  const nav_msgs::msg::OccupancyGrid * online_labels,
+  TerrainSampler terrain_sampler_odom)
 {
-  return annotateRegionsImpl(trajectory, nullptr, tf_buffer, rules, odom_frame, online_labels);
+  return annotateRegionsImpl(trajectory, nullptr, tf_buffer, rules, odom_frame, online_labels, std::move(terrain_sampler_odom));
 }
 
 RegionController::RegionController(uint8_t normal_mode, double normal_speed,
@@ -239,6 +261,14 @@ void RegionController::setPlan(std::shared_ptr<const RegionPlan> plan)
 {
   if (plan_ == plan) return;
   alignment_segment_.reset();
+  retained_alignment_active_ = false;
+  if (!plan) {
+    alignment_memory_.reset();
+    mode_ = normal_mode_;
+    label_.reset();
+    target_speed_limit_ = normal_speed_;
+    target_acceleration_limit_ = normal_acceleration_;
+  }
   if (plan_ && plan && plan_->trajectory_id == plan->trajectory_id) {
     // The online semantic map can change while the trajectory stays the same.
     // Preserve path progress but reselect the active segment from the new plan.
@@ -265,10 +295,51 @@ void RegionController::setPlan(std::shared_ptr<const RegionPlan> plan)
   last_position_odom_.reset();
 }
 
-uint8_t RegionController::update(const Eigen::Vector2d & position_odom)
+bool RegionController::frontEntryAllowed(const RegionSegment & segment,
+  const Eigen::Vector2d & position) const
+{
+  if (!front_entry_enable_ || segment.label != 5U || progress_ >= segment.enter_s) return true;
+  if (segment.entry_axis.norm() < 0.5) return false;
+  const Eigen::Vector2d delta = segment.entry_position-position;
+  const double along = delta.dot(segment.entry_axis);
+  const double lateral = std::abs(delta.x()*segment.entry_axis.y()-delta.y()*segment.entry_axis.x());
+  // Re-enter at the strict tolerance, but do not reset the lower-board angle
+  // baseline for one map cell of lateral jitter after alignment has started.
+  // Only the same nearby ramp, in the same travel direction, can retain it.
+  const bool continuing = alignment_memory_ && alignment_memory_->segment.label == 5U &&
+    (position - alignment_memory_->position_odom).norm() < alignment_memory_->release_distance &&
+    (segment.entry_position - alignment_memory_->segment.entry_position).norm() <
+      alignment_memory_->release_distance &&
+    segment.entry_axis.dot(alignment_memory_->segment.entry_axis) >= 0.95;
+  const double lateral_limit = front_entry_lateral_ +
+    (continuing ? front_entry_lateral_hysteresis_ : 0.0);
+  if (along < -0.05 || lateral > lateral_limit) return false;
+  // Position alone is insufficient at a hairpin: finish the approach turn first.
+  for (size_t i = 1; i < plan_->positions_odom.size(); ++i) {
+    if (plan_->arc_lengths[i] <= progress_+1e-6) continue;
+    const Eigen::Vector2d tangent = plan_->positions_odom[i]-plan_->positions_odom[i-1];
+    if (tangent.norm() > 1e-9)
+      return tangent.normalized().dot(segment.entry_axis) >= front_entry_cosine_;
+  }
+  return false;
+}
+
+uint8_t RegionController::update(const Eigen::Vector2d & position_odom,
+  double minimum_prepare_distance)
 {
   alignment_segment_.reset();
+  retained_alignment_active_ = false;
   if (!plan_ || plan_->positions_odom.size() < 2 || !position_odom.allFinite()) return mode_;
+  const auto remember_alignment = [this, &position_odom](const RegionSegment & segment) {
+    const double extent = segment.release_s - segment.exit_s;
+    const double release = std::isfinite(extent) ? extent : segment.release_distance;
+    if (std::isfinite(release) && release > 0.0) {
+      alignment_memory_ = AlignmentMemory{
+        segment, position_odom, release, mode_, plan_->trajectory_id};
+    } else {
+      alignment_memory_.reset();
+    }
+  };
   const double moved = last_position_odom_ ?
     (position_odom - *last_position_odom_).norm() : 0.25;
   const double maximum_s = progress_ + 2.0 * moved + 0.02;
@@ -286,13 +357,25 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom)
       phase_ = progress_ < held.commit_s ? RegionPhase::ARMED :
         progress_ < held.enter_s ? RegionPhase::COMMITTED :
         progress_ < held.exit_s ? RegionPhase::INSIDE : RegionPhase::RELEASING;
+      remember_alignment(held);
       return mode_;
     }
     held_segment_.reset();
   }
   for (size_t i = 0; i < plan_->segments.size(); ++i) {
     const auto & segment = plan_->segments[i];
-    if (progress_ < segment.prepare_s) break;
+    // Keep ordinary spin until the configured front-entry window. Braking
+    // toward that window is independent of the lower-board follow request.
+    const bool prepare_early = !(front_entry_enable_ && segment.label == 5U);
+    const double prepare_s = prepare_early && std::isfinite(minimum_prepare_distance) &&
+      minimum_prepare_distance > 0.0 ?
+      std::max(0.0, std::min(segment.prepare_s, segment.enter_s - minimum_prepare_distance)) :
+      segment.prepare_s;
+    if (progress_ < prepare_s) break;
+    if (!frontEntryAllowed(segment,position_odom)) {
+      alignment_memory_.reset();
+      break;
+    }
     if (progress_ < segment.active_s) {
       alignment_segment_ = i;
       target_speed_limit_ = segment.max_speed;
@@ -300,6 +383,7 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom)
       label_ = segment.label;
       mode_ = normal_mode_;
       phase_ = RegionPhase::PREPARING;
+      remember_alignment(segment);
       return mode_;
     }
     if (progress_ < segment.release_s) {
@@ -312,9 +396,31 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom)
       phase_ = progress_ < segment.commit_s ? RegionPhase::ARMED :
         progress_ < segment.enter_s ? RegionPhase::COMMITTED :
         progress_ < segment.exit_s ? RegionPhase::INSIDE : RegionPhase::RELEASING;
+      remember_alignment(segment);
       return mode_;
     }
   }
+  // A new MINCO trajectory or a missing semantic sample must not release the
+  // lower board back into free spin at the preparation boundary. Retain the
+  // observed region over its existing release distance, measured in odometry;
+  // use the NEW trajectory tangent for heading, not an obsolete angle.
+  if (alignment_memory_ && plan_->trajectory_id == alignment_memory_->trajectory_id &&
+    progress_ >= alignment_memory_->segment.release_s) {
+    alignment_memory_.reset();
+  }
+  if (alignment_memory_ &&
+    (position_odom - alignment_memory_->position_odom).norm() <
+    alignment_memory_->release_distance) {
+    const auto & memory = *alignment_memory_;
+    mode_ = memory.mode;
+    label_ = memory.segment.label;
+    target_speed_limit_ = memory.segment.max_speed;
+    target_acceleration_limit_ = memory.segment.max_acceleration;
+    phase_ = mode_ == normal_mode_ ? RegionPhase::PREPARING : RegionPhase::RELEASING;
+    retained_alignment_active_ = true;
+    return mode_;
+  }
+  alignment_memory_.reset();
   mode_ = normal_mode_;
   target_speed_limit_ = normal_speed_;
   target_acceleration_limit_ = normal_acceleration_;
@@ -323,11 +429,32 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom)
   return mode_;
 }
 
+std::optional<double> RegionController::distanceToSlopeAlignment() const
+{
+  if (!front_entry_enable_ || alignmentActive() || !plan_) return std::nullopt;
+  for (const auto & segment : plan_->segments) {
+    if (segment.label == 5U && progress_ < segment.enter_s) {
+      return std::max(0.0, segment.prepare_s - progress_);
+    }
+  }
+  return std::nullopt;
+}
+
 std::optional<double> RegionController::trajectoryHeadingErrorDegrees(double lio_yaw_rad) const
 {
-  if (!plan_ || !std::isfinite(lio_yaw_rad) ||
-    !alignment_segment_ || *alignment_segment_ >= plan_->segments.size() ||
+  // Only a slope requests heading alignment. Other region labels retain their
+  // mode and speed profiles without changing the lower board's free spin.
+  if (label_ != 5U || !plan_ || !std::isfinite(lio_yaw_rad) ||
+    (!retained_alignment_active_ &&
+      (!alignment_segment_ || *alignment_segment_ >= plan_->segments.size())) ||
     plan_->positions_odom.size() != plan_->arc_lengths.size()) return std::nullopt;
+  if (front_entry_enable_ && alignment_segment_) {
+    const auto & segment = plan_->segments[*alignment_segment_];
+    if (progress_ < segment.enter_s && segment.entry_axis.norm() >= 0.5) {
+      const double offset = std::atan2(segment.entry_axis.y(),segment.entry_axis.x())-lio_yaw_rad;
+      return std::atan2(std::sin(offset),std::cos(offset))*(180.0/3.14159265358979323846);
+    }
+  }
   // Follow the current MINCO path tangent, including changes inside a curved region.
   // At a vertex prefer the outgoing segment; at the end retain the last nonzero tangent.
   const double target_s = progress_;

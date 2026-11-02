@@ -3,6 +3,7 @@
 
 #include "mas2027_nav_executor/common/control/goal_approach.hpp"
 #include "minco_core/header.hpp"
+#include "mas2027_nav_executor/path_planner/search/directed_terrain.hpp"
 #include "minco_core/performance/planner_performance_monitor.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
 
@@ -66,6 +67,8 @@ public:
     const geometry_msgs::msg::PoseStamped & goal) const;
   bool lastGoalShifted() const { return last_goal_shifted_; }
   bool copyLatestGlobalGoal(geometry_msgs::msg::PoseStamped & goal) const;
+  // Configured planners share their lifecycle node's ROS / simulation clock.
+  rclcpp::Time nowTime() const;
   double nowSeconds() const;
   bool isTrajectoryTimeExpired(double now_s) const;
   double getLookaheadDist() const { return lookahead_dist_; }
@@ -178,13 +181,15 @@ private:
   double smac_esdf_max_cost_{0.5};
   double smac_minimum_clearance_{0.0};
   double smac_relaxed_minimum_clearance_{0.0};
+  /// 台阶/高度突变边界的独立中心净空；比普通墙面净空大，避免贴边。
+  double height_clearance_{0.40};
   bool use_yaw_opt_{true};
+  bool terrain_side_gate_enable_{true};
+  mas2027_nav_executor::DirectedTerrainConfig directed_terrain_;
   bool exploration_unknown_as_occupied_{true};
   bool exploration_prefer_goal_direction_{true};
   double exploration_boundary_margin_{0.8};
   double exploration_boundary_sample_step_{0.1};
-  double lidar_offset_x_{0.0};
-  double lidar_offset_y_{-0.2};
   double lookahead_dist_;
   double traj_goal_tolerance_{0.15};
   double collision_dist_{0.30};

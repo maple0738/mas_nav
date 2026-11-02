@@ -70,6 +70,19 @@ public:
       if (!reverse && std::abs(forward_error) > 90.0 + band) reverse = true;
       if (reverse && std::abs(forward_error) < 90.0 - band) reverse = false;
     }
+    // The position command is limited to [-180, 180] deg and must not wrap.
+    // If the nearer axis needs a target beyond that limit, the integrator
+    // saturates with a constant error and heading never becomes ready. The
+    // opposite axis is then always reachable (targets differ by 180 deg).
+    if (params_.allow_reverse && following_) {
+      const auto target = [this, forward_error](bool use_reverse) {
+        return command_deg_ + std::remainder(forward_error + (use_reverse ? 180.0 : 0.0), 360.0);
+      };
+      if (std::abs(target(reverse)) > kCommandLimitDeg &&
+          std::abs(target(!reverse)) <= kCommandLimitDeg) {
+        reverse = !reverse;
+      }
+    }
     reverse_heading_ = reverse;
     following_ = true;
     holding_ = false;
@@ -111,11 +124,12 @@ public:
       rate_deg_s = std::clamp(
         rate_deg_s, -params_.max_heading_rate_deg_s, params_.max_heading_rate_deg_s);
       // This is a position offset: wrapping would jump the lower INS target by 360 degrees.
-      command_deg_ = std::clamp(command_deg_ + rate_deg_s * dt, -180.0, 180.0);
+      command_deg_ = std::clamp(command_deg_ + rate_deg_s * dt, -kCommandLimitDeg, kCommandLimitDeg);
     }
     return command_deg_;
   }
 private:
+  static constexpr double kCommandLimitDeg = 180.0;
   GimbalFollowParams params_;
   double command_deg_{}, settled_s_{}, heading_error_deg_{};
   bool heading_ready_{}, following_{}, holding_{}, reverse_heading_{}, has_command_{};

@@ -17,7 +17,9 @@
 #include "interfaces/msg/chassis_command.hpp"
 #include "interfaces/msg/region_status.hpp"
 #include "mas2027_nav_executor/common/environment/region_control.hpp"
+#include "mas2027_nav_executor/common/environment/online_global_map.hpp"
 #include "mas2027_nav_executor/common/control/gimbal_follow_adapter.hpp"
+#include "mas2027_nav_executor/common/control/goal_approach.hpp"
 #include "mas2027_nav_executor/path_executor/mpc/mpc_solver.hpp"
 #include "mas2027_nav_executor/path_planner/path_planner.hpp"
 #include "mas2027_nav_executor/path_executor/path_executor.hpp"
@@ -207,12 +209,6 @@ public:
       declare_parameter<double>("planner.minco_optimizer.clearance_braking.deceleration", 1.2);
     executor_params.clearance_braking.reaction_time =
       declare_parameter<double>("planner.minco_optimizer.clearance_braking.reaction_time", 0.20);
-    executor_params.narrow_passage_alignment_enable =
-      declare_parameter<bool>("planner.minco_optimizer.narrow_passage_alignment_enable", true);
-    executor_params.narrow_passage_alignment_lookahead =
-      declare_parameter<double>("planner.minco_optimizer.narrow_passage_alignment_lookahead", 2.0);
-    executor_params.narrow_passage_alignment_hold_distance =
-      declare_parameter<double>("planner.minco_optimizer.narrow_passage_alignment_hold_distance", 2.0);
     // 目标接近减速带：与规划侧共用同一组 YAML 键，保证"种子限速"和"参考限速"
     // 用的是同一个实测刹车能力；deceleration<=0 表示关闭。
     executor_params.goal_approach.deceleration =
@@ -224,6 +220,7 @@ public:
     executor_params.goal_approach.reaction_time =
       declare_parameter<double>("planner.minco_optimizer.goal_approach.reaction_time", 0.20);
     goal_approach_deceleration_ = executor_params.goal_approach.deceleration;
+    alignment_braking_ = executor_params.goal_approach;
     executor_params.rog_map_timeout_s = declare_parameter<double>("node.rog_map_timeout_s", 0.5);
     executor_params.control_delay_s = declare_parameter<double>("mpc.control_delay_compensation");
     executor_params.secondary_reference_enable =
@@ -300,6 +297,17 @@ public:
     region_controller_ = std::make_unique<RegionController>(
       static_cast<uint8_t>(normal_mode), normal_max_speed, normal_max_acceleration,
       speed_blend_rate, acceleration_blend_rate);
+    const bool front_entry = declare_parameter<bool>("region_control.slope.front_entry.enable", true);
+    const double front_lateral = declare_parameter<double>("region_control.slope.front_entry.lateral_tolerance", 0.15);
+    const double front_cosine = declare_parameter<double>("region_control.slope.front_entry.min_alignment_cosine", 0.8);
+    const double front_hysteresis = declare_parameter<double>(
+      "region_control.slope.front_entry.lateral_hysteresis", 0.05);
+    if (!std::isfinite(front_lateral) || front_lateral <= 0 ||
+        !std::isfinite(front_cosine) || front_cosine <= 0 || front_cosine > 1 ||
+        !std::isfinite(front_hysteresis) || front_hysteresis < 0 || front_hysteresis > front_lateral)
+      throw std::invalid_argument("Invalid slope front-entry geometry");
+    region_controller_->setFrontEntryGate(front_entry,front_lateral,front_cosine,front_hysteresis);
+
 
     if (executor_params.narrow_passage_enable &&
       std::isfinite(swept_radius) && swept_radius > 0.0 &&
@@ -335,11 +343,6 @@ public:
        (!std::isfinite(executor_params.narrow_passage_clearance) ||
         executor_params.narrow_passage_clearance <= 0.0 ||
         executor_params.narrow_passage_clearance >= executor_params.rog_map_clearance)) ||
-      (executor_params.narrow_passage_alignment_enable &&
-       (!std::isfinite(executor_params.narrow_passage_alignment_lookahead) ||
-        executor_params.narrow_passage_alignment_lookahead <= 0.0 ||
-        !std::isfinite(executor_params.narrow_passage_alignment_hold_distance) ||
-        executor_params.narrow_passage_alignment_hold_distance < 0.0)) ||
       (executor_params.goal_approach.deceleration > 0.0 &&
        !executor_params.goal_approach.valid()) ||
       (executor_params.secondary_reference_enable &&
@@ -380,15 +383,13 @@ public:
     }
     RCLCPP_INFO(get_logger(),
       "Clearance policy: corridor_radius=%.3f m swept_radius=%.3f m regular=%.2f m narrow=%.3f m "
-      "brake_decel=%.2f m/s^2 reaction=%.2f s geometric_alignment=%s align_hold=%.2f m",
+      "brake_decel=%.2f m/s^2 reaction=%.2f s heading_alignment=slope_only",
       corridor_radius, swept_radius,
       effectiveClearanceThreshold(executor_params.rog_map_clearance),
       executor_params.narrow_passage_enable ? executor_params.narrow_passage_clearance :
       effectiveClearanceThreshold(executor_params.rog_map_clearance),
       executor_params.clearance_braking.deceleration,
-      executor_params.clearance_braking.reaction_time,
-      executor_params.narrow_passage_alignment_enable ? "on" : "off",
-      executor_params.narrow_passage_alignment_hold_distance);
+      executor_params.clearance_braking.reaction_time);
 
     // ── 地图与规划层：TerrainGrid 管静态语义地图；PathPlanner 管全局搜索、MINCO 和在线 ROGMap。
     if (!online_only) terrain_grid_ = std::make_shared<TerrainGrid>();
@@ -712,9 +713,13 @@ private:
       online_labels_fresh(*online_labels, received_s, current_s);
     bool online_applied = online_current;
     std::shared_ptr<const RegionPlan> plan;
+    const auto remembered = std::dynamic_pointer_cast<OnlineGlobalMapSnapshot>(path_planner_->globalMapQuery());
+    TerrainSampler terrain_sampler;
+    if (remembered && persistent_online_terrain_ && online_current) terrain_sampler =
+      [remembered](double x,double y) { return remembered->sampleTerrain(x,y); };
     if (const auto terrain = terrain_grid_ ? terrain_grid_->snapshot() : nullptr) {
       auto annotated = annotateRegions(*trajectory, *terrain, *tf_buffer_,
-        region_rules_, odom_frame_, online_current ? online_labels.get() : nullptr);
+        region_rules_, odom_frame_, online_current ? online_labels.get() : nullptr, terrain_sampler);
       if (!annotated && online_current) {
         // Conflicting online regions can create overlapping mode windows.
         // Keep the known static annotation for this update.
@@ -727,7 +732,7 @@ private:
       }
     } else if (!terrain_grid_) {
       auto annotated = annotateOnlineRegions(*trajectory, *tf_buffer_, region_rules_,
-        odom_frame_, online_current ? online_labels.get() : nullptr);
+        odom_frame_, online_current ? online_labels.get() : nullptr, terrain_sampler);
       if (!annotated && online_current) {
         // Conflicting online mode windows must not stop ordinary driving. Retry
         // without semantic labels so the trajectory gets a normal, segment-free
@@ -777,27 +782,35 @@ private:
 
     region_controller_->setPlan(region_plan);
     if (input.odom) {
+      double prepare_distance = 0.0;
+      const double speed = std::hypot(input.odom->twist.twist.linear.x,
+        input.odom->twist.twist.linear.y);
+      if (alignment_braking_.valid() && std::isfinite(speed) &&
+        std::abs((input.stamp - rclcpp::Time(input.odom->header.stamp)).seconds()) <=
+        alignment_odom_timeout_s_) {
+        prepare_distance = speed * alignment_braking_.reaction_time +
+          speed * speed / (2.0 * alignment_braking_.deceleration) +
+          alignment_braking_.stop_margin;
+      }
       region_controller_->update({input.odom->pose.pose.position.x,
-        input.odom->pose.pose.position.y});
+        input.odom->pose.pose.position.y}, prepare_distance);
     }
     region_controller_->tickProfile(1.0 / control_rate_hz_);
     input.region_speed_limit = region_controller_->speedLimit();
     input.region_acceleration_limit = region_controller_->accelerationLimit();
-    if (input.odom &&
-      std::abs((input.stamp - rclcpp::Time(input.odom->header.stamp)).seconds()) <=
-      alignment_odom_timeout_s_ &&
-      std::isfinite(input.odom->pose.pose.position.x) &&
-      std::isfinite(input.odom->pose.pose.position.y)) {
-      path_executor_->updateNarrowPassageAlignmentPose(
-        input.odom->pose.pose.position.x, input.odom->pose.pose.position.y);
+    if (const auto distance = region_controller_->distanceToSlopeAlignment();
+      distance && alignment_braking_.valid()) {
+      // Stop at the alignment window using the existing measured braking
+      // envelope, while keeping ordinary spin until that window is reached.
+      const double cap = goalApproachSpeedLimit(
+        *distance + alignment_braking_.stop_margin, alignment_braking_);
+      if (cap < input.region_speed_limit) {
+        input.region_speed_limit = cap;
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+          "Slope approach braking while spinning: alignment_window=%.2f m allowed=%.2f m/s",
+          *distance, cap);
+      }
     }
-    if (!path_planner_->hasActiveGoal() &&
-        path_executor_->releaseNarrowPassageAlignmentAtGoal()) {
-      RCLCPP_INFO(get_logger(),
-        "Narrow alignment completed at goal after %.2f m of odometry travel",
-        path_executor_->narrowPassageAlignmentTraveled());
-    }
-
     std::optional<double> heading_error;
     bool semantic_alignment = false;
     // Follow a valid road heading even while the MPC or collision gate brakes translation.
@@ -811,26 +824,8 @@ private:
         std::isfinite(input.odom->pose.pose.position.x) &&
         std::isfinite(input.odom->pose.pose.position.y)) {
         const double lio_yaw = tf2::getYaw(q);
-        // Once the square has entered a geometric narrow section, keep its
-        // latched corridor heading even if a terrain label also requests a
-        // semantic heading. Switching targets inside the slot would rotate
-        // the corners and repeatedly revoke heading readiness.
-        if (path_executor_->narrowPassageAlignmentActive()) {
-          heading_error = path_executor_->narrowPassageHeadingErrorDegrees(
-            *input.trajectory, input.odom->pose.pose.position.x,
-            input.odom->pose.pose.position.y, lio_yaw);
-        }
-        if (!heading_error) {
-          heading_error = region_controller_->trajectoryHeadingErrorDegrees(lio_yaw);
-          semantic_alignment = heading_error.has_value();
-          if (!heading_error) {
-            // 5.5.5.4.4: align only where both sides of a low-clearance route
-            // are constrained, before the body reaches the corridor mouth.
-            heading_error = path_executor_->narrowPassageHeadingErrorDegrees(
-              *input.trajectory, input.odom->pose.pose.position.x,
-              input.odom->pose.pose.position.y, lio_yaw);
-          }
-        }
+        heading_error = region_controller_->trajectoryHeadingErrorDegrees(lio_yaw);
+        semantic_alignment = heading_error.has_value();
       }
     }
     bool odom_pose_current = false;
@@ -843,26 +838,25 @@ private:
         std::isfinite(input.odom->pose.pose.position.x) &&
         std::isfinite(input.odom->pose.pose.position.y);
     }
-    // A planner retry gap must not hand the chassis back to its free-spin mode.
+    // A planner retry gap inside a slope must not restore free spin.
     // The lower board keeps the gimbal target relative to auto_yaw_offset; if we
     // clear follow and ref=0 between trajectories, the chassis spins while the
     // next trajectory is searched and the next translation command can end up in
     // the opposite direction. Hold the last valid angle with zero translation
-    // until the same active goal yields another trajectory (or is finished).
+    // while the same active goal remains in the slope's region window.
     const bool hold_gimbal_alignment = !heading_error &&
       gimbal_follow_adapter_->hasCommand() &&
-      (path_executor_->narrowPassageAlignmentActive() ||
-       (gimbal_hold_enabled_ && input.trajectory && !input.allow_motion &&
-        odom_pose_current && path_planner_->hasActiveGoal()));
+      gimbal_hold_enabled_ && input.trajectory &&
+      region_controller_->label() == 5U && region_controller_->alignmentActive() &&
+      odom_pose_current && path_planner_->hasActiveGoal();
     const auto follow = hold_gimbal_alignment ?
       gimbal_follow_adapter_->hold() :
       gimbal_follow_adapter_->updateHeading(heading_error, 1.0 / control_rate_hz_);
     input.follow_gimbal = follow.follow_gimbal;
     input.reverse_follow_heading = follow.reverse_heading;
-    // The aligned square can translate through a slot narrower than its
-    // rotating envelope. Wait for measured heading before entering it.
+    // Wait for measured heading in the slope's prepare/inside/release window.
     input.hold_translation = follow.follow_gimbal && !follow.heading_ready &&
-      (semantic_alignment || path_executor_->narrowPassageAlignmentActive());
+      semantic_alignment;
     if (heading_error) {
       input.alignment_heading_odom = tf2::getYaw(input.odom->pose.pose.orientation) +
         follow.heading_error_deg * (3.14159265358979323846 / 180.0);
@@ -919,11 +913,10 @@ private:
     chassis_command.follow_gimbal = follow.follow_gimbal;
     if (!has_follow_gimbal_state_ || chassis_command.follow_gimbal != last_follow_gimbal_) {
       RCLCPP_INFO(get_logger(),
-        "Chassis alignment transition: follow=%s geometric=%s traveled=%.2f m "
+        "Chassis alignment transition: follow=%s slope=%s "
         "hold=%s heading=%s allow_motion=%s active_goal=%s odom_current=%s",
         chassis_command.follow_gimbal ? "true" : "false",
-        path_executor_->narrowPassageAlignmentActive() ? "true" : "false",
-        path_executor_->narrowPassageAlignmentTraveled(),
+        region_controller_->label() == 5U ? "true" : "false",
         hold_gimbal_alignment ? "true" : "false",
         heading_error ? "true" : "false",
         input.allow_motion ? "true" : "false",
@@ -941,7 +934,7 @@ private:
     region_status.mode = region_controller_->mode();
     region_status.phase = static_cast<uint8_t>(region_controller_->phase());
     region_status.path_progress = static_cast<float>(region_controller_->progress());
-    region_status.speed_limit = static_cast<float>(region_controller_->speedLimit());
+    region_status.speed_limit = static_cast<float>(input.region_speed_limit);
     region_status.gimbal_heading_error_deg = static_cast<float>(follow.heading_error_deg);
     region_status.gimbal_heading_ready = follow.heading_ready;
     region_status_pub_->publish(region_status);
@@ -1001,6 +994,7 @@ private:
   bool has_follow_gimbal_state_{false};
   double alignment_odom_timeout_s_{};
   double alignment_trajectory_timeout_s_{};
+  GoalApproachParams alignment_braking_;
   /// 目标接近减速带用的实测刹车能力（<=0 表示关闭），仅用于节流日志。
   double goal_approach_deceleration_{0.0};
   std::shared_ptr<const RegionPlan> region_plan_;

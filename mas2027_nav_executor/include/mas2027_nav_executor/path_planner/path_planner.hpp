@@ -55,6 +55,7 @@ private:
   rclcpp::CallbackGroup::SharedPtr global_map_callback_group_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr global_map_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr global_terrain_pub_;
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr global_height_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr global_uphill_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr global_terrain_markers_pub_;
   std::shared_ptr<TerrainGrid> terrain_;

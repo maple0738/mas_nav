@@ -2,6 +2,7 @@
 #include "mas2027_nav_executor/common/environment/terrain_map_query.hpp"
 #include "mas2027_nav_executor/common/environment/terrain_semantics.hpp"
 #include "mas2027_nav_executor/common/environment/online_global_map.hpp"
+#include "mas2027_nav_executor/common/environment/history_frontier.hpp"
 #include "rog_map/projection_layer.hpp"
 #include "rog_map/query_adapter.hpp"
 
@@ -16,6 +17,11 @@
 namespace minco_planner {
 
 namespace {
+
+constexpr double kDeadEndRadius = 2.0;
+constexpr double kDeadEndMemoryS = 120.0;
+constexpr double kRecoveryTimeoutS = 60.0;
+constexpr double kRecoveryReachedDistance = 1.0;
 
 bool projectStartToFreeCell(
   const std::shared_ptr<rog_map::MapQueryInterface> & map, unsigned int & mx, unsigned int & my)
@@ -586,7 +592,22 @@ bool GlobalPathSearcher::plan(const geometry_msgs::msg::PoseStamped & start,
   std::vector<geometry_msgs::msg::PoseStamped> & latest_global_path)
 {
   std::lock_guard<std::mutex> lock(search_mutex_);
-  return planExploration(start, goal, mode_context, latest_global_path);
+  const bool success = planExploration(start, goal, mode_context, latest_global_path);
+  if (success && !terrain_ && !latest_global_path.empty()) {
+    geometry_msgs::msg::PoseStamped actual;
+    const auto query = mode_context.globalQuery();
+    unsigned int ax, ay, bx, by;
+    if (query && normalizePoseToFrame(start, mode_context.rogFrame(),
+        latest_global_path.front().header.frame_id, "path start", actual) &&
+      query->worldToMap(actual.pose.position.x, actual.pose.position.y, ax, ay) &&
+      query->worldToMap(latest_global_path.front().pose.position.x,
+        latest_global_path.front().pose.position.y, bx, by) && ax == bx && ay == by) {
+      // Keep the checked real-to-grid first edge. Re-inserting the snapped
+      // center here can manufacture a dip toward a nearby remembered drop.
+      latest_global_path.front().pose.position = actual.pose.position;
+    }
+  }
+  return success;
 }
 
 bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped & start,
@@ -624,6 +645,8 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
     completed_online_subgoals_.clear();
     failed_online_subgoals_.clear();
     suspended_history_subgoal_.reset();
+    dead_ends_.clear();
+    recovery_target_.reset();
   }
 
   std::function<bool()> cancel_checker = []() {
@@ -652,12 +675,19 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
       nav_msgs::msg::Path terrain_plan;
       terrain_plan.header.stamp = rclcpp::Clock().now();
       terrain_plan.header.frame_id = mode_context.outputFrame();
-      auto slope_edge = [terrain, terrain_query](unsigned int x, unsigned int y,
+      const auto terrain_direction = mas2027_nav_executor::makeDirectedTerrainSampler(
+        terrain_query->sizeX(),terrain_query->sizeY(),terrain_query->resolution(),
+        terrain_query->originX(),terrain_query->originY(),
+        [terrain](double x,double y) { return terrain->sampleTerrain(x,y); },directed_terrain_);
+      auto slope_edge = [terrain, terrain_query, terrain_direction, cfg = directed_terrain_](unsigned int x, unsigned int y,
           unsigned int next_x, unsigned int next_y) {
         double ax = 0.0, ay = 0.0, bx = 0.0, by = 0.0;
         terrain_query->mapToWorld(x, y, ax, ay);
         terrain_query->mapToWorld(next_x, next_y, bx, by);
-        return terrain->slopeTransition({ax, ay}, {bx, by});
+        return terrain->slopeTransition({ax, ay}, {bx, by}) &&
+          mas2027_nav_executor::directed_terrain_edge_allowed(
+            terrain_direction,
+            {ax,ay}, {bx,by}, cfg, 0.5*terrain_query->resolution());
       };
       if (!makePlanOnQuery(start_map.pose, goal_map.pose, terrain_query,
             mode_context.outputFrame(), "Terrain", tolerance_, cancel_checker, terrain_plan,
@@ -687,7 +717,21 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
   const auto adapter = std::dynamic_pointer_cast<rog_map::QueryAdapter>(query);
   const auto semantic = adapter ? adapter->snapshot() : nullptr;
   const auto remembered = online_terrain_ ? online_terrain_->snapshot() : nullptr;
-
+  const auto live_direction = semantic ? mas2027_nav_executor::makeDirectedTerrainSampler(
+    semantic->width,semantic->height,semantic->resolution,semantic->origin_x,semantic->origin_y,
+    [semantic](double x,double y) { return semantic->sampleTerrain(x,y); },directed_terrain_) :
+    mas2027_nav_executor::TerrainSampler{};
+  const auto history_direction = remembered ? mas2027_nav_executor::makeDirectedTerrainSampler(
+    remembered->sizeX(),remembered->sizeY(),remembered->resolution(),remembered->originX(),remembered->originY(),
+    [remembered](double x,double y) { return remembered->sampleTerrain(x,y); },directed_terrain_,
+    [remembered](int x,int y) { return remembered->isFree(x,y); }) :
+    mas2027_nav_executor::TerrainSampler{};
+  const auto target_height_penalty = [this, remembered](double x, double y) {
+    if (!(target_height_clearance_ > 0.0) || !remembered) return 0.0;
+    const auto q = remembered->queryHeight({x, y, 0.0});
+    return q.ok && std::isfinite(q.distance) ?
+      4.0 * std::max(0.0, target_height_clearance_ - q.distance) : 0.0;
+  };
   unsigned int sx = 0;
   unsigned int sy = 0;
   if (!query->worldToMap(start_rog.pose.position.x, start_rog.pose.position.y, sx, sy)) {
@@ -706,7 +750,34 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
     std::make_shared<const std::vector<uint8_t>>(
       mas2027_nav_executor::buildSlopeSideMask(semantic->width, semantic->height,
         semantic->terrain_labels, semantic->uphill_x, semantic->uphill_y)) : nullptr;
-  const auto online_edge = [remembered, live_sides, semantic, query](unsigned int x, unsigned int y,
+  const double height_clearance = use_smac_ && smac_ ? smac_->minimumClearance() : 0.0;
+  const Eigen::Vector2d height_origin(start_rog.pose.position.x, start_rog.pose.position.y);
+  // Diagnostics only: count which online edge rule rejected expansions and
+  // keep the rejected cell nearest the goal. Does not change any decision.
+  struct EdgeRejectStats
+  {
+    size_t live_side{}, remembered_cell{}, remembered_clearance{}, direction{};
+    double best_distance{std::numeric_limits<double>::infinity()};
+    double best_x{}, best_y{};
+    const char * best_reason{"none"};
+  };
+  const auto edge_stats = std::make_shared<EdgeRejectStats>();
+  const double edge_goal_x = goal_rog.pose.position.x, edge_goal_y = goal_rog.pose.position.y;
+  const auto note_reject = [edge_stats, query, edge_goal_x, edge_goal_y](
+      unsigned int nx, unsigned int ny, const char * reason) {
+    double wx = 0.0, wy = 0.0;
+    query->mapToWorld(nx, ny, wx, wy);
+    const double d = std::hypot(wx - edge_goal_x, wy - edge_goal_y);
+    if (d < edge_stats->best_distance) {
+      edge_stats->best_distance = d;
+      edge_stats->best_x = wx;
+      edge_stats->best_y = wy;
+      edge_stats->best_reason = reason;
+    }
+  };
+  const auto online_edge = [remembered, live_sides, semantic, query, height_clearance, height_origin,
+      edge_stats, note_reject, live_direction, history_direction, start_x = sx, start_y = sy,
+      cfg = directed_terrain_](unsigned int x, unsigned int y,
       unsigned int next_x, unsigned int next_y) {
     if (live_sides && live_sides->size() ==
         static_cast<size_t>(query->sizeX()) * query->sizeY()) {
@@ -716,19 +787,55 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
       };
       const size_t a = static_cast<size_t>(y) * query->sizeX() + x;
       const size_t b = static_cast<size_t>(next_y) * query->sizeX() + next_x;
-      if (((*live_sides)[a] && !is_slope(a)) || ((*live_sides)[b] && !is_slope(b))) return false;
+      if (((*live_sides)[a] && !is_slope(a)) || ((*live_sides)[b] && !is_slope(b))) {
+        ++edge_stats->live_side;
+        note_reject(next_x, next_y, "live_side");
+        return false;
+      }
       if (x != next_x && y != next_y) {
         const size_t c1 = static_cast<size_t>(y) * query->sizeX() + next_x;
         const size_t c2 = static_cast<size_t>(next_y) * query->sizeX() + x;
-        if (((*live_sides)[c1] && !is_slope(c1)) || ((*live_sides)[c2] && !is_slope(c2)))
+        if (((*live_sides)[c1] && !is_slope(c1)) || ((*live_sides)[c2] && !is_slope(c2))) {
+          ++edge_stats->live_side;
+          note_reject(next_x, next_y, "live_side");
           return false;
+        }
       }
     }
     if (remembered) {
       double ax = 0.0, ay = 0.0, bx = 0.0, by = 0.0;
       query->mapToWorld(x, y, ax, ay);
       query->mapToWorld(next_x, next_y, bx, by);
-      if (!remembered->terrainTransition(ax, ay, bx, by)) return false;
+      if (x == start_x && y == start_y) {
+        // The robot occupies its measured pose, not the cell center. A center
+        // closer to a drop must not make every otherwise-safe exit fail.
+        ax = height_origin.x();
+        ay = height_origin.y();
+        if (next_x == start_x && next_y == start_y) { bx = ax; by = ay; }
+      }
+      if (!remembered->terrainTransition(ax, ay, bx, by, height_clearance, height_origin)) {
+        if (!remembered->terrainTransition(ax, ay, bx, by, 0.0, height_origin)) {
+          ++edge_stats->remembered_cell;
+          note_reject(next_x, next_y, "remembered_side_or_height_cell");
+        } else {
+          ++edge_stats->remembered_clearance;
+          note_reject(next_x, next_y, "remembered_height_clearance");
+        }
+        return false;
+      }
+    }
+    double ax = 0.0, ay = 0.0, bx = 0.0, by = 0.0;
+    query->mapToWorld(x, y, ax, ay);
+    query->mapToWorld(next_x, next_y, bx, by);
+    const auto allowed = [&](const mas2027_nav_executor::TerrainSampler & sample) {
+      return mas2027_nav_executor::directed_terrain_edge_allowed(sample,
+        {ax,ay}, {bx,by}, cfg, 0.5*query->resolution());
+    };
+    if ((live_direction && !allowed(live_direction)) ||
+      (history_direction && !allowed(history_direction))) {
+      ++edge_stats->direction;
+      note_reject(next_x,next_y,"slope_direction");
+      return false;
     }
     return true;
   };
@@ -776,6 +883,11 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
     RCLCPP_WARN(logger_,
       "[MincoPlanner] Exploration goal direct search failed; "
       "see endpoint diagnostics above; fallback to a reachable observed subgoal.");
+    RCLCPP_WARN(logger_,
+      "[MincoPlanner] Online edge rejections: live_side=%zu remembered_cell=%zu "
+      "remembered_height_clearance=%zu nearest_to_goal=(%.2f,%.2f) %.2f m reason=%s",
+      edge_stats->live_side, edge_stats->remembered_cell, edge_stats->remembered_clearance,
+      edge_stats->best_x, edge_stats->best_y, edge_stats->best_distance, edge_stats->best_reason);
 
     // Direct search also tries the line approach and radial ejection. If the
     // live goal is blocked and neither exists, the fallback search must not
@@ -907,7 +1019,15 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
           snapshot_stamp - entry.stamp < 30.0 &&
           (candidate - entry.position).norm() < 1.20;
       });
-    return completed || failed;
+    // The rolling window cannot see past a dead end, so its greedy candidates
+    // would lead straight back in. Exclude the area for this mission goal.
+    const bool dead_end = std::any_of(dead_ends_.begin(), dead_ends_.end(),
+      [&candidate, snapshot_stamp](const FailedOnlineSubgoal & entry) {
+        return std::isfinite(snapshot_stamp) && snapshot_stamp >= entry.stamp &&
+          snapshot_stamp - entry.stamp < kDeadEndMemoryS &&
+          (candidate - entry.position).norm() < kDeadEndRadius;
+      });
+    return completed || failed || dead_end;
   };
   const auto reject_subgoal = [this, snapshot_stamp](bool lost_live_connectivity) {
     if (!committed_online_subgoal_) return;
@@ -1006,8 +1126,11 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
       const auto clearance = query->query({wx, wy, 0.0});
       if (clearance.ok && std::isfinite(clearance.distance) &&
         clearance.distance >= online_subgoal_clearance_) {
-        best_score = score;
-        best_idx = current.idx;
+        const double preferred_score = score + target_height_penalty(wx, wy);
+        if (preferred_score < best_score) {
+          best_score = preferred_score;
+          best_idx = current.idx;
+        }
       }
     }
 
@@ -1028,6 +1151,8 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
       if (diagonal && (!traversable(index_of(nbx, cy)) ||
         !traversable(index_of(cx, nby)))) continue;
       const double step = (diagonal ? 1.41421356237 : 1.0) * resolution;
+      double nb_wx = 0.0, nb_wy = 0.0;
+      query->mapToWorld(nbx, nby, nb_wx, nb_wy);
       const double next_dist = current.cost + step;
       if (next_dist < dist[nb_idx]) {
         dist[nb_idx] = next_dist;
@@ -1054,12 +1179,15 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
           projectStartToSearchableCell(remembered, hgx, hgy, clearance, endpoint_shift)) {
         smac_->setMap(remembered);
         smac_->setESDFQuery(remembered);
-        smac_->setEdgeFilter([remembered](unsigned int ax, unsigned int ay,
+        smac_->setEdgeFilter([remembered, history_direction, cfg = directed_terrain_](unsigned int ax, unsigned int ay,
             unsigned int bx, unsigned int by) {
           double x1 = 0.0, y1 = 0.0, x2 = 0.0, y2 = 0.0;
           remembered->mapToWorld(ax, ay, x1, y1);
           remembered->mapToWorld(bx, by, x2, y2);
-          return remembered->terrainTransition(x1, y1, x2, y2);
+          return remembered->terrainTransition(x1, y1, x2, y2) &&
+            mas2027_nav_executor::directed_terrain_edge_allowed(
+              history_direction,
+              {x1,y1}, {x2,y2}, cfg, 0.5*remembered->resolution());
         });
         mas2027_nav_executor::smac::SmacPlanner2DSimple::CoordinateVector route;
         if (smac_->createPath(hsx, hsy, hgx, hgy, route, cancel_checker)) {
@@ -1112,6 +1240,77 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
     }
   }
 
+  // Farthest point of an accumulated-map route that the live search reached.
+  // Only the live search authorizes the segment actually sent to the robot.
+  // Transit waypoints may revisit completed/dead-end areas while backing out;
+  // exclusions still apply to the final history frontier target.
+  const auto live_lookahead = [&](const std::vector<Eigen::Vector2d> & target_to_start) {
+    constexpr double route_corridor = 0.45;
+    const int corridor_cells = static_cast<int>(std::ceil(route_corridor / resolution));
+    for (const auto & point : target_to_start) {
+      unsigned int lx = 0U, ly = 0U;
+      if (!query->worldToMap(point.x(), point.y(), lx, ly)) continue;
+      double nearest = std::numeric_limits<double>::infinity();
+      size_t route_idx = map_size;
+      for (int dy = -corridor_cells; dy <= corridor_cells; ++dy) {
+        for (int dx = -corridor_cells; dx <= corridor_cells; ++dx) {
+          const int cx = static_cast<int>(lx) + dx, cy = static_cast<int>(ly) + dy;
+          if (cx < 0 || cy < 0 || cx >= static_cast<int>(nx) || cy >= static_cast<int>(ny)) {
+            continue;
+          }
+          const size_t live_idx = index_of(static_cast<unsigned int>(cx),
+            static_cast<unsigned int>(cy));
+          if (!closed[live_idx]) continue;
+          double candidate_x = 0.0, candidate_y = 0.0;
+          query->mapToWorld(static_cast<unsigned int>(cx), static_cast<unsigned int>(cy),
+            candidate_x, candidate_y);
+          const Eigen::Vector2d candidate(candidate_x, candidate_y);
+          const double offset = (candidate - point).norm();
+          if (offset > route_corridor || offset >= nearest ||
+            (candidate - start_xy).norm() < 0.5) continue;
+          const auto field = query->query({candidate_x, candidate_y, 0.0});
+          if (!field.ok || !std::isfinite(field.distance) ||
+            field.distance < online_subgoal_clearance_) continue;
+          nearest = offset;
+          route_idx = live_idx;
+        }
+      }
+      if (route_idx < map_size) return route_idx;
+    }
+    return map_size;
+  };
+  const auto history_route = [&](std::optional<Eigen::Vector2d> fixed_target)
+    -> std::optional<mas2027_nav_executor::HistoryFrontierRoute> {
+    if (!remembered) return std::nullopt;
+    mas2027_nav_executor::HistoryFrontierQuery request;
+    request.start = start_xy;
+    request.goal = Eigen::Vector2d(goal_position.x, goal_position.y);
+    request.route_clearance = route_clearance;
+    request.height_clearance = target_height_clearance_;
+    request.target_clearance = online_subgoal_clearance_;
+    request.minimum_advance = kDeadEndRadius + 0.5;
+    request.excluded = recently_completed;
+    request.fixed_target = fixed_target;
+    request.directed_terrain = directed_terrain_;
+    return mas2027_nav_executor::findHistoryFrontierRoute(*remembered, request);
+  };
+  if (recovery_target_) {
+    const bool reached = (start_xy - *recovery_target_).norm() <= kRecoveryReachedDistance;
+    const bool expired = !std::isfinite(snapshot_stamp) || snapshot_stamp < recovery_stamp_ ||
+      snapshot_stamp - recovery_stamp_ > kRecoveryTimeoutS;
+    const auto route = reached || expired ? std::nullopt : history_route(*recovery_target_);
+    const size_t idx = route ? live_lookahead(route->target_to_start) : map_size;
+    if (idx < map_size) {
+      best_idx = idx;
+      remembered_candidate_idx = idx;
+    } else {
+      RCLCPP_INFO(logger_, "[MincoPlanner] Dead-end escape toward (%.2f, %.2f) %s.",
+        recovery_target_->x(), recovery_target_->y(),
+        reached ? "reached its frontier" : (expired ? "timed out" : "lost its route"));
+      recovery_target_.reset();
+    }
+  }
+
   // Preserve the current observed waypoint while it is still connected to
   // the robot in this map snapshot. A better-scoring point on the other side
   // of a wall must not reverse the robot on every rolling-map update.
@@ -1124,7 +1323,28 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
         committed_online_subgoal_->y(), 0.0});
       if (closed[committed_idx] && field.ok && std::isfinite(field.distance) &&
         field.distance >= online_subgoal_clearance_) {
-        best_idx = committed_idx;
+        bool advance_known_route = false;
+        if (committed_online_from_history_ && remembered_candidate_idx < map_size &&
+          remembered_candidate_idx != committed_idx && !suspended_history_subgoal_) {
+          double next_x = 0.0, next_y = 0.0;
+          query->mapToWorld(static_cast<unsigned int>(remembered_candidate_idx % nx),
+            static_cast<unsigned int>(remembered_candidate_idx / nx), next_x, next_y);
+          const Eigen::Vector2d previous = *committed_online_subgoal_ - start_xy;
+          const Eigen::Vector2d next = Eigen::Vector2d(next_x, next_y) - start_xy;
+          // Slide a waypoint forward on an already known route as the live
+          // window advances. Keeping its old endpoint until arrival makes
+          // goal-approach braking stop at every intermediate waypoint.
+          // Ordinary exploration commitments and reversals remain latched.
+          advance_known_route = next.norm() >= previous.norm() + .5 &&
+            next.dot(previous) >= .8 * next.norm() * previous.norm();
+          if (advance_known_route) {
+            RCLCPP_INFO_THROTTLE(logger_, *rclcpp::Clock::make_shared(), 2000,
+              "[MincoPlanner] Advancing accumulated-route lookahead from (%.2f, %.2f) "
+              "to (%.2f, %.2f) before intermediate-goal braking.",
+              committed_online_subgoal_->x(), committed_online_subgoal_->y(), next_x, next_y);
+          }
+        }
+        if (!advance_known_route) best_idx = committed_idx;
       } else {
         reject_subgoal(true);
       }
@@ -1237,10 +1457,34 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
       const double score = frontier_dist[idx] +
         0.25 * (candidate - Eigen::Vector2d(
           goal_rog.pose.position.x, goal_rog.pose.position.y)).norm() +
-        0.15 * dist[idx];
+        0.15 * dist[idx] + target_height_penalty(wx, wy);
       if (score < best_frontier_score) {
         best_frontier_score = score;
         best_idx = idx;
+      }
+    }
+    if (best_idx >= map_size && !recovery_target_) {
+      // No live candidate and no live frontier: the robot is in a dead end
+      // the rolling window cannot see out of. Back out along the accumulated
+      // map to the best reachable frontier and stop re-entering this area.
+      if (std::isfinite(snapshot_stamp) && snapshot_stamp > 0.0) {
+        dead_ends_.push_back({start_xy, snapshot_stamp});
+        if (dead_ends_.size() > 32U) dead_ends_.erase(dead_ends_.begin());
+        const auto route = history_route(std::nullopt);
+        const size_t idx = route ? live_lookahead(route->target_to_start) : map_size;
+        if (idx < map_size) {
+          recovery_target_ = route->target;
+          recovery_stamp_ = snapshot_stamp;
+          best_idx = idx;
+          remembered_candidate_idx = idx;
+          suspended_history_subgoal_.reset();
+          RCLCPP_WARN(logger_, "[MincoPlanner] Dead end at (%.2f, %.2f): no live progress or "
+            "frontier; escaping along the accumulated map to frontier (%.2f, %.2f), "
+            "route %.1f m.", start_xy.x(), start_xy.y(), route->target.x(), route->target.y(),
+            static_cast<double>(route->target_to_start.size()) * remembered->resolution());
+        } else {
+          dead_ends_.pop_back();
+        }
       }
     }
     if (best_idx >= map_size) {
@@ -1251,18 +1495,24 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
       } else {
         RCLCPP_ERROR(logger_, "[MincoPlanner] Online search has no reachable observed subgoal "
           "with safe goal progress or an explorable frontier "
-          "(route_clearance=%.3f subgoal_clearance=%.3f).",
-          route_clearance, online_subgoal_clearance_);
+          "(route_clearance=%.3f subgoal_clearance=%.3f reachable_cells=%zu "
+          "live_side=%zu remembered_cell=%zu height_clearance=%zu direction=%zu).",
+          route_clearance, online_subgoal_clearance_,
+          static_cast<size_t>(std::count(closed.begin(), closed.end(), uint8_t{1})),
+          edge_stats->live_side, edge_stats->remembered_cell, edge_stats->remembered_clearance,
+          edge_stats->direction);
       }
       return false;
     }
-    double frontier_x = 0.0, frontier_y = 0.0;
-    query->mapToWorld(static_cast<unsigned int>(best_idx % nx),
-      static_cast<unsigned int>(best_idx / nx), frontier_x, frontier_y);
-    RCLCPP_INFO_THROTTLE(logger_, *rclcpp::Clock::make_shared(), 2000,
-      "[MincoPlanner] Goal progress is blocked; advancing to observed frontier "
-      "standoff (%.2f, %.2f), %.2f m from unknown, to reveal a route.",
-      frontier_x, frontier_y, frontier_dist[best_idx]);
+    if (best_idx != remembered_candidate_idx) {
+      double frontier_x = 0.0, frontier_y = 0.0;
+      query->mapToWorld(static_cast<unsigned int>(best_idx % nx),
+        static_cast<unsigned int>(best_idx / nx), frontier_x, frontier_y);
+      RCLCPP_INFO_THROTTLE(logger_, *rclcpp::Clock::make_shared(), 2000,
+        "[MincoPlanner] Goal progress is blocked; advancing to observed frontier "
+        "standoff (%.2f, %.2f), %.2f m from unknown, to reveal a route.",
+        frontier_x, frontier_y, frontier_dist[best_idx]);
+    }
   }
 
   std::vector<size_t> reversed;

@@ -52,13 +52,15 @@ terrain msgpack → map_server: /cost_map + /terrain_label_map
                                    commit_s ↑
 ```
 
-- `prepare_s = enter_s - prepare_distance`：开始将 MPC 的速度、加速度约束向区域目标值过渡，同时请求小 yaw 对齐。
+- `prepare_s = enter_s - prepare_distance`：开始将 MPC 的速度、加速度约束向区域目标值过渡，坡道（label 5）同时请求小 yaw 对齐，其他区域只切换速度参数。
 - `active_s = enter_s - activation_distance`：导航内部开始请求该区域的 mode；当前不经串口发送。
 - `commit_s = enter_s - commit_distance`：到这里较低的区域上限会被钳到目标值；坡道上限高于普通路段时仍按混合速率逐步提升。它仅是导航内部的路径阶段标记，不代表底盘已切换。
 - `enter_s` / `exit_s`：轨迹进入、离开区域本体的位置。
 - `release_s = exit_s + release_distance`：越过后才恢复普通 mode，给车体离开区域留余量。
 
 各距离满足 `prepare_distance >= activation_distance >= commit_distance >= 0`。轨迹结束时如果仍在区域内，该段的出口与释放位置保持为无穷大，避免因为轨迹到头就恢复自转。同 mode 的重叠控制窗会合并；不同 mode 的控制窗重叠会拒绝整条轨迹，防止两个区域同时争夺底盘模式。
+
+开启坡道`front_entry`时，对齐仅在固定的`prepare_distance=0.3 m`窗内触发，速度较高也不提前退出自转。窗口外，按到准备窗的剩余弧长及`planner.minco_optimizer.goal_approach`中的减速度/反应时间平滑收速；到窗后再请求跟随，未就绪清零平移。`RegionStatus.speed_limit`报告包含接近限速的有效上限。关闭front_entry的旧行为仍允许按停车距离提前准备；mode激活、提交与退出位置保持原配置。
 
 实现文件：`src/common/environment/region_control.cpp` 中的 `annotateRegions()`。
 
@@ -107,15 +109,27 @@ MINCO 在稀疏路径上读取原始区域标签，为坡道影响窗提供更�
 
 PathExecutor 仍使用同一个 MPC 求解 vx/vy/omega。健康连续控制沿用上一拍 MPC 命令作为加速度差分约束起点，不再每个跟随周期都用滞后的实测速度重置；过期输入、参考/求解失败或安全门拒绝仍停车并锚回实测速度。原角速度 ±2 rad/s、角加速度 ±4 rad/s²、控制周期 0.05 s 保留，普通路段平移上限仍为 3 m/s。
 
-### 特殊地形跟随
+### 坡道跟随
 
-在 PREPARING、ARMED、COMMITTED、INSIDE、RELEASING 阶段持续请求 follow_gimbal=1；进度达到 release_s 后切回 NORMAL 并清除请求。所选轴线误差需在 5° 内持续 0.3 s 才放行平移，超过 8° 重新等待；等待时 MPC 位置参考固定当前点、平移前馈为零。无有效轨迹/许可但同一目标仍在规划/重试、已有上一有效角度时，保持 `follow_gimbal=1` 和最后 `small_yaw_ref`、平移清零；目标结束、输入过期或姿态无效时才清除。地形、TF、ROGMap 时效和净空安全门保留。
+只有 `SLOPE=5` 请求航向对齐。几何窄道入口已从执行节点移除；隧道 `6` 和起伏路 `7` 保留原有 mode、速度与加速度约束，但不请求 `follow_gimbal`。普通窄处继续使用原有净空、限速和制动门，不因等待几何航向就绪而清零平移。
+
+坡道在 PREPARING、ARMED、COMMITTED、INSIDE、RELEASING 阶段持续请求 follow_gimbal=1；进度达到 release_s 后切回 NORMAL 并清除请求。所选轴线误差需在 5° 内持续 0.3 s 才放行平移，超过 8° 重新等待；等待时 MPC 位置参考固定当前点、平移前馈为零。无有效轨迹/许可但同一目标仍在规划/重试、已有上一有效角度时，保持 `follow_gimbal=1` 和最后 `small_yaw_ref`、平移清零；目标结束、输入过期或姿态无效时才清除。地形、TF、ROGMap 时效和净空安全门保留。
+
+新轨迹或在线语义刷新暂时不再命中当前区域时，在已配置 `release_distance` 的里程计位置邻域内
+保留最近的准备/区域模式及速度约束。准备态保留 PREPARING，已激活区域进入 RELEASING；
+航向始终根据新轨迹的当前切线计算，不沿用旧路线角度。当前轨迹已经明确越过 release_s 时立即释放，
+清空计划也立即清除保持。轨迹末端仍在区域内时，另存有限的 release_distance，避免无穷大出口使保持无法解除。
+在区域内暂时无法计算有效航向时，已有跟随角度保持、平移清零，避免仍处于特殊区域却恢复自由自旋。
+
+在线坡道侧边掩码同时用于搜索、MINCO 优化代价和发布前检查。优化器从同一份掩码计算有符号距离梯度，
+以半个栅格作为平滑代价的缓冲，使曲线避开搜索路径已经绕过的侧边格子。
+该代价不改变侧边掩码、占据图、碰撞净空或发布前逐段侧入检查；不满足原有硬门的轨迹仍被拒绝。
 
 `force_follow_gimbal` 参数已删除。NORMAL 阶段 follow_gimbal=0、角度为 0，ROS w=+2 rad/s；串口不发送 w，下位机在导航在线且速度有效时自行生成固定 +4 rad/s 自转。
 
 ### 规划间隙保持对齐
 
-规划器短暂失败时，若此前已有有效跟随角度，节点继续发送 `follow_gimbal=1`、保持最后 `small_yaw_ref`，同时把 `vx/vy` 清零；新轨迹到达后从保持角度继续积分。普通语义区域的间隙保持由 `gimbal_follow.hold_last_alignment`（默认 true）控制，需要同一目标仍有效且里程计姿态有效。几何窄道对齐一旦锁存，则跨越无轨迹空档与相邻目标切换继续保持角度和模式，直到里程计累计行驶至少 2 m 且当前位置与近前方恢复宽路；目标结束时若已满 2 m 也释放；里程计过期期间停止平移并保持最后角度，不把定位跳变计入行驶距离。控制日志中的 `Chassis alignment transition` 给出实际下发的 `follow`、锁存状态和累计里程。
+坡道区域内规划器短暂失败时，若此前已有有效跟随角度，节点继续发送 `follow_gimbal=1`、保持最后 `small_yaw_ref`，同时把 `vx/vy` 清零；新轨迹到达后从保持角度继续积分。该保持由 `gimbal_follow.hold_last_alignment` 控制，需要区域标签仍为 `5`、同一目标仍有效且里程计姿态有效。离开坡道释放窗、任务结束或输入无效后清除跟随。几何窄道不再锁存角度，也不再跨目标保持窄道对齐。控制日志中的 `Chassis alignment transition` 记录 `follow`、`slope` 和 `hold`。
 
 ### 角度输出和观察
 
@@ -141,3 +155,10 @@ Foxglove 中 gimbal_heading_error_deg 表示 LIO 云台轴线到较近轨迹轴�
 当前 ESDF 软代价倾向远离墙面，并非特殊区域中线硬约束；用户确认本次不新增居中规划。MPC 跟踪现有 MINCO 路线，不能修正参考路线本身偏离特殊路段中线的问题。
 
 两端包类型和偏移不变。需重启上位机导航、串口桥和 Foxglove bridge；未刷写、未做实车通过验证，朝向参数、提前距离和稳定时间尚需实车标定。
+
+
+### 几字坡的正前方入口门
+
+`region_control.slope.front_entry.enable=true` 时，车体先沿坡前空地转向并移动到入口轴线正前方（实测横向偏差 ≤0.15 m，接近路径方向点积 ≥0.8），再进入对齐准备阶段。制动前视不会绕过此位置门；准备阶段对齐物理坡轴，航向稳定后沿原安全链路通过坡面。完整方向规划、助跑正则、参数及 A/B 限制见[几字坡实现说明](../../docs/directed_ramp_approach.md)。
+
+当前坡前正向入口门为横向误差≤0.15 m、切线余弦≥0.8；同一附近坡轴连续对齐增加0.05 m横向滞回，避免一格定位或语义变化清掉跟随基线。侧方首次接近、不同坡轴、越过滞回范围或取消目标均不沿用该滞回。航向修正增益为2.0，角速度120°/s上限、5°进入/8°释放与0.3 s稳定时间保持；未就绪仍清零平移。坡前0.5 m方向区也由最终MINCO轨迹复核，详见 `../../docs/directed_ramp_approach.md`。

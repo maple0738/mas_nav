@@ -14,6 +14,7 @@ double MincoOptimizer::optimize(const std::vector<Eigen::Vector3d> & waypoints,
   geometry_utils::Trajectory & out_traj,
   OptimizationStage stage)
 {
+  opt_vars_.runup = cfg_.runup;
   opt_vars_.stage = stage;
   opt_vars_.fine_directional_gradient =
     (stage == OptimizationStage::FINELY_OPTIMIZATION) &&
@@ -232,6 +233,7 @@ double MincoOptimizer::costFunctional(void * ptr, const VecDf & x, VecDf & g)
     minco_solver_->getCoeffs(),
     waypoint_attractor,
     map,
+    opt_vars_.position_constraint,
     smooth_eps,
     integral_res,
     magnitudeBounds,
@@ -243,6 +245,48 @@ double MincoOptimizer::costFunctional(void * ptr, const VecDf & x, VecDf & g)
     partialGradByCoeffs,
     opt_vars_.penalty_log,
     opt_vars_.query_failure_count);
+
+  if (opt_vars_.runup.enable && !opt_vars_.terrain_samplers.empty()) {
+    struct Basis { int piece; double alpha, fraction; Vec6f p,v,a; Vec3f vel,acc,jer; };
+    std::vector<Basis> basis;
+    std::vector<mas2027_nav_executor::RunupSample> samples;
+    const auto & coeffs = minco_solver_->getCoeffs();
+    for (int i = 0; i < times.size(); ++i) {
+      const Mat63f c = coeffs.block<6,3>(6*i,0);
+      // Sample at half a map cell so the 0.1 m run-up transition is resolved.
+      const double spacing = map ? std::max(0.01,0.5*map->resolution()) : 0.025;
+      const int count = std::max(integral_res, static_cast<int>(std::ceil(std::min(256.0,
+        times(i)*std::max(0.1,local_magnitudes(i))/spacing))));
+      for (int j = 0; j <= count; ++j) {
+        const double alpha = static_cast<double>(j)/count;
+        const double t = alpha*times(i), t2=t*t, t3=t2*t, t4=t3*t, t5=t4*t;
+        Vec6f bp,bv,ba,bj;
+        bp << 1,t,t2,t3,t4,t5;
+        bv << 0,1,2*t,3*t2,4*t3,5*t4;
+        ba << 0,0,2,6*t,12*t2,20*t3;
+        bj << 0,0,0,6,24*t,60*t2;
+        const Vec3f pos=c.transpose()*bp, vel=c.transpose()*bv;
+        const Vec3f acc=c.transpose()*ba, jer=c.transpose()*bj;
+        const double fraction = (j == 0 || j == count ? 0.5 : 1.0)/count;
+        basis.push_back({i,alpha,fraction,bp,bv,ba,vel,acc,jer});
+        samples.push_back({pos.head<2>(),vel.head<2>(),acc.head<2>(),fraction*times(i)});
+      }
+    }
+    for (const auto & sampler : opt_vars_.terrain_samplers) {
+      if (!sampler) continue;
+      std::vector<mas2027_nav_executor::RunupGradient> gradient;
+      cost += mas2027_nav_executor::runupCost(samples,sampler,opt_vars_.runup,gradient);
+      for (size_t i = 0; i < basis.size(); ++i) {
+        const auto & b = basis[i]; const auto & g = gradient[i];
+        Vec3f gp(g.position.x(),g.position.y(),0), gv(g.velocity.x(),g.velocity.y(),0);
+        Vec3f ga(g.acceleration.x(),g.acceleration.y(),0);
+        partialGradByCoeffs.block<6,3>(6*b.piece,0) +=
+          b.p*gp.transpose()+b.v*gv.transpose()+b.a*ga.transpose();
+        partialGradByTimes(b.piece) += b.alpha*(gp.dot(b.vel)+gv.dot(b.acc)+ga.dot(b.jer))+
+          b.fraction*g.time_measure;
+      }
+    }
+  }
 
   // 6. Propagate gradients to points and times
   Mat3Df gradByPoints;
@@ -338,6 +382,7 @@ void MincoOptimizer::constraintsFunctional(const VecDf & T,
   const MatD3f & coeffs,
   const Mat3Df & waypoint_attractor,
   const std::shared_ptr<rog_map::MapQueryInterface> & map,
+  const std::function<rog_map::QueryResult(const Eigen::Vector3d &)> & position_constraint,
   const double & smooth_eps,
   const int & integral_res,
   const VecDf & magnitudeBounds,
@@ -424,6 +469,14 @@ void MincoOptimizer::constraintsFunctional(const VecDf & T,
         if (query.ok) {
           esdf_dist = query.distance;
           esdf_grad = query.gradient;
+          if (position_constraint) {
+            const auto constraint = position_constraint(pos.cast<double>());
+            if (constraint.ok && std::isfinite(constraint.distance) &&
+              constraint.gradient.allFinite() && constraint.distance < esdf_dist) {
+              esdf_dist = constraint.distance;
+              esdf_grad = constraint.gradient;
+            }
+          }
         } else {
           ++query_failure_count;
         }

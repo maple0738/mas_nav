@@ -5,12 +5,17 @@
 #include <vector>
 
 #include <rog_map/field_layer.hpp>
+#include <rog_map/terrain_direction.hpp>
 #include <rog_map/map_query_interface.hpp>
 
 namespace rog_map {
 
 struct MapSnapshot
 {
+  TerrainDirectionSample sampleTerrain(double x, double y) const
+  { return sampleTerrainDirection(width, height, resolution, origin_x, origin_y,
+      terrain_labels, uphill_x, uphill_y, x, y); }
+
   uint64_t sequence{0};
   uint64_t projection_sequence{0};
   uint64_t mask_sequence{0};
@@ -28,6 +33,12 @@ struct MapSnapshot
   std::vector<uint8_t> raw_types;
   std::vector<double> distances;
   std::vector<float> height_deltas;
+  // Observed support heights and height-jump barriers are geometric evidence,
+  // unlike morphology-filled obstacles. Keep their provenance for history.
+  std::vector<float> ground_heights;
+  // 0 none, 1 measured adjacent jump, 2 inferred inside a bridged FREE gap.
+  std::vector<uint8_t> height_discontinuities;
+  double max_step_height{0.08};
   std::vector<float> confidence;
   std::vector<uint8_t> terrain_labels;
   std::vector<float> uphill_x;

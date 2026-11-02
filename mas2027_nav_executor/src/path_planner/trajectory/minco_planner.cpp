@@ -6,9 +6,11 @@
 #include "mas2027_nav_executor/common/environment/clearance_gate.hpp"
 #include "mas2027_nav_executor/common/environment/terrain_semantics.hpp"
 #include "mas2027_nav_executor/common/environment/online_global_map.hpp"
+#include "mas2027_nav_executor/common/control/odometry_velocity.hpp"
 #include "mas2027_nav_executor/path_planner/search/route_commitment.hpp"
 #include "mas2027_nav_executor/path_planner/trajectory/arc_length_speed_profile.hpp"
 #include "mas2027_nav_executor/path_planner/trajectory/replan_continuity.hpp"
+#include "mas2027_nav_executor/path_planner/trajectory/safe_path_prefix.hpp"
 #include "rog_map/query_adapter.hpp"
 
 #include <algorithm>
@@ -308,6 +310,11 @@ void MincoPlanner::configure(const rclcpp_lifecycle::LifecycleNode::WeakPtr & pa
   // 这只是给局部规划器一条可跟踪的参考线，执行侧仍按轨迹门和窄道地板验收。
   declareParameterIfMissing(
     node, prefix + "smac_2d.relaxed_minimum_clearance", rclcpp::ParameterValue(0.0));
+  // 台阶/高度突变边界单独使用更大的中心净空：普通墙面净空 0.27 m 时，
+  // 车体中心贴着一级 0.3 m 台阶走仍会让方形车体悬在边缘外，既危险又
+  // 会反复触发航向门。该值只作用于高度边界，不改变墙面净空。
+  declareParameterIfMissing(
+    node, prefix + "smac_2d.height_clearance", rclcpp::ParameterValue(0.40));
   node->get_parameter(prefix + "smac_2d.use_esdf_cost", smac_use_esdf_cost_);
   node->get_parameter(prefix + "smac_2d.esdf_weight", smac_esdf_weight_);
   node->get_parameter(prefix + "smac_2d.esdf_decay", smac_esdf_decay_);
@@ -315,6 +322,7 @@ void MincoPlanner::configure(const rclcpp_lifecycle::LifecycleNode::WeakPtr & pa
   node->get_parameter(prefix + "smac_2d.minimum_clearance", smac_minimum_clearance_);
   node->get_parameter(
     prefix + "smac_2d.relaxed_minimum_clearance", smac_relaxed_minimum_clearance_);
+  node->get_parameter(prefix + "smac_2d.height_clearance", height_clearance_);
   if (!std::isfinite(smac_minimum_clearance_) || smac_minimum_clearance_ < 0.0) {
     throw std::invalid_argument("smac_2d.minimum_clearance must be finite and non-negative");
   }
@@ -323,13 +331,9 @@ void MincoPlanner::configure(const rclcpp_lifecycle::LifecycleNode::WeakPtr & pa
     throw std::invalid_argument(
       "smac_2d.relaxed_minimum_clearance must be finite and non-negative");
   }
-
-  declareParameterIfMissing(
-    node, prefix + "lidar_offset_x", rclcpp::ParameterValue(0.0));
-  declareParameterIfMissing(
-    node, prefix + "lidar_offset_y", rclcpp::ParameterValue(-0.2));
-  node->get_parameter(prefix + "lidar_offset_x", lidar_offset_x_);
-  node->get_parameter(prefix + "lidar_offset_y", lidar_offset_y_);
+  if (!std::isfinite(height_clearance_) || height_clearance_ < 0.0) {
+    throw std::invalid_argument("smac_2d.height_clearance must be finite and non-negative");
+  }
 
   // Odometry topic
   std::string odom_topic = "/odom";
@@ -532,6 +536,9 @@ void MincoPlanner::configure(const rclcpp_lifecycle::LifecycleNode::WeakPtr & pa
   declareParameterIfMissing(
     node, prefix + "minco_optimizer.enable_yaw_opt", rclcpp::ParameterValue(true));
   node->get_parameter(prefix + "minco_optimizer.enable_yaw_opt", use_yaw_opt_);
+  declareParameterIfMissing(
+    node, prefix + "minco_optimizer.terrain_side_gate_enable", rclcpp::ParameterValue(true));
+  node->get_parameter(prefix + "minco_optimizer.terrain_side_gate_enable", terrain_side_gate_enable_);
 
   declareParameterIfMissing(
     node, prefix + "minco_optimizer.penalty_weight_time", rclcpp::ParameterValue(0.01));
@@ -573,6 +580,28 @@ void MincoPlanner::configure(const rclcpp_lifecycle::LifecycleNode::WeakPtr & pa
     minco_config.stage2_directional_gradient_enable);
   minco_config.stage1_time_balance_weight = std::max(0.0, minco_config.stage1_time_balance_weight);
   minco_config.stage1_time_balance_ratio = std::max(0.0, minco_config.stage1_time_balance_ratio);
+
+  declareParameterIfMissing(node, prefix + "directional_terrain.enable", rclcpp::ParameterValue(false));
+  node->get_parameter(prefix + "directional_terrain.enable", directed_terrain_.enable);
+  declareParameterIfMissing(node, prefix + "directional_terrain.min_alignment_cosine", rclcpp::ParameterValue(0.8));
+  node->get_parameter(prefix + "directional_terrain.min_alignment_cosine", directed_terrain_.min_alignment_cosine);
+  minco_config.runup.enable = directed_terrain_.enable;
+  minco_config.runup.minimum_alignment_cosine =
+    std::min(0.99, directed_terrain_.min_alignment_cosine + 0.05);
+  const auto runup_param = [&](const std::string & name, double & value) {
+    declareParameterIfMissing(node, prefix + "directional_terrain." + name, rclcpp::ParameterValue(value));
+    node->get_parameter(prefix + "directional_terrain." + name, value);
+    if (!std::isfinite(value) || value < 0.0) throw std::invalid_argument("Invalid directional_terrain."+name);
+  };
+  runup_param("approach_distance", directed_terrain_.approach_distance);
+  runup_param("run_up", minco_config.runup.distance);
+  runup_param("transition", minco_config.runup.transition);
+  runup_param("saturation_length", minco_config.runup.saturation_length);
+  runup_param("alignment_weight", minco_config.runup.alignment_weight);
+  runup_param("curvature_weight", minco_config.runup.curvature_weight);
+  if (!std::isfinite(directed_terrain_.min_alignment_cosine) ||
+      directed_terrain_.min_alignment_cosine <= 0.0 || directed_terrain_.min_alignment_cosine > 1.0 ||
+      minco_config.runup.saturation_length <= 0.0) throw std::invalid_argument("Invalid directional terrain bounds");
 
   double penalty_weight_pos = 0.0;
   declareParameterIfMissing(
@@ -699,6 +728,14 @@ void MincoPlanner::configure(const rclcpp_lifecycle::LifecycleNode::WeakPtr & pa
     }
   }
   global_path_searcher_->setRelaxedMinimumClearance(relaxed_search_clearance);
+  global_path_searcher_->setTargetHeightClearance(height_clearance_);
+  global_path_searcher_->setDirectedTerrain(directed_terrain_);
+  RCLCPP_INFO(logger_, "[MincoPlanner] Directed terrain=%s cosine=%.2f approach=%.2f m run_up=%.2f m transition=%.2f m",
+    directed_terrain_.enable ? "true" : "false",directed_terrain_.min_alignment_cosine,
+    directed_terrain_.approach_distance,minco_config.runup.distance,minco_config.runup.transition);
+  RCLCPP_INFO(logger_,
+    "[MincoPlanner] Exploration-target height clearance: %.3f m",
+    height_clearance_);
   if (relaxed_search_clearance > 0.0) {
     RCLCPP_INFO(logger_,
       "[MincoPlanner] Narrow global-search fallback enabled: primary=%.3f m relaxed=%.3f m "
@@ -1116,14 +1153,24 @@ bool MincoPlanner::PlanGlobalPath(
     if (query && query->resolution() > 0.0) {
       const double floor = narrow_passage_enable_ ? narrow_passage_clearance_ :
         mas2027_nav_executor::effectiveClearanceThreshold(collision_dist_);
-      const auto valid_point = [query, floor](double x, double y) {
+      const auto remembered = online_terrain_ ? online_terrain_->snapshot() : nullptr;
+      const auto adapter = std::dynamic_pointer_cast<rog_map::QueryAdapter>(map_);
+      const auto semantic = adapter ? adapter->snapshot() : nullptr;
+      const auto sides = semantic ? std::make_shared<const std::vector<uint8_t>>(
+        mas2027_nav_executor::buildSlopeSideMask(semantic->width, semantic->height,
+          semantic->terrain_labels, semantic->uphill_x, semantic->uphill_y)) : nullptr;
+      const Eigen::Vector2d origin(start.pose.position.x, start.pose.position.y);
+      const auto valid_point = [query, floor, remembered, semantic, sides, origin](double x, double y) {
         unsigned int mx = 0U, my = 0U;
         if (!query->worldToMap(x, y, mx, my) || !query->isFree(mx, my)) {
           return false;
         }
         const auto result = query->query(Eigen::Vector3d(x, y, 0.0));
+        const Eigen::Vector3d p(x, y, 0.0);
         return result.ok && std::isfinite(result.distance) &&
-          result.distance + mas2027_nav_executor::kClearanceComparisonTolerance >= floor;
+          result.distance + mas2027_nav_executor::kClearanceComparisonTolerance >= floor &&
+          (!semantic || isSlopeCell(*semantic, x, y) || onlineSlopeTransition(*semantic, *sides, p, p)) &&
+          (!remembered || remembered->terrainTransition(x, y, x, y, floor, origin));
       };
       auto retained = committedRouteForReversal(
         start, committed_path, planned_path, query->resolution(), valid_point);
@@ -1288,6 +1335,8 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
   }
 
   std::function<bool(const Eigen::Vector3d &, const Eigen::Vector3d &)> terrain_segment_free;
+  minco_optimizer_->setPositionConstraint({});
+  minco_optimizer_->setTerrainSampler({});
   if (terrain_) {
     const auto terrain = terrain_->snapshot();
     if (!terrain || !tf_) return finish(false, "TERRAIN_MAP_UNAVAILABLE");
@@ -1301,13 +1350,28 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
       if (fused_query_) {
         fused_query_->setStaticTransform(tx, ty, yaw);
       }
-      terrain_segment_free = [terrain, c, s, tx, ty](
+      const auto direction = mas2027_nav_executor::makeDirectedTerrainSampler(
+        terrain->cost.info.width,terrain->cost.info.height,terrain->cost.info.resolution,
+        terrain->cost.info.origin.position.x,terrain->cost.info.origin.position.y,
+        [terrain](double x,double y) { return terrain->sampleTerrain(x,y); },directed_terrain_);
+      minco_optimizer_->setTerrainSampler([direction,c,s,tx,ty](double x, double y) {
+        auto sample = direction(c*x-s*y+tx,s*x+c*y+ty);
+        Eigen::Matrix2d rotation; rotation << c,-s,s,c;
+        sample.uphill = rotation.transpose()*sample.uphill;
+        sample.body_gradient = rotation.transpose()*sample.body_gradient;
+        sample.uphill_jacobian = rotation.transpose()*sample.uphill_jacobian*rotation;
+        return sample;
+      });
+      terrain_segment_free = [terrain, direction, c, s, tx, ty, cfg = directed_terrain_](
         const Eigen::Vector3d & a, const Eigen::Vector3d & b) {
         const auto to_map = [c, s, tx, ty](const Eigen::Vector3d & p) {
           return Eigen::Vector2d(c * p.x() - s * p.y() + tx,
             s * p.x() + c * p.y() + ty);
         };
-        return terrain->transition(to_map(a), to_map(b));
+        return terrain->transition(to_map(a), to_map(b)) &&
+          mas2027_nav_executor::directed_terrain_edge_allowed(
+            direction,
+            to_map(a),to_map(b),cfg,0.5*terrain->cost.info.resolution);
       };
     } catch (const tf2::TransformException &) {
       return finish(false, "TERRAIN_TF_UNAVAILABLE");
@@ -1320,15 +1384,81 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
     const auto live_sides = semantic ? std::make_shared<const std::vector<uint8_t>>(
       mas2027_nav_executor::buildSlopeSideMask(semantic->width, semantic->height,
         semantic->terrain_labels, semantic->uphill_x, semantic->uphill_y)) : nullptr;
-    if (semantic || remembered) {
-      terrain_segment_free = [semantic, remembered, live_sides](const Eigen::Vector3d & a,
+    std::vector<mas2027_nav_executor::TerrainSampler> direction_fields;
+    if (semantic) direction_fields.push_back(mas2027_nav_executor::makeDirectedTerrainSampler(
+      semantic->width,semantic->height,semantic->resolution,semantic->origin_x,semantic->origin_y,
+      [semantic](double x,double y) { return semantic->sampleTerrain(x,y); },directed_terrain_));
+    if (remembered) direction_fields.push_back(mas2027_nav_executor::makeDirectedTerrainSampler(
+      remembered->sizeX(),remembered->sizeY(),remembered->resolution(),remembered->originX(),remembered->originY(),
+      [remembered](double x,double y) { return remembered->sampleTerrain(x,y); },directed_terrain_,
+      [remembered](int x,int y) { return remembered->isFree(x,y); }));
+    // Both fields are hard gates at publication. Optimizing just the physical
+    // live ramp leaves the virtual/history runway invisible to the optimizer.
+    minco_optimizer_->setTerrainSamplers(std::move(direction_fields));
+    if (terrain_side_gate_enable_ && (semantic || remembered)) {
+      // Search and final validation already reject these exact cells. Give
+      // smoothing their distance gradient too, otherwise it repeatedly cuts
+      // the same forbidden corner of an otherwise valid grid path. The half-
+      // cell soft margin absorbs interpolation; the original hard gates stay.
+      minco_optimizer_->setPositionConstraint(
+        [semantic, live_sides, remembered, target = minco_config.safe_dist](
+          const Eigen::Vector3d & pos) {
+          rog_map::QueryResult result;
+          const auto constrain = [&](int width, int height, double res, double ox, double oy,
+              const std::vector<uint8_t> & mask) {
+            const auto side = mas2027_nav_executor::terrainSideDistance(
+              width, height, res, ox, oy, mask, pos.x(), pos.y());
+            const double distance = target + side.distance - 0.5 * res;
+            if (std::isfinite(distance) && (!result.ok || distance < result.distance)) {
+              result.ok = true;
+              result.status = rog_map::QueryStatus::OK;
+              result.distance = distance;
+              result.gradient = {side.gradient_x, side.gradient_y, 0.0};
+            }
+          };
+          if (semantic && live_sides) constrain(semantic->width, semantic->height,
+            semantic->resolution, semantic->origin_x, semantic->origin_y, *live_sides);
+          if (remembered) {
+            constrain(remembered->sizeX(), remembered->sizeY(), remembered->resolution(),
+              remembered->originX(), remembered->originY(), remembered->slopeSideMask());
+            const auto height = remembered->queryHeight(pos);
+            if (height.ok && (!result.ok || height.distance < result.distance)) result = height;
+          }
+          return result;
+        });
+    }
+    if (terrain_side_gate_enable_ && (semantic || remembered)) {
+      terrain_segment_free = [semantic, remembered, live_sides,
+          clearance = mas2027_nav_executor::effectiveClearanceThreshold(collision_dist_),
+          origin = Eigen::Vector2d(current_pose.pose.position.x, current_pose.pose.position.y)](const Eigen::Vector3d & a,
           const Eigen::Vector3d & b) {
         const bool both_slope = semantic &&
           isSlopeCell(*semantic, a.x(), a.y()) && isSlopeCell(*semantic, b.x(), b.y());
         return (both_slope || !semantic || onlineSlopeTransition(*semantic, *live_sides, a, b)) &&
-          (!remembered || remembered->terrainTransition(a.x(), a.y(), b.x(), b.y()));
+          (!remembered || remembered->terrainTransition(a.x(), a.y(), b.x(), b.y(), clearance, origin));
       };
     }
+  }
+  if (directed_terrain_.enable) {
+    const auto previous_gate = terrain_segment_free;
+    const auto live_adapter = std::dynamic_pointer_cast<rog_map::QueryAdapter>(map_);
+    const auto live = live_adapter ? live_adapter->snapshot() : nullptr;
+    const auto history = online_terrain_ ? online_terrain_->snapshot() : nullptr;
+    const auto live_direction = live ? mas2027_nav_executor::makeDirectedTerrainSampler(
+      live->width,live->height,live->resolution,live->origin_x,live->origin_y,
+      [live](double x,double y) { return live->sampleTerrain(x,y); },directed_terrain_) : mas2027_nav_executor::TerrainSampler{};
+    const auto history_direction = history ? mas2027_nav_executor::makeDirectedTerrainSampler(
+      history->sizeX(),history->sizeY(),history->resolution(),history->originX(),history->originY(),
+      [history](double x,double y) { return history->sampleTerrain(x,y); },directed_terrain_,
+      [history](int x,int y) { return history->isFree(x,y); }) : mas2027_nav_executor::TerrainSampler{};
+    if (!terrain_) terrain_segment_free = [previous_gate,live_direction,history_direction,cfg=directed_terrain_](
+        const Eigen::Vector3d & a,const Eigen::Vector3d & b) {
+      if (previous_gate && !previous_gate(a,b)) return false;
+      const auto allowed = [&](const mas2027_nav_executor::TerrainSampler & sampler) {
+        return mas2027_nav_executor::directed_terrain_edge_allowed(sampler,a.head<2>(),b.head<2>(),cfg,0.025);
+      };
+      return (!live_direction || allowed(live_direction)) && (!history_direction || allowed(history_direction));
+    };
   }
   const LocalPathSeed seed = local_path_processor_->buildSeed(
     global_path_snapshot, current_pose, *mode_context_, terrain_segment_free);
@@ -1459,6 +1589,13 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
   // Remove near-start redundant points from sparse_path.
   while (sparse_path.size() > 2) {
     if ((sparse_path[1] - start_state.col(0)).norm() < 0.2) {
+      const Eigen::Vector3d incoming = sparse_path[1]-start_state.col(0);
+      const Eigen::Vector3d outgoing = sparse_path[2]-sparse_path[1];
+      // A nearby turn can be essential to the ramp approach. Removing it
+      // after seed validation silently creates an unchecked shortcut.
+      if (incoming.norm() > 1e-6 && outgoing.norm() > 1e-6 &&
+          incoming.normalized().dot(outgoing.normalized()) < 0.995) break;
+      if (terrain_segment_free && !terrain_segment_free(start_state.col(0),sparse_path[2])) break;
       sparse_path.erase(sparse_path.begin() + 1);
     } else {
       break;
@@ -1502,12 +1639,14 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
     minco_optimizer_->optimizeTwoStage(sparse_path, start_state, end_state, local_vmaxs, opt_traj) :
     minco_optimizer_->optimize(sparse_path, start_state, end_state, local_vmaxs, opt_traj);
   const int initial_optimizer_code = minco_optimizer_->lastReturnCode();
+  bool validation_ok = std::isfinite(final_cost) &&
+    validateTrajectory(opt_traj,end_state.col(0),seed.dense_path);
   Eigen::Vector3d measured_velocity = Eigen::Vector3d::Zero();
-  if (!std::isfinite(final_cost) && state == PlanningState::HOT_START) {
-    measured_velocity = getCurrentSpeed();
-  }
-  if (!std::isfinite(final_cost) && state == PlanningState::HOT_START &&
-      measured_velocity.allFinite()) {
+  if (!validation_ok && state == PlanningState::HOT_START) measured_velocity = getCurrentSpeed();
+  const bool inherited_state_mismatch =
+    (measured_velocity-start_state.col(1)).head<2>().norm() > 0.15 || used_shifted_prefix;
+  if (!validation_ok && state == PlanningState::HOT_START && measured_velocity.allFinite() &&
+      (!std::isfinite(final_cost) || inherited_state_mismatch)) {
     // A shifted prefix may no longer match a rerouted path. More importantly,
     // the old trajectory's predicted velocity/acceleration can differ from
     // odometry after a collision gate or heading hold has stopped translation.
@@ -1536,8 +1675,9 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
       start_state = measured_start;
       end_state = measured_end;
       state = PlanningState::COLD_START;
-      RCLCPP_INFO_THROTTLE(logger_, *rclcpp::Clock::make_shared(), 2000,
-        "[MincoPlanner] Measured-velocity path seed recovered a failed hot-start optimization "
+      validation_ok = validateTrajectory(opt_traj,end_state.col(0),seed.dense_path);
+      if (validation_ok) RCLCPP_INFO_THROTTLE(logger_, *rclcpp::Clock::make_shared(), 2000,
+        "[MincoPlanner] Measured-velocity path seed recovered a failed hot-start candidate "
         "(initial_code=%d shifted_prefix=%s)", initial_optimizer_code,
         used_shifted_prefix ? "true" : "false");
     }
@@ -1545,6 +1685,33 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
   if (perf) {
     perf->optimizer_time_ms =
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - opt_start_steady).count();
+  }
+
+  if (!validation_ok && directed_terrain_.enable && goal_approach_.valid() &&
+      (!has_last_traj_snapshot || nowTime().seconds()-last_traj_start_WT >= 2.0)) {
+    const auto actual_velocity = getCurrentSpeed();
+    if (actual_velocity.allFinite() && actual_velocity.head<2>().norm() < 0.05) {
+      auto recovery_path = sparse_path;
+      recovery_path.front() = {current_pose.pose.position.x,current_pose.pose.position.y,0.0};
+      std::vector<Eigen::Vector3d> prefix;
+      auto candidate = mas2027_nav_executor::stoppedPathPrefix(recovery_path,0.6,
+        std::min(minco_config.max_vel,recovery_server_config_.escape_speed),
+        std::min(minco_config.max_acc,goal_approach_.deceleration),prefix);
+      if (prefix.size() >= 2 &&
+          (prefix.back()-prefix.front()).head<2>().norm() >= 0.08 &&
+          validateTrajectory(candidate,prefix.back(),seed.dense_path)) {
+        opt_traj = std::move(candidate);
+        sparse_path = std::move(prefix);
+        start_state.setZero(); start_state.col(0)=sparse_path.front();
+        end_state.setZero(); end_state.col(0)=sparse_path.back();
+        final_cost = 0.0;
+        validation_ok = true;
+        state = PlanningState::COLD_START;
+        RCLCPP_WARN_THROTTLE(logger_,*rclcpp::Clock::make_shared(),2000,
+          "[MincoPlanner] Validated stopped-seed prefix recovered an infeasible smoothing candidate "
+          "(length<=0.60 m, speed<=%.2f m/s)",recovery_server_config_.escape_speed);
+      }
+    }
   }
 
   // const double max_allowed_cost = 6000.0;
@@ -1581,7 +1748,6 @@ bool MincoPlanner::ReplanLocal(const geometry_msgs::msg::PoseStamped & current_p
             << "cost: " << final_cost << RESET << std::endl;
 
   // 8.5 Quality gating (hard validation) before publishing.
-  const bool validation_ok = validateTrajectory(opt_traj, end_state.col(0), seed.dense_path);
   if (visualizer_) {
     visualizer_->updateCandidateTrajectory(opt_traj,
       opt_duration,
@@ -2213,7 +2379,14 @@ bool MincoPlanner::validateTrajectory(
         static_cast<double>(terrain->cost.info.resolution) /
         (2.0 * std::max(0.1, minco_config.max_vel)));
       const int intervals = std::max(1, static_cast<int>(std::ceil(duration / dt)));
+      const auto & terrain_info = terrain->cost.info;
+      const auto direction = mas2027_nav_executor::makeDirectedTerrainSampler(
+        terrain_info.width, terrain_info.height, terrain_info.resolution,
+        terrain_info.origin.position.x, terrain_info.origin.position.y,
+        [terrain](double x, double y) { return terrain->sampleTerrain(x, y); },
+        directed_terrain_);
       Eigen::Vector2d previous = to_map(traj.getPos(0.0));
+      std::vector<Eigen::Vector2d> direction_points{previous};
       if (!terrain->traversable(previous)) {
         log_terrain_reject("start_static", previous, traj.getPos(0.0), nullptr);
         last_validation_failure_reason_ = "TERRAIN_COLLISION";
@@ -2227,7 +2400,13 @@ bool MincoPlanner::validateTrajectory(
           last_validation_failure_reason_ = "TERRAIN_COLLISION";
           return false;
         }
+        direction_points.push_back(current);
         previous = current;
+      }
+      if (!mas2027_nav_executor::directed_terrain_path_allowed(direction,direction_points,
+          directed_terrain_,0.5*terrain->cost.info.resolution)) {
+        last_validation_failure_reason_ = "DIRECTED_TERRAIN_ALIGNMENT";
+        return false;
       }
     } catch (const tf2::TransformException & ex) {
       RCLCPP_WARN(logger_, "Terrain trajectory validation TF failed: %s", ex.what());
@@ -2243,11 +2422,46 @@ bool MincoPlanner::validateTrajectory(
     const auto live_sides = semantic ? mas2027_nav_executor::buildSlopeSideMask(
       semantic->width, semantic->height, semantic->terrain_labels,
       semantic->uphill_x, semantic->uphill_y) : std::vector<uint8_t>{};
-    if (semantic || remembered) {
+    if (directed_terrain_.enable && (semantic || remembered)) {
+      // Validate the reserved approach as well as the physical ramp. Otherwise
+      // MINCO can cut a safe search corner back toward the ramp lip.
+      const auto live_direction = semantic ? mas2027_nav_executor::makeDirectedTerrainSampler(
+        semantic->width, semantic->height, semantic->resolution, semantic->origin_x, semantic->origin_y,
+        [semantic](double x, double y) { return semantic->sampleTerrain(x, y); },
+        directed_terrain_) : mas2027_nav_executor::TerrainSampler{};
+      const auto history_direction = remembered ? mas2027_nav_executor::makeDirectedTerrainSampler(
+        remembered->sizeX(), remembered->sizeY(), remembered->resolution(),
+        remembered->originX(), remembered->originY(),
+        [remembered](double x, double y) { return remembered->sampleTerrain(x, y); },
+        directed_terrain_,
+        [remembered](int x,int y) { return remembered->isFree(x,y); }) : mas2027_nav_executor::TerrainSampler{};
+      const int intervals = std::max(1,static_cast<int>(std::ceil(
+        dur*std::max(0.1,vmax)/(0.5*(semantic ? semantic->resolution : remembered->resolution())))));
+      std::vector<Eigen::Vector2d> points;
+      points.reserve(intervals+1);
+      for (int i=0;i<=intervals;++i) points.push_back(traj.getPos(dur*i/intervals).head<2>());
+      size_t rejected = 0;
+      const bool live_allowed = !live_direction || mas2027_nav_executor::directed_terrain_path_allowed(
+        live_direction,points,directed_terrain_,0.5*semantic->resolution,&rejected);
+      const bool history_allowed = !history_direction || mas2027_nav_executor::directed_terrain_path_allowed(
+        history_direction,points,directed_terrain_,0.5*remembered->resolution(),&rejected);
+      if (!live_allowed || !history_allowed) {
+        last_validation_failure_reason_ = "DIRECTED_TERRAIN_ALIGNMENT";
+        if (const auto node = node_.lock()) {
+          RCLCPP_WARN_THROTTLE(logger_, *node->get_clock(), 2000,
+            "Directed trajectory rejection: t=%.3f/%.3f position=(%.3f,%.3f) live=%s history=%s",
+            dur*rejected/intervals,dur,points[rejected].x(),points[rejected].y(),
+            live_allowed ? "allow" : "block",history_allowed ? "allow" : "block");
+        }
+        return false;
+      }
+    }
+    if (terrain_side_gate_enable_ && (semantic || remembered)) {
       const int intervals = std::max(1, static_cast<int>(std::ceil(
         dur * std::max(0.1, vmax) /
         (0.5 * (semantic ? semantic->resolution : remembered->resolution())))));
       Eigen::Vector3d previous = traj.getPos(0.0);
+      const Eigen::Vector2d height_origin(previous.x(), previous.y());
       for (int i = 1; i <= intervals; ++i) {
         const Eigen::Vector3d current = traj.getPos(dur * i / intervals);
         const bool both_slope = semantic &&
@@ -2256,7 +2470,8 @@ bool MincoPlanner::validateTrajectory(
         const bool live_allowed = both_slope || !semantic ||
           onlineSlopeTransition(*semantic, live_sides, previous, current);
         const bool remembered_allowed = !remembered || remembered->terrainTransition(
-          previous.x(), previous.y(), current.x(), current.y());
+          previous.x(), previous.y(), current.x(), current.y(),
+          mas2027_nav_executor::effectiveClearanceThreshold(collision_dist_), height_origin);
         if (!live_allowed || !remembered_allowed) {
           last_validation_failure_reason_ = "TERRAIN_SIDE_ENTRY";
           if (const auto node = node_.lock()) {
@@ -2553,28 +2768,7 @@ Eigen::Vector3d MincoPlanner::getCurrentSpeed() const
 {
   std::lock_guard<std::mutex> lk(odom_mutex_);
   if (has_latest_odom_) {
-    const auto & twist = latest_odom_.twist.twist;
-    const double yaw = utils::quaternionToYaw(latest_odom_.pose.pose.orientation);
-
-    double vx_global = 0.0;
-    double vy_global = 0.0;
-    double omega_global = 0.0;
-    utils::compensateLeverArm(
-      twist.linear.x,
-      twist.linear.y,
-      twist.angular.z,
-      yaw,
-      lidar_offset_x_,
-      lidar_offset_y_,
-      vx_global,
-      vy_global,
-      omega_global);
-
-    // std::cout << "[MincoPlanner] Lever-arm compensation: raw_v=(" << twist.linear.x << ", "
-    //           << twist.linear.y << ") wz=" << twist.angular.z << " yaw=" << yaw << " -> v=("
-    //           << vx_global << ", " << vy_global << ")" << std::endl;
-
-    return Eigen::Vector3d(vx_global, vy_global, twist.linear.z);
+    return mas2027_nav_executor::odometryVelocityInPlanningFrame(latest_odom_);
   }
   return Eigen::Vector3d::Zero();
 }

@@ -287,4 +287,152 @@ TEST(ProjectionGround, DisablingFilterPreservesOriginalClassification)
   EXPECT_EQ(layer.cells()[10 * kSize + 10].type, rog_map::CellType::OCCUPIED);
 }
 
+TEST(ProjectionSteps, ThinStairTopsBlockBothSidesWithoutRiserReturns)
+{
+  rog_map::ProjectionLayer layer;
+  rog_map::ProjectionLayerConfig config;
+  config.hysteresis_en = false;
+  config.mask_filter_en = false;
+  layer.updateFull(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 1.0, config,
+    [](int x, int) { return ground(x < 10 ? 0.0 : 0.20); });
+  for (int y = 0; y < kSize; ++y) {
+    for (const int x : {9, 10}) {
+      const auto index = y * kSize + x;
+      EXPECT_TRUE(layer.cells()[index].height_discontinuity);
+      EXPECT_TRUE(layer.cells()[index].height_discontinuity_measured);
+      EXPECT_EQ(layer.values()[index], 254U);
+      EXPECT_EQ(layer.mask()[index], 0U);
+      EXPECT_EQ(layer.cells()[index].traversable, 0U);
+    }
+  }
+  EXPECT_EQ(layer.values()[10 * kSize + 5], 0U);
+  EXPECT_EQ(layer.values()[10 * kSize + 15], 0U);
+}
+
+TEST(ProjectionSteps, ContinuousQuantizedSlopeRemainsTraversable)
+{
+  rog_map::ProjectionLayer layer;
+  rog_map::ProjectionLayerConfig config;
+  config.hysteresis_en = false;
+  config.mask_filter_en = false;
+  layer.updateFull(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 1.0, config,
+    [](int x, int) {
+      return ground(std::round(0.7 * x * kResolution / kResolution) * kResolution);
+    });
+  for (const auto value : layer.values()) EXPECT_NE(value, 254U);
+}
+
+TEST(ProjectionSteps, DirtyHeightUpdateClearsNeighboringStepMask)
+{
+  rog_map::ProjectionLayer layer;
+  rog_map::ProjectionLayerConfig config;
+  config.hysteresis_en = false;
+  config.mask_filter_en = false;
+  layer.updateFull(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 1.0, config,
+    [](int x, int y) { return ground(x == 10 && y == 10 ? 0.20 : 0.0); });
+  ASSERT_EQ(layer.values()[10 * kSize + 9], 254U);
+  layer.updateDirty(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 2.0,
+    config, [](int, int) { return ground(0.0); }, {10 * kSize + 10}, false);
+  for (const auto value : layer.values()) EXPECT_EQ(value, 0U);
+}
+
+TEST(ProjectionSteps, TenCentimeterStaircaseIsNotAContinuousRamp)
+{
+  rog_map::ProjectionLayer layer;
+  rog_map::ProjectionLayerConfig config;
+  config.hysteresis_en = false;
+  config.mask_filter_en = false;
+  layer.updateFull(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 1.0, config,
+    [](int x, int) { return ground((x / 4) * 0.10); });
+  for (const int boundary : {4, 8, 12, 16}) {
+    EXPECT_EQ(layer.values()[10 * kSize + boundary - 1], 254U);
+    EXPECT_EQ(layer.values()[10 * kSize + boundary], 254U);
+  }
+}
+
+TEST(ProjectionSteps, FreeRaysAboveKnownStepDoNotEraseItsHeightEvidence)
+{
+  rog_map::ProjectionLayer layer;
+  rog_map::ProjectionLayerConfig config;
+  config.hysteresis_en = false; config.mask_filter_en = false;
+  layer.updateFull(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 1.0, config,
+    [](int x, int) { return ground(x < 10 ? 0.0 : 0.30); });
+  layer.updateFull(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 2.0, config,
+    [](int, int) { rog_map::ColumnStats s; s.observed_count = 20; return s; });
+  EXPECT_EQ(layer.values()[10 * kSize + 9], 254U);
+  EXPECT_EQ(layer.values()[10 * kSize + 10], 254U);
+  // A newly observed continuous floor is sufficient to clear the old edge.
+  layer.updateFull(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 3.0, config,
+    [](int, int) { return ground(0.0); });
+  for (const auto value : layer.values()) EXPECT_EQ(value, 0U);
+}
+
+TEST(ProjectionSteps, SparseGroundOnBothSidesBlocksInterveningAirColumns)
+{
+  rog_map::ProjectionLayer layer;
+  rog_map::ProjectionLayerConfig config;
+  config.hysteresis_en = false; config.mask_filter_en = false;
+  layer.updateFull(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 1.0, config,
+    [](int x, int) {
+      if (x >= 8 && x <= 12) { rog_map::ColumnStats s; s.observed_count = 20; return s; }
+      return ground(x < 8 ? 0.0 : 0.30);
+    });
+  for (int x = 7; x <= 13; ++x) {
+    EXPECT_EQ(layer.values()[10 * kSize + x], 254U);
+    // The edge lies somewhere in the bridged gap: block it live, but mark it
+    // as inferred so history does not treat the gap as a measured step.
+    EXPECT_FALSE(layer.cells()[10 * kSize + x].height_discontinuity_measured) << x;
+  }
+}
+
+TEST(ProjectionSteps, SparseContinuousGradeDoesNotBecomeAFalseStep)
+{
+  rog_map::ProjectionLayer layer;
+  rog_map::ProjectionLayerConfig config;
+  config.hysteresis_en = false; config.mask_filter_en = false;
+  layer.updateFull(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 1.0, config,
+    [](int x, int) {
+      if (x >= 8 && x <= 12) { rog_map::ColumnStats s; s.observed_count = 20; return s; }
+      return ground(0.5 * x * kResolution);
+    });
+  for (const auto value : layer.values()) EXPECT_NE(value, 254U);
+}
+
+TEST(ProjectionSteps, DirtyUpdateClearsAnEdgeAcrossTheWholeScanGap)
+{
+  rog_map::ProjectionLayer layer;
+  rog_map::ProjectionLayerConfig config;
+  config.hysteresis_en = false; config.mask_filter_en = false;
+  const auto scan = [](int x, int) {
+    if (x >= 8 && x <= 12) { rog_map::ColumnStats s; s.observed_count = 20; return s; }
+    return ground(x < 8 ? 0.0 : 0.30);
+  };
+  layer.updateFull(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 1.0, config, scan);
+  ASSERT_EQ(layer.values()[10 * kSize + 7], 254U);
+  std::vector<int> dirty;
+  for (int y = 0; y < kSize; ++y)
+    for (int x = 13; x < kSize; ++x) dirty.push_back(y*kSize+x);
+  layer.updateDirty(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 2.0, config,
+    [](int, int) { return ground(0.0); }, dirty, false);
+  for (const auto value : layer.values()) EXPECT_EQ(value, 0U);
+}
+
+TEST(ProjectionTerrain, ObservedSlopeSurvivesFreeAirRaysButNotSlidingOutOfWindow)
+{
+  rog_map::ProjectionLayer layer;
+  rog_map::ProjectionLayerConfig config;
+  config.hysteresis_en = false; config.mask_filter_en = false;
+  layer.updateFull(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 1.0, config,
+    [](int x, int) { return ground(0.2*x*kResolution); });
+  const auto before = layer.terrainLabels();
+  ASSERT_EQ(before[10*kSize+10], 5U);
+  const auto free_scan = [](int, int) { rog_map::ColumnStats s; s.observed_count = 20; return s; };
+  layer.updateFull(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 2.0, config, free_scan);
+  EXPECT_EQ(layer.terrainLabels(), before);
+  layer.syncSlidingWindow(kSize, kSize, kResolution, Eigen::Vector2i(200, 0),
+    Eigen::Vector2d(10.0, 0.0), config);
+  layer.updateFull(kSize, kSize, kResolution, Eigen::Vector2d(10.0, 0.0), 3.0, config, free_scan);
+  EXPECT_EQ(layer.terrainLabels()[10*kSize+10], 255U);
+}
+
 }  // namespace

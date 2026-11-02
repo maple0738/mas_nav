@@ -16,7 +16,7 @@ void TaskManager::submitGoal(const geometry_msgs::msg::PoseStamped & goal)
 {
   std::lock_guard<std::mutex> lock(pending_mutex_);
   pending_goal_ = goal;  // Latest goal wins; old planning results cannot become active.
-  minimum_trajectory_stamp_ns_.store(rclcpp::Clock().now().nanoseconds());
+  minimum_trajectory_stamp_ns_.store(planner_->nowTime().nanoseconds());
   mission_active_.store(true);
   allows_motion_.store(false);
 }
@@ -164,7 +164,7 @@ void TaskManager::tick()
       last_plan_attempt_s_ = -1.0;
       return;
     }
-    const auto escape_started_ns = rclcpp::Clock().now().nanoseconds();
+    const auto escape_started_ns = planner_->nowTime().nanoseconds();
     planner_->publishEscapeCommand(pose, escape_velocity_);
     minimum_trajectory_stamp_ns_.store(escape_started_ns);
     activateCurrentGoal();
@@ -211,7 +211,7 @@ void TaskManager::tick()
       now_s - last_local_replan_s_ >= planner_->getForceReplanPeriod();
     if (!expired && !due) return;
     last_local_replan_s_ = now_s;
-    const auto plan_started_ns = rclcpp::Clock().now().nanoseconds();
+    const auto plan_started_ns = planner_->nowTime().nanoseconds();
     if (planner_->ReplanLocal(pose)) {
       if (const auto recovery = planner_->recoveryServer()) recovery->onReplanSuccess();
       minimum_trajectory_stamp_ns_.store(plan_started_ns);
@@ -246,7 +246,7 @@ void TaskManager::tick()
   }
   retryable_goal_blocked_ = false;
   last_global_replan_s_ = now_s;
-  const auto plan_started_ns = rclcpp::Clock().now().nanoseconds();
+  const auto plan_started_ns = planner_->nowTime().nanoseconds();
   if (!planner_->ReplanLocal(pose)) {
     RCLCPP_WARN(logger_, "MINCO path generation failed; retrying");
     handleFailure(pose, now_s);

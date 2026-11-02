@@ -3,8 +3,11 @@
 #include <limits>
 
 #include "rog_map/query_adapter.hpp"
+#include "rog_map/projection_layer.hpp"
+#include "mas2027_nav_executor/path_planner/search/smac/smac_planner_2d_simple.hpp"
 
 #include "mas2027_nav_executor/common/environment/online_global_map.hpp"
+#include "mas2027_nav_executor/common/environment/history_frontier.hpp"
 #include "mas2027_nav_executor/path_planner/search/global_path_searcher.hpp"
 #include "minco_core/components/planner_mode_context.hpp"
 
@@ -172,6 +175,244 @@ TEST(OnlineGlobalMap, ObservedFreeCellsFilledOrHeldByLocalSafetyAreNotStoredAsOb
   EXPECT_EQ(valueAt(map.snapshot(), 0.45, 0.45), 254U);
   auto invalid = source(3); invalid.raw_types.assign(1, 3U);
   EXPECT_EQ(map.update(invalid), Result::INVALID_INPUT);
+}
+
+TEST(OnlineGlobalMap, MeasuredHeightEdgesSurviveFreeAirAndNeedContinuousGroundToClear)
+{
+  OnlineGlobalMapConfig config;
+  config.resolution = 0.1;
+  OnlineGlobalMap map(config, "odom");
+  auto edge = source(1, 0, 0, 2);
+  edge.raw_types.assign(100, 2U);
+  edge.ground_heights.assign(100, 0.0F);
+  edge.height_discontinuities.assign(100, 0U);
+  edge.confidence.assign(100, 1.0F);
+  const size_t i = 4 * 10 + 5;
+  edge.types[i] = 3U;
+  edge.values[i] = 254U;
+  edge.height_discontinuities[i] = 1U;
+  ASSERT_EQ(map.update(edge), Result::UPDATED);
+  EXPECT_EQ(valueAt(map.snapshot(), 0.55, 0.45), 254U);
+  EXPECT_FALSE(map.snapshot()->terrainTransition(0.45, 0.45, 0.65, 0.45));
+  for (uint64_t sequence = 2; sequence <= 5; ++sequence) {
+    auto air = source(sequence);
+    air.ground_heights.assign(100, std::numeric_limits<float>::quiet_NaN());
+    air.height_discontinuities.assign(100, 0U);
+    ASSERT_EQ(map.update(air), Result::UPDATED);
+    EXPECT_EQ(valueAt(map.snapshot(), 0.55, 0.45), 254U);
+  }
+  auto floor = source(6, 0, 0, 2);
+  floor.raw_types.assign(100, 2U);
+  floor.ground_heights.assign(100, 0.0F);
+  floor.height_discontinuities.assign(100, 0U);
+  ASSERT_EQ(map.update(floor), Result::UPDATED);
+  EXPECT_EQ(valueAt(map.snapshot(), 0.55, 0.45), 254U);
+  floor.sequence = 7; floor.stamp = 7;
+  ASSERT_EQ(map.update(floor), Result::UPDATED);
+  EXPECT_EQ(valueAt(map.snapshot(), 0.55, 0.45), 0U);
+  EXPECT_TRUE(map.snapshot()->terrainTransition(0.45, 0.45, 0.65, 0.45));
+}
+
+TEST(OnlineGlobalMap, OnlyAdjacentMeasuredStepsEnterHistory)
+{
+  // 0 = gap-inferred on unseen cell, 1 = gap-inferred on seen ground,
+  // 2 = adjacent measured jump on seen ground.
+  for (const int scenario : {0, 1, 2}) {
+    OnlineGlobalMapConfig config;
+    config.resolution = 0.1;
+    OnlineGlobalMap map(config, "odom");
+    uint64_t sequence = 1;
+    const auto floor = [&sequence]() {
+      auto f = source(sequence, 0, 0, 2);
+      f.stamp = static_cast<double>(sequence);
+      ++sequence;
+      f.raw_types.assign(100, 2U);
+      f.ground_heights.assign(100, 0.0F);
+      f.height_discontinuities.assign(100, 0U);
+      f.confidence.assign(100, 1.0F);
+      return f;
+    };
+    if (scenario > 0) {
+      ASSERT_EQ(map.update(floor()), Result::UPDATED);
+      ASSERT_EQ(map.update(floor()), Result::UPDATED);
+    }
+    for (int repeat = 0; repeat < 3; ++repeat) {
+      auto edge = floor();
+      const size_t i = 4 * 10 + 5;
+      edge.types[i] = 3U;
+      edge.values[i] = 254U;
+      edge.height_discontinuities[i] = scenario == 2 ? 1U : 2U;
+      ASSERT_EQ(map.update(edge), Result::UPDATED);
+    }
+    const auto snapshot = map.snapshot();
+    unsigned int mx = 0, my = 0;
+    ASSERT_TRUE(snapshot->worldToMap(0.55, 0.45, mx, my));
+    EXPECT_EQ(snapshot->heightDiscontinuityMask()[my * snapshot->sizeX() + mx] != 0U,
+      scenario == 2) << scenario;
+    // Repeated inferred-only marks are not an observed obstacle either.
+    if (scenario == 1) EXPECT_EQ(valueAt(snapshot, 0.55, 0.45), 0U);
+    if (scenario == 2) {
+      EXPECT_EQ(valueAt(snapshot, 0.55, 0.45), 254U);
+      EXPECT_FALSE(snapshot->terrainTransition(0.45, 0.45, 0.65, 0.45));
+    }
+  }
+}
+
+TEST(OnlineGlobalMap, RejectsUnknownHeightDiscontinuityCode)
+{
+  OnlineGlobalMap map(immediateConfig(), "odom");
+  auto edge = source(1, 0, 0, 2);
+  edge.raw_types.assign(100, 2U);
+  edge.ground_heights.assign(100, 0.0F);
+  edge.height_discontinuities.assign(100, 0U);
+  edge.height_discontinuities[45] = 3U;
+  EXPECT_EQ(map.update(edge), Result::INVALID_INPUT);
+}
+
+TEST(OnlineGlobalMap, HeightEvidenceAcrossAnUnobservedScanGapIsRetained)
+{
+  OnlineGlobalMap map(immediateConfig(), "odom");
+  auto edge = source(1, 0, 0, 0);
+  edge.raw_types.assign(100, 0U);
+  edge.height_discontinuities.assign(100, 0U);
+  edge.confidence.assign(100, 0.0F);
+  edge.types[45] = 3U;
+  edge.height_discontinuities[45] = 1U;
+  ASSERT_EQ(map.update(edge), Result::UPDATED);
+  EXPECT_EQ(valueAt(map.snapshot(), 0.55, 0.45), 254U);
+}
+
+TEST(OnlineGlobalMap, SparseEnclosingGroundCorrectsRememberedGapButStepsAndOneSidedReturnsDoNot)
+{
+  constexpr int size = 31, center = 15;
+  constexpr double res = .05;
+  for (int scenario = 0; scenario < 4; ++scenario) {
+    OnlineGlobalMapConfig cfg; cfg.resolution = res;
+    OnlineGlobalMap map(cfg, "odom");
+    auto edge = source(1, 0, 0, 1, size, size, res);
+    edge.raw_types = edge.types;
+    edge.height_discontinuities.assign(size * size, 0U);
+    const size_t target = center * size + center;
+    edge.types[target] = 3U; edge.values[target] = 254U;
+    edge.height_discontinuities[target] = 1U;
+    ASSERT_EQ(map.update(edge), Result::UPDATED);
+    auto floor = source(2, 0, 0, 2, size, size, res);
+    floor.raw_types = floor.types;
+    floor.ground_heights.resize(size * size);
+    floor.height_discontinuities.assign(size * size, 0U);
+    for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
+      const size_t i = y * size + x;
+      floor.ground_heights[i] = scenario == 1 ? .2F * x * res :
+        (scenario == 2 && x >= center ? .10F : 0.F);
+      if (std::hypot(x-center, y-center) < 7 || (scenario == 3 && x >= center)) {
+        floor.types[i] = floor.raw_types[i] = 1U;
+        floor.ground_heights[i] = std::numeric_limits<float>::quiet_NaN();
+      }
+    }
+    ASSERT_EQ(map.update(floor), Result::UPDATED);
+    EXPECT_EQ(valueAt(map.snapshot(), .775, .775), 254U);
+    floor.sequence = 3; floor.stamp = 3;
+    ASSERT_EQ(map.update(floor), Result::UPDATED);
+    EXPECT_EQ(valueAt(map.snapshot(), .775, .775), scenario < 2 ? 0U : 254U);
+  }
+}
+
+TEST(OnlineGlobalMap, MirroredPlatformsUseOnlyTheirContinuousCornerRampInBothDirections)
+{
+  constexpr int size = 61;
+  constexpr double res = 0.05, extent = size * res;
+  for (const bool mirrored : {false, true}) {
+    rog_map::ProjectionLayer projection;
+    rog_map::ProjectionLayerConfig config;
+    config.hysteresis_en = false;
+    config.mask_filter_en = false;
+    projection.updateFull(size, size, res, Eigen::Vector2d::Zero(), 1, config,
+      [mirrored](int x, int y) {
+        if (mirrored) { x = size - 1 - x; y = size - 1 - y; }
+        const double z = y < 12 ? 0.2 * std::clamp((x - 20) / 20.0, 0.0, 1.0) :
+          (x < 30 ? 0.0 : 0.2);
+        rog_map::ColumnStats s;
+        s.observed_count = 10; s.occupied_count = 1;
+        s.occupied_z_index_min = s.occupied_z_index_max = static_cast<int>(std::round(z / res));
+        s.occupied_z_min_abs = s.occupied_z_max_abs = z;
+        return s;
+      });
+    auto observation = source(1, 0, 0, 2, size, size, res);
+    observation.values = projection.values();
+    observation.raw_types.resize(size * size);
+    observation.ground_heights.resize(size * size);
+    observation.height_discontinuities.resize(size * size);
+    for (size_t i = 0; i < observation.types.size(); ++i) {
+      const auto & cell = projection.cells()[i];
+      observation.types[i] = static_cast<uint8_t>(cell.type);
+      observation.raw_types[i] = static_cast<uint8_t>(cell.raw_type);
+      observation.ground_heights[i] = cell.ground_reference_z;
+      observation.height_discontinuities[i] = cell.height_discontinuity ? 1U : 0U;
+    }
+    auto cfg = immediateConfig(); cfg.resolution = res;
+    OnlineGlobalMap map(cfg, "odom");
+    ASSERT_EQ(map.update(observation), Result::UPDATED);
+    // Remove the platform from the live window: history must keep its drop.
+    ASSERT_EQ(map.update(source(2, 10, 0, 1, size, size, res)), Result::UPDATED);
+    const auto history = map.snapshot();
+    mas2027_nav_executor::smac::SmacPlanner2DSimple planner;
+    planner.setMap(history); planner.setESDFQuery(history);
+    planner.setMinimumClearance(0.1);
+    planner.setParameters(false, 100000, 0.0F);
+    for (const bool reverse : {false, true}) {
+      Eigen::Vector2d start(0.55, 2.0), goal(2.55, 2.0);
+      if (mirrored) { start = Eigen::Vector2d::Constant(extent) - start;
+        goal = Eigen::Vector2d::Constant(extent) - goal; }
+      if (reverse) std::swap(start, goal);
+      unsigned int sx, sy, gx, gy;
+      ASSERT_TRUE(history->worldToMap(start.x(), start.y(), sx, sy));
+      ASSERT_TRUE(history->worldToMap(goal.x(), goal.y(), gx, gy));
+      mas2027_nav_executor::smac::SmacPlanner2DSimple::CoordinateVector path;
+      ASSERT_TRUE(planner.createPath(sx, sy, gx, gy, path));
+      bool used_ramp = false;
+      for (const auto & point : path) {
+        double wx, wy;
+        history->mapToWorld(static_cast<unsigned int>(point.x),
+          static_cast<unsigned int>(point.y), wx, wy);
+        if (mirrored) { wx = extent - wx; wy = extent - wy; }
+        if (wx > 1.4 && wx < 1.6) {
+          EXPECT_LT(wy, 0.6);
+          used_ramp = true;
+        }
+      }
+      EXPECT_TRUE(used_ramp);
+    }
+  }
+}
+
+TEST(OnlineGlobalMap, RememberedDropRequiresRobotClearanceEvenWhenLiveRaysAreFree)
+{
+  auto cfg = immediateConfig(); cfg.resolution = .1;
+  OnlineGlobalMap map(cfg, "odom");
+  auto edge = source(1, 0, 0, 1, 31, 31, .1);
+  edge.raw_types = edge.types;
+  edge.height_discontinuities.assign(31*31, 0U);
+  for (int y = 0; y < 31; ++y) {
+    const size_t i = y * 31 + 15;
+    edge.types[i] = 3U; edge.values[i] = 254U; edge.height_discontinuities[i] = 1U;
+  }
+  ASSERT_EQ(map.update(edge), Result::UPDATED);
+  ASSERT_EQ(map.update(source(2, 0, 0, 1, 31, 31, .1)), Result::UPDATED);
+  const auto history = map.snapshot();
+  const auto field = history->queryHeight({1.25, 1.55, 0});
+  ASSERT_TRUE(field.ok);
+  EXPECT_NEAR(field.distance, .25, 1e-6);
+  EXPECT_LT(field.gradient.x(), -.9);
+  EXPECT_TRUE(history->terrainTransition(1.25, 1.25, 1.25, 1.85));
+  EXPECT_FALSE(history->terrainTransition(1.25, 1.25, 1.25, 1.85, .28));
+  const Eigen::Vector2d near_start(1.25, 1.25);
+  EXPECT_TRUE(history->terrainTransition(1.25, 1.25, 1.10, 1.25, .28, near_start));
+  EXPECT_FALSE(history->terrainTransition(1.25, 1.25, 1.35, 1.25, .28, near_start));
+  EXPECT_FALSE(history->terrainTransition(1.25, 1.25, 1.25, 1.85, .28, near_start));
+  EXPECT_TRUE(history->terrainTransition(1.15, 1.25, 1.15, 1.85, .28));
+  EXPECT_FALSE(history->terrainTransition(1.15, 1.25, 1.95, 1.25, .28));
+  const auto barriers = history->heightGrid();
+  EXPECT_EQ(std::count(barriers.data.begin(), barriers.data.end(), 100), 31);
 }
 
 TEST(OnlineGlobalMap, UnknownBlockingCostsDoNotCreatePermanentWalls)
@@ -344,3 +585,89 @@ TEST(OnlineGlobalMap, ExistingSearchInterfaceCanReturnThroughRetainedArea)
 }
 
 }  // namespace
+
+using mas2027_nav_executor::HistoryFrontierQuery;
+using mas2027_nav_executor::findHistoryFrontierRoute;
+
+TEST(HistoryFrontier, DeadEndPocketEscapesTowardTheOnlyUnexploredSide)
+{
+  // 6 x 4 m corridor, closed to the east (toward the goal), never observed
+  // west of x = 0.5 m. The live window from the east end sees no progress.
+  constexpr int width = 60, height = 40;
+  OnlineGlobalMap map(immediateConfig(), "odom");
+  auto scan = source(1, 0, 0, 1, width, height, 0.1);
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const size_t i = static_cast<size_t>(y) * width + x;
+      if (x < 5) { scan.types[i] = 0U; scan.values[i] = 255U; }
+      if (y < 2 || y >= height - 2 || x >= width - 1) { scan.types[i] = 3U; scan.values[i] = 254U; }
+    }
+  }
+  ASSERT_EQ(map.update(scan), Result::UPDATED);
+  const auto snapshot = map.snapshot();
+  ASSERT_TRUE(snapshot);
+  HistoryFrontierQuery request;
+  request.start = {5.0, 2.0};
+  request.goal = {10.0, 2.0};
+  const auto route = findHistoryFrontierRoute(*snapshot, request);
+  ASSERT_TRUE(route);
+  EXPECT_LT(route->target.x(), 1.6);
+  EXPECT_GE((route->target - request.start).norm(), request.minimum_advance);
+  ASSERT_GE(route->target_to_start.size(), 2U);
+  EXPECT_LT((route->target_to_start.front() - route->target).norm(), 1e-9);
+  EXPECT_LT((route->target_to_start.back() - request.start).norm(), 0.15);
+  for (const auto & p : route->target_to_start) {
+    unsigned int mx = 0, my = 0;
+    ASSERT_TRUE(snapshot->worldToMap(p.x(), p.y(), mx, my));
+    EXPECT_EQ(snapshot->value(mx, my), 0U);  // never enters unknown or walls
+  }
+
+  request.fixed_target = route->target;
+  request.start = {4.0, 2.0};
+  const auto again = findHistoryFrontierRoute(*snapshot, request);
+  ASSERT_TRUE(again);
+  EXPECT_LT((again->target - route->target).norm(), 1e-9);
+
+  request.fixed_target.reset();
+  request.excluded = [](const Eigen::Vector2d & p) { return p.x() < 3.0; };
+  EXPECT_FALSE(findHistoryFrontierRoute(*snapshot, request));
+}
+
+TEST(HistoryFrontier, PreferredEdgeMarginDoesNotEraseTheOnlySafeFrontier)
+{
+  constexpr int width = 80, height = 30;
+  OnlineGlobalMap map(immediateConfig(), "odom");
+  auto scan = source(1, 0, 0, 1, width, height, .1);
+  scan.height_discontinuities.assign(width * height, 0U);
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const size_t i = static_cast<size_t>(y) * width + x;
+      if (x < 5) { scan.types[i] = 0U; scan.values[i] = 255U; }
+      if (y <= 10 || y >= 18 || x == width - 1) {
+        scan.types[i] = 3U; scan.values[i] = 254U;
+      }
+      if (y == 10 || y == 18) scan.height_discontinuities[i] = 1U;
+    }
+  }
+  scan.raw_types = scan.types;
+  ASSERT_EQ(map.update(scan), Result::UPDATED);
+  const auto snapshot = map.snapshot();
+  ASSERT_TRUE(snapshot);
+  HistoryFrontierQuery request;
+  request.start = {6.5, 1.45};
+  request.goal = {10.0, 1.45};
+  request.height_clearance = .45;
+  const auto route = findHistoryFrontierRoute(*snapshot, request);
+  ASSERT_TRUE(route);
+  EXPECT_LT(route->target.x(), 1.6);
+  EXPECT_LT(snapshot->queryHeight({route->target.x(), route->target.y(), 0}).distance,
+    request.height_clearance);
+  for (const auto & point : route->target_to_start) {
+    const auto field = snapshot->query({point.x(), point.y(), 0});
+    ASSERT_TRUE(field.ok);
+    EXPECT_GE(field.distance, request.route_clearance);
+  }
+  // A genuinely unsafe slot is still refused by the original clearance gate.
+  request.route_clearance = .5;
+  EXPECT_FALSE(findHistoryFrontierRoute(*snapshot, request));
+}

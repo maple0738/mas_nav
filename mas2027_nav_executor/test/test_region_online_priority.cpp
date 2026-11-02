@@ -238,4 +238,101 @@ TEST(RegionOnlinePriority, OnlineOnlyWorksWithoutStaticMapOrMapTF)
   EXPECT_TRUE(unknown->segments.empty());
 }
 
+TEST(TerrainGrid, InteriorSemanticHolesDoNotCreateSlopeSides)
+{
+  constexpr int width = 25;
+  for (const uint8_t gap_label : {0U, 255U}) {
+    std::vector<uint8_t> labels(width * width, 0U);
+    std::vector<float> uphill_x(labels.size(), 0.0F), uphill_y(labels.size(), 0.0F);
+    for (int y = 6; y <= 18; ++y) for (int x = 4; x <= 20; ++x) {
+      const size_t i = y * width + x;
+      labels[i] = 5U;
+      uphill_x[i] = 1.0F;
+    }
+    labels[12 * width + 12] = gap_label;
+    const auto sides = mas2027_nav_executor::buildSlopeSideMask(
+      width, width, labels, uphill_x, uphill_y);
+    EXPECT_EQ(sides[12 * width + 12], 0U);
+    EXPECT_EQ(sides[5 * width + 12], 1U);
+    EXPECT_TRUE(mas2027_nav_executor::terrainSideTransitionAllowed(
+      width, width, 0.1, 0.0, 0.0, sides, 1.15, 1.25, 1.35, 1.25, true));
+  }
+}
+
+TEST(TerrainGrid, RaySamplingSeamInsideSlopeDoesNotBecomeSideWall)
+{
+  constexpr int width = 25;
+  std::vector<uint8_t> labels(width * width, 0U);
+  std::vector<float> uphill_x(labels.size(), 0.0F), uphill_y(labels.size(), 0.0F);
+  for (int y = 6; y <= 18; ++y) for (int x = 4; x <= 20; ++x) {
+    const size_t i = y * width + x;
+    labels[i] = x == 12 ? 255U : 5U;
+    uphill_x[i] = 1.0F;
+  }
+  const auto sides = mas2027_nav_executor::buildSlopeSideMask(
+    width, width, labels, uphill_x, uphill_y);
+  for (int y = 7; y <= 17; ++y) EXPECT_EQ(sides[y * width + 12], 0U);
+  EXPECT_EQ(sides[5 * width + 10], 1U);
+}
+
+TEST(TerrainGrid, GapBetweenParallelSlopesRemainsASideBoundary)
+{
+  constexpr int width = 25;
+  std::vector<uint8_t> labels(width * width, 0U);
+  std::vector<float> uphill_x(labels.size(), 0.0F), uphill_y(labels.size(), 0.0F);
+  for (int y = 5; y <= 13; ++y) for (int x = 4; x <= 20; ++x) {
+    if (y == 9) continue;
+    const size_t i = y * width + x;
+    labels[i] = 5U;
+    uphill_x[i] = 1.0F;
+  }
+  const auto sides = mas2027_nav_executor::buildSlopeSideMask(
+    width, width, labels, uphill_x, uphill_y);
+  EXPECT_EQ(sides[9 * width + 12], 1U);
+  EXPECT_FALSE(mas2027_nav_executor::terrainSideTransitionAllowed(
+    width, width, 0.1, 0.0, 0.0, sides, 1.25, 0.85, 1.25, 1.05, true));
+}
+
+TEST(TerrainGrid, RotatedSlopeInteriorHoleKeepsLongSidesBlocked)
+{
+  constexpr int width = 25;
+  std::vector<uint8_t> labels(width * width, 0U);
+  std::vector<float> uphill_x(labels.size(), 0.0F), uphill_y(labels.size(), 0.0F);
+  for (int y = 0; y < width; ++y) for (int x = 0; x < width; ++x) {
+    if (std::abs(x + y - 20) > 8 || std::abs(y - x) > 2) continue;
+    const size_t i = y * width + x;
+    labels[i] = 5U;
+    uphill_x[i] = uphill_y[i] = 0.70710678F;
+  }
+  labels[10 * width + 10] = 255U;
+  const auto sides = mas2027_nav_executor::buildSlopeSideMask(
+    width, width, labels, uphill_x, uphill_y);
+  EXPECT_EQ(sides[10 * width + 10], 0U);
+  EXPECT_EQ(sides[12 * width + 9], 1U);
+}
+
+TEST(TerrainGrid, SideDistanceRepelsBothSidesOfTheUnchangedMask)
+{
+  std::vector<uint8_t> mask(100, 0U);
+  mask[4 * 10 + 4] = 1U;
+  const auto outside = mas2027_nav_executor::terrainSideDistance(
+    10, 10, 0.1, 0, 0, mask, 0.53, 0.45);
+  EXPECT_NEAR(outside.distance, 0.03, 1e-9);
+  EXPECT_NEAR(outside.gradient_x, 1.0, 1e-9);
+  EXPECT_NEAR(outside.gradient_y, 0.0, 1e-9);
+  const auto inside = mas2027_nav_executor::terrainSideDistance(
+    10, 10, 0.1, 0, 0, mask, 0.48, 0.45);
+  EXPECT_NEAR(inside.distance, -0.02, 1e-9);
+  EXPECT_NEAR(inside.gradient_x, 1.0, 1e-9);
+  mask[4 * 10 + 5] = 1U;
+  const auto joined = mas2027_nav_executor::terrainSideDistance(
+    10, 10, 0.1, 0, 0, mask, 0.499, 0.47);
+  EXPECT_NEAR(joined.distance, -0.03, 1e-9);
+  EXPECT_NEAR(joined.gradient_y, 1.0, 1e-9); // Shared cell edge is not an exit.
+  EXPECT_TRUE(std::isinf(mas2027_nav_executor::terrainSideDistance(
+    10, 10, 0.1, 0, 0, mask, -0.01, 0.4).distance));
+  EXPECT_TRUE(std::isinf(mas2027_nav_executor::terrainSideDistance(
+    10, 10, 0.1, 0, 0, {}, 0.4, 0.4).distance));
+}
+
 }  // namespace

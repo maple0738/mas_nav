@@ -80,6 +80,9 @@ void TerrainGrid::refresh()
   }
   next->slope_side_mask = buildSlopeSideMask(
     static_cast<int>(width), static_cast<int>(height), labels, uphill_x, uphill_y);
+  next->terrain_labels = std::move(labels);
+  next->uphill_x = std::move(uphill_x);
+  next->uphill_y = std::move(uphill_y);
   snapshot_ = std::move(next);
 }
 

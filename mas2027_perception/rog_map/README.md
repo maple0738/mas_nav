@@ -157,6 +157,8 @@ RViz 的 `ROGMAP` 分组默认开启 `Online Terrain (orange=slope, cyan=tunnel)
 
 ### 二维投影（决定 `/rog_map/layer_value`）
 
+薄面并不直接代表车轮可到达：台阶顶面同样是薄面。投影保留滚动窗口内最后实际观测的薄地面世界高度；空中通过的自由射线、三维占据衰减不再抹掉地面或台阶证据，新的地面观测可以替换旧高度，滑出窗口后清除。相邻高度差超过 `max_step_height` 时仍阻断两侧；两侧之间隔着扫描空列时，在最多 20 格的四向/对角扫描中，分别拟合两端地面，只有两端外推都证实超过原阈值的高度断裂才阻断空列及两端，连续坡面不按总升高量当作台阶。检查不越过中间已有的地面观测或已确认占据。高度边界与掩码一同重算，避免长于旧脏列 halo 的依赖留下陈旧障碍。坡面语义拟合也使用这些实际高度证据，减少传感器转开后的错误退出。该约束不读取仿真场地模型或先验地图、不放宽净空或台阶阈值；从未观测的落差或超出拟合/空列范围的边缘仍不能由它凭空补全。
+
 | 参数 | 现值 | 默认 | 说明 |
 |---|---:|---:|---|
 | `projection.enable` | `true` | `true` | 投影层总开关 |
@@ -166,14 +168,15 @@ RViz 的 `ROGMAP` 分组默认开启 `Online Terrain (orange=slope, cyan=tunnel)
 | `projection.unknown_as_occupied` | `false` | `true` | UNKNOWN 是否算二维障碍。**必须与 `planner.exploration.unknown_as_occupied` 一致**，否则全局搜索与距离场对同一格给出相反结论 |
 | `projection.body_exclusion_radius` | `0.302` | `0.302` | 方形底盘的外接圆半径；入图前按配对位姿过滤轮廓内的自车回波，保留已观测的墙体占据。设 0 关闭过滤 |
 | `projection.min_observed_voxels` | `1` | `2` | 柱内至少几个已观测（free/occ）体素才算“观测过” |
-| `projection.surface_height_delta_max` | `0.15` | `0.10` | span ≤ 本值 → PASSABLE（薄面：地面、坡面、桌面）。**2026-09-22 由 0.10 放宽到 0.15**（桌子被判障碍），代价见下方⚠️ |
+| `projection.surface_height_delta_max` | `0.08` | `0.10` | 柱内 span ≤ 本值初判为薄面；相邻地面高度突变仍会将边界改判为障碍 |
+| `projection.max_step_height` | `0.08` | `0.08` | 已观测地面的相邻高度跳变或跨扫描空列的双端地面外推跳变超过本值时，边界写入 OCCUPIED 并进入距离场；必须为正数，需按底盘能力标定 |
 | `projection.wall_height_delta_min` | `0.8` | `0.20` | span ≥ 本值且竖直占据率 ≥ `wall_occupancy_ratio_min` → OCCUPIED（实心墙） |
 | `projection.wall_occupancy_ratio_min` | `0.9` | `0.80` | 墙面的竖直占据率下限 |
 | `projection.tunnel_height_delta_min` | `0.25` | `0.24` | 中空结构 span 下限 |
 | `projection.tunnel_height_delta_max` | `0.4` | `0.40` | 中空结构 span 上限 |
 | `projection.tunnel_occupancy_ratio_max` | `0.45` | `0.55` | 中空结构的竖直占据率上限。**校验：必须 < `wall_occupancy_ratio_min`** |
 | `projection.passable_cost` | 未设置 | `50` | PASSABLE 格的 value。**只有 `passable_as_free: false` 时才出现在图里**；安全检查只拒 254，所以它不会让规划器绕开这些格子 |
-| `projection.passable_as_free` | `true` | `true` | PASSABLE 的 **mask 恒为 1（自由）**，本项只决定 value 是 0 还是 `passable_cost` |
+| `projection.passable_as_free` | `true` | `true` | 未被高度突变检测阻断的 PASSABLE 的 mask 为 1；本项只决定其 value 是 0 还是 `passable_cost` |
 | `projection.hysteresis_enable` | `false` | `true` | 分类迟滞：OCCUPIED 立即进入，清出需连续确认 |
 | `projection.hysteresis_count` | 未设置 | `2` | 迟滞确认次数 |
 | `projection.obstacle_hold_time` | `1.5` | `0.0` | 曾判占据的格子强制保持占用的时间（s） |

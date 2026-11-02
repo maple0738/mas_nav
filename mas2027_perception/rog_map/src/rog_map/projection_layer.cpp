@@ -112,9 +112,8 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const
   }
 
   const auto thinGround = [](const CellData & cell) {
-    return cell.type == CellType::PASSABLE &&
-      cell.raw_reason == ProjectionClassReason::THIN_SURFACE &&
-      std::isfinite(cell.occupied_z_min_abs);
+    return (cell.type == CellType::PASSABLE || cell.type == CellType::FREE) &&
+      std::isfinite(cell.ground_reference_z);
   };
   const auto & tunnel_config = current_config_;
   const auto tunnelCandidate = [&tunnel_config](const CellData & cell) {
@@ -183,7 +182,7 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const
       double sum_xx = 0.0, sum_xy = 0.0, sum_yy = 0.0;
       double sum_xz = 0.0, sum_yz = 0.0, sum_zz = 0.0;
       plane_samples.clear();
-      float lowest = center.occupied_z_min_abs;
+      float lowest = center.ground_reference_z;
       float highest = lowest;
       for (int dy = -kRadius; dy <= kRadius; ++dy) {
         for (int dx = -kRadius; dx <= kRadius; ++dx) {
@@ -194,7 +193,7 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const
           if (!thinGround(neighbor)) continue;
           const double px = dx * resolution_;
           const double py = dy * resolution_;
-          const double z = neighbor.occupied_z_min_abs;
+          const double z = neighbor.ground_reference_z;
           sum_x += px;
           sum_y += py;
           sum_z += z;
@@ -204,8 +203,8 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const
           sum_xz += px * z;
           sum_yz += py * z;
           sum_zz += z * z;
-          lowest = std::min(lowest, neighbor.occupied_z_min_abs);
-          highest = std::max(highest, neighbor.occupied_z_min_abs);
+          lowest = std::min(lowest, neighbor.ground_reference_z);
+          highest = std::max(highest, neighbor.ground_reference_z);
           plane_samples.push_back({px, py, z});
         }
       }
@@ -599,6 +598,7 @@ void ProjectionLayer::updateOneCell(
   const CellData previous = cell_buffer_[static_cast<size_t>(hash_id)];
 
   CellData cell;
+  cell.ground_reference_z = previous.ground_reference_z;
   cell.last_hit_time = static_cast<float>(stats.last_hit_time);
   cell.last_update_time = static_cast<float>(stats.last_update_time);
   const CellType raw_type = classifyCell(stats, cell, config, resolution_);
@@ -716,40 +716,12 @@ void ProjectionLayer::filterMask(
     return;
   }
 
-  std::vector<int> affected;
-  if (base_dirty_indices) {
-    constexpr int kFilterInfluenceRadius = 2;
-    const size_t expected = static_cast<size_t>(width_) * static_cast<size_t>(height_);
-    std::vector<uint8_t> update_mask(expected, 0U);
-    affected.reserve(base_dirty_indices->size() * 25U);
-    for (const int view_id : *base_dirty_indices) {
-      if (view_id < 0 || view_id >= static_cast<int>(expected)) {
-        continue;
-      }
-      const int cx = view_id % width_;
-      const int cy = view_id / width_;
-      for (int dy = -kFilterInfluenceRadius; dy <= kFilterInfluenceRadius; ++dy) {
-        for (int dx = -kFilterInfluenceRadius; dx <= kFilterInfluenceRadius; ++dx) {
-          const int nx = cx + dx;
-          const int ny = cy + dy;
-          if (nx < 0 || ny < 0 || nx >= width_ || ny >= height_) {
-            continue;
-          }
-          const int nidx = ny * width_ + nx;
-          if (update_mask[static_cast<size_t>(nidx)] == 0U) {
-            update_mask[static_cast<size_t>(nidx)] = 1U;
-            affected.push_back(nidx);
-          }
-        }
-      }
-    }
-  } else {
-    const int expected = width_ * height_;
-    affected.resize(static_cast<size_t>(expected));
-    for (int i = 0; i < expected; ++i) {
-      affected[static_cast<size_t>(i)] = i;
-    }
-  }
+  // Height evidence can connect across empty scan columns. A new observation
+  // may invalidate an edge beyond the old two-cell dirty halo, so rebuild this
+  // bounded rolling projection's masks together rather than leave stale cells.
+  const int count = width_ * height_;
+  std::vector<int> affected(static_cast<size_t>(count));
+  for (int i = 0; i < count; ++i) affected[static_cast<size_t>(i)] = i;
 
   if (config.mask_filter_en) {
     fillMask(config, affected);
@@ -764,6 +736,110 @@ void ProjectionLayer::filterMask(
       cell.type = cell.base_type;
     }
   }
+
+  const auto at = [this](int x, int y) -> CellData & {
+    return cell_buffer_[static_cast<size_t>(hashIndexFromLocal(x, y))];
+  };
+  const auto inside = [this](int x, int y) {
+    return x >= 0 && y >= 0 && x < width_ && y < height_;
+  };
+  for (int y = 0; y < height_; ++y) {
+    for (int x = 0; x < width_; ++x) {
+      auto & cell = at(x, y);
+      // THIN_SURFACE passable cells and OCCUPIED cells both carry a measured
+      // ground return.  Updating OCCUPIED cells here ensures that edge-adjacent
+      // free cells see the true height difference across a platform drop even
+      // when the edge voxel itself is classified as an obstacle.
+      if (std::isfinite(cell.occupied_z_min_abs) &&
+          (cell.base_type == CellType::PASSABLE ||
+           cell.base_type == CellType::OCCUPIED))
+        cell.ground_reference_z = cell.occupied_z_min_abs;
+      cell.height_discontinuity = false;
+      cell.height_discontinuity_measured = false;
+    }
+  }
+
+  // Adjacent measured height jumps retain the original hard step threshold.
+  // Sparse lidar rings may leave FREE air columns between the two surfaces.
+  // Only bridge that gap when planes fitted independently on BOTH sides
+  // disagree by more than the same threshold; a continuous grade agrees with
+  // both planes even when its total height gain exceeds a single step.
+  constexpr int kFitRadius = 5;
+  constexpr int kMaxGapCells = 4 * kFitRadius;
+  std::vector<Eigen::Vector3d> planes(static_cast<size_t>(count), Eigen::Vector3d::Zero());
+  std::vector<int8_t> plane_state(static_cast<size_t>(count), 0);
+  const auto fit = [&](int x, int y) {
+    const size_t id = static_cast<size_t>(y) * width_ + x;
+    if (plane_state[id]) return plane_state[id] > 0;
+    plane_state[id] = -1;
+    const double z0 = at(x, y).ground_reference_z;
+    Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
+    Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
+    double zz = 0.0;
+    int samples = 0;
+    for (int dy = -kFitRadius; dy <= kFitRadius; ++dy) {
+      for (int dx = -kFitRadius; dx <= kFitRadius; ++dx) {
+        if (!inside(x + dx, y + dy)) continue;
+        const double z = at(x + dx, y + dy).ground_reference_z;
+        if (!std::isfinite(z) || std::abs(z - z0) > config.max_step_height + 1e-6) continue;
+        const Eigen::Vector3d row(dx * resolution_, dy * resolution_, 1.0);
+        normal.noalias() += row * row.transpose(); rhs += row * z;
+        zz += z * z; ++samples;
+      }
+    }
+    if (samples < 6 || std::abs(normal.determinant()) < 1e-9) return false;
+    const Eigen::Vector3d plane = normal.fullPivLu().solve(rhs);
+    if (!plane.allFinite() || plane.head<2>().norm() > 0.70 ||
+        std::sqrt(std::max(0.0, zz - plane.dot(rhs)) / samples) > 0.04) return false;
+    planes[id] = plane; plane_state[id] = 1;
+    return true;
+  };
+  const int directions[4][2] = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
+  for (int y = 0; y < height_; ++y) {
+    for (int x = 0; x < width_; ++x) {
+      const double za = at(x, y).ground_reference_z;
+      if (!std::isfinite(za)) continue;
+      for (const auto & direction : directions) {
+        const int dx = direction[0], dy = direction[1];
+        for (int step = 1; step <= kMaxGapCells; ++step) {
+          const int nx = x + dx * step, ny = y + dy * step;
+          if (!inside(nx, ny)) break;
+          const auto & neighbor = at(nx, ny);
+          const double zb = neighbor.ground_reference_z;
+          if (!std::isfinite(zb)) {
+            if (neighbor.base_type == CellType::OCCUPIED) break;
+            continue;
+          }
+          bool jump = std::abs(za - zb) > config.max_step_height + 1e-6;
+          if (jump && step > 1) {
+            jump = fit(x, y) && fit(nx, ny);
+            if (jump) {
+              const auto & pa = planes[static_cast<size_t>(y) * width_ + x];
+              const auto & pb = planes[static_cast<size_t>(ny) * width_ + nx];
+              const double wx = dx * step * resolution_, wy = dy * step * resolution_;
+              const double ab = zb - pa.dot(Eigen::Vector3d(wx, wy, 1.0));
+              const double ba = za - pb.dot(Eigen::Vector3d(-wx, -wy, 1.0));
+              jump = ab * ba < 0.0 &&
+                std::abs(ab) > config.max_step_height + 1e-6 &&
+                std::abs(ba) > config.max_step_height + 1e-6;
+            }
+          }
+          if (jump) {
+            for (int k = 0; k <= step; ++k) {
+              auto & marked = at(x + dx*k, y + dy*k);
+              marked.height_discontinuity = true;
+              marked.height_discontinuity_measured =
+                marked.height_discontinuity_measured || step == 1;
+            }
+          }
+          break;  // Never connect over an intervening observed ground surface.
+        }
+      }
+    }
+  }
+  for (int y = 0; y < height_; ++y)
+    for (int x = 0; x < width_; ++x)
+      if (at(x, y).height_discontinuity) at(x, y).type = CellType::OCCUPIED;
 
   const auto view_start = std::chrono::steady_clock::now();
   if (base_dirty_indices) {

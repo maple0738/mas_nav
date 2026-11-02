@@ -8,9 +8,11 @@
 #include <utility>
 
 #include <opencv2/imgproc.hpp>
+#include <Eigen/LU>
 #include "rclcpp/time.hpp"
 #include "rog_map/query_adapter.hpp"
 #include "mas2027_nav_executor/common/environment/terrain_semantics.hpp"
+#include "mas2027_nav_executor/common/environment/clearance_gate.hpp"
 
 namespace mas2027_nav_executor {
 namespace {
@@ -87,12 +89,45 @@ sensor_msgs::msg::Image OnlineGlobalMapSnapshot::uphillImage() const
   return image;
 }
 
-bool OnlineGlobalMapSnapshot::terrainTransition(double from_x, double from_y,
-  double to_x, double to_y) const
+nav_msgs::msg::OccupancyGrid OnlineGlobalMapSnapshot::heightGrid() const
 {
-  return terrainSideTransitionAllowed(static_cast<int>(sizeX()),
+  auto result = grid_;
+  for (size_t i = 0; i < result.data.size(); ++i)
+    result.data[i] = height_discontinuity_mask_[i] ? 100 : 0;
+  return result;
+}
+
+bool OnlineGlobalMapSnapshot::terrainTransition(double from_x, double from_y,
+  double to_x, double to_y, double height_clearance,
+  std::optional<Eigen::Vector2d> clearance_origin) const
+{
+  if (!terrainSideTransitionAllowed(static_cast<int>(sizeX()),
     static_cast<int>(sizeY()), resolution_, originX(), originY(), slope_side_mask_,
-    from_x, from_y, to_x, to_y, false);
+    from_x, from_y, to_x, to_y, false) ||
+    !terrainSideTransitionAllowed(static_cast<int>(sizeX()),
+      static_cast<int>(sizeY()), resolution_, originX(), originY(), height_discontinuity_mask_,
+      from_x, from_y, to_x, to_y, false)) return false;
+  if (height_clearance <= 0.0) return true;
+  const auto initial = clearance_origin ? queryHeight(
+    {clearance_origin->x(), clearance_origin->y(), 0.0}) : rog_map::QueryResult{};
+  // Reuse the existing near-field rule when new observations find the robot
+  // already closer to an edge: move out without worsening clearance, then
+  // restore the full threshold outside one safety radius. Cell crossings
+  // remain forbidden, including within this recovery interval.
+  const auto gate = makeClearanceRequirement(height_clearance, height_clearance,
+    initial.distance, initial.ok, 0.0);
+  const int steps = std::max(1, static_cast<int>(std::ceil(
+    std::hypot(to_x-from_x, to_y-from_y) / (0.5 * resolution_))));
+  for (int i = 0; i <= steps; ++i) {
+    const double u = static_cast<double>(i) / steps;
+    const double x = from_x + u*(to_x-from_x), y = from_y + u*(to_y-from_y);
+    const auto q = queryHeight({x, y, 0.0});
+    if (q.status == rog_map::QueryStatus::OUT_OF_MAP) continue;
+    const double required = clearance_origin ? gate.requiredAt(
+      std::hypot(x-clearance_origin->x(), y-clearance_origin->y())) : height_clearance;
+    if (!q.ok || q.distance + kClearanceComparisonTolerance < required) return false;
+  }
+  return true;
 }
 
 void OnlineGlobalMapSnapshot::mapToWorld(unsigned int mx, unsigned int my, double & x,
@@ -127,12 +162,25 @@ bool OnlineGlobalMapSnapshot::copyValues(std::vector<unsigned char> & out) const
 
 rog_map::QueryResult OnlineGlobalMapSnapshot::query(const Eigen::Vector3d & position) const
 {
+  return queryField(position, distances_);
+}
+
+rog_map::QueryResult OnlineGlobalMapSnapshot::queryHeight(const Eigen::Vector3d & position) const
+{
+  auto result = queryField(position, height_distances_);
+  if (result.ok) result.distance -= 0.5 * resolution_; // Cell extent, not only its center.
+  return result;
+}
+
+rog_map::QueryResult OnlineGlobalMapSnapshot::queryField(const Eigen::Vector3d & position,
+  const std::shared_ptr<const std::vector<double>> & field) const
+{
   rog_map::QueryResult result;
   if (!position.allFinite()) {
     result.status = rog_map::QueryStatus::NONFINITE_INPUT;
     return result;
   }
-  if (!distances_ || distances_->size() != grid_.data.size()) return result;
+  if (!field || field->size() != grid_.data.size()) return result;
   // Distance samples lie at cell centers, as in TerrainMapQuery.
   const double px = (position.x() - originX()) / resolution_ - 0.5;
   const double py = (position.y() - originY()) / resolution_ - 0.5;
@@ -145,7 +193,7 @@ rog_map::QueryResult OnlineGlobalMapSnapshot::query(const Eigen::Vector3d & posi
   const auto y = static_cast<unsigned int>(std::floor(py));
   const size_t i = static_cast<size_t>(y) * sizeX() + x;
   const double fx = px - x, fy = py - y;
-  const auto & d = *distances_;
+  const auto & d = *field;
   const double a = d[i], b = d[i + 1], c = d[i + sizeX()], e = d[i + sizeX() + 1];
   result.distance = (1 - fy) * ((1 - fx) * a + fx * b) + fy * ((1 - fx) * c + fx * e);
   result.gradient = {((1 - fy) * (b - a) + fy * (e - c)) / resolution_,
@@ -198,6 +246,11 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
   if (source_count > config_.max_cells || source.values.size() != source_count ||
     source.types.size() != source_count ||
     (!source.raw_types.empty() && source.raw_types.size() != source_count) ||
+    (!source.height_deltas.empty() && source.height_deltas.size() != source_count) ||
+    (!source.ground_heights.empty() && source.ground_heights.size() != source_count) ||
+    (!source.height_discontinuities.empty() && source.height_discontinuities.size() != source_count) ||
+    ((!source.ground_heights.empty() || !source.height_discontinuities.empty()) &&
+      (!std::isfinite(source.max_step_height) || source.max_step_height <= 0.0)) ||
     (!source.confidence.empty() && source.confidence.size() != source_count) ||
     ((!source.terrain_labels.empty() || !source.uphill_x.empty() ||
        !source.uphill_y.empty()) &&
@@ -230,22 +283,89 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
     uint8_t terrain_label{255U};
     float uphill_x{0.0f};
     float uphill_y{0.0f};
+    bool height_discontinuity{false};
+    bool height_measured{false};
+    // Occupied for a reason other than a gap-inferred height barrier.
+    bool occupied_not_inferred{false};
+    unsigned int continuous_ground_count{0};
   };
   std::vector<Observation> observations(static_cast<size_t>(ow) * oh);
+  const auto ground_history = snapshot();
+  const auto fresh_ground = [&source](int x, int y) {
+    if (source.ground_heights.empty() || x < 0 || y < 0 ||
+      x >= source.width || y >= source.height) return false;
+    const size_t i = static_cast<size_t>(y) * source.width + x;
+    const uint8_t raw = source.raw_types.empty() ? source.types[i] : source.raw_types[i];
+    return raw == 2U && source.types[i] != 3U && source.values[i] < 253U &&
+      std::isfinite(source.ground_heights[i]) &&
+      (source.height_deltas.empty() || (std::isfinite(source.height_deltas[i]) &&
+        source.height_deltas[i] <= source.max_step_height));
+  };
+  const auto continuous_ground = [&source, &fresh_ground, &ground_history](int x, int y) {
+    if (fresh_ground(x, y)) {
+      const double z = source.ground_heights[static_cast<size_t>(y) * source.width + x];
+      bool dense = true;
+      for (int dy = -1; dy <= 1; ++dy) for (int dx = -1; dx <= 1; ++dx) {
+        dense = dense && fresh_ground(x + dx, y + dy);
+        if (dense) dense = std::abs(source.ground_heights[
+          static_cast<size_t>(y + dy) * source.width + x + dx] - z) <= source.max_step_height + 1e-6;
+      }
+      if (dense) return true;
+    }
+    if (!ground_history || source.ground_heights.empty()) return false;
+    unsigned int hx, hy;
+    if (!ground_history->worldToMap(source.origin_x + (x + 0.5) * source.resolution,
+        source.origin_y + (y + 0.5) * source.resolution, hx, hy) ||
+      !ground_history->heightDiscontinuityMask()[static_cast<size_t>(hy) * ground_history->sizeX() + hx])
+      return false;
+    // Lidar rings and the body blind spot need not produce a dense 3x3
+    // return. Correct a remembered gap only with an enclosing, measured local
+    // plane. One-sided support or the two levels of a step cannot clear it.
+    const int radius = static_cast<int>(std::ceil(0.5 / source.resolution));
+    std::vector<std::pair<Eigen::Vector3d, double>> samples;
+    std::vector<double> angles;
+    Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
+    Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
+    for (int dy = -radius; dy <= radius; ++dy) for (int dx = -radius; dx <= radius; ++dx) {
+      if (!fresh_ground(x + dx, y + dy)) continue;
+      const Eigen::Vector3d row(dx * source.resolution, dy * source.resolution, 1.0);
+      const double z = source.ground_heights[
+        static_cast<size_t>(y + dy) * source.width + x + dx];
+      normal.noalias() += row * row.transpose(); rhs += row * z;
+      samples.emplace_back(row, z);
+      if (dx || dy) angles.push_back(std::atan2(dy, dx));
+    }
+    if (samples.size() < 6 || angles.size() < 3 || std::abs(normal.determinant()) < 1e-9) return false;
+    std::sort(angles.begin(), angles.end());
+    constexpr double pi = 3.14159265358979323846;
+    double gap = angles.front() + 2 * pi - angles.back();
+    for (size_t i = 1; i < angles.size(); ++i) gap = std::max(gap, angles[i] - angles[i - 1]);
+    if (gap >= pi - 1e-6) return false;
+    const Eigen::Vector3d plane = normal.fullPivLu().solve(rhs);
+    if (!plane.allFinite() || plane.head<2>().norm() > 0.70) return false;
+    for (const auto & sample : samples)
+      if (std::abs(sample.second - plane.dot(sample.first)) > 0.5 * source.max_step_height)
+        return false;
+    return true;
+  };
   for (int y = 0; y < source.height; ++y) {
     for (int x = 0; x < source.width; ++x) {
       const size_t i = static_cast<size_t>(y) * source.width + x;
       const uint8_t type = source.types[i];
       if (type > 3U) return UpdateResult::INVALID_INPUT;
+      if (!source.height_discontinuities.empty() && source.height_discontinuities[i] > 2U)
+        return UpdateResult::INVALID_INPUT;
+      const bool height_edge = !source.height_discontinuities.empty() &&
+        source.height_discontinuities[i] != 0U && type == 3U && source.values[i] >= 253U;
       if (type == 0U) continue;  // Unknown != observed obstacle, even if its cost is 254.
       const uint8_t raw_type = source.raw_types.empty() ? type : source.raw_types[i];
       if (raw_type > 3U) return UpdateResult::INVALID_INPUT;
       // Filter-filled and held obstacles belong to current local safety, not
       // persistent sensor evidence. Ignore rather than reinterpret as free.
-      if (raw_type == 0U || (type == 3U && raw_type != 3U)) continue;
+      if (!height_edge && (raw_type == 0U || (type == 3U && raw_type != 3U))) continue;
       // Projection morphology can fill an unobserved hole with an occupied
       // type. Its observation confidence remains zero: do not memorize it.
-      if (!source.confidence.empty() && (!std::isfinite(source.confidence[i]) ||
+      if (!height_edge && !source.confidence.empty() && (!std::isfinite(source.confidence[i]) ||
         source.confidence[i] <= 0.0F)) continue;
       int gx, gy;
       if (!latticeIndex(source.origin_x + (x + 0.5) * source.resolution, config_.resolution, gx) ||
@@ -253,6 +373,10 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
         return UpdateResult::INVALID_INPUT;
       }
       auto & observation = observations[static_cast<size_t>(gy - by) * ow + gx - bx];
+      observation.height_discontinuity = observation.height_discontinuity || height_edge;
+      observation.height_measured = observation.height_measured ||
+        (height_edge && source.height_discontinuities[i] == 1U);
+      if (!height_edge && continuous_ground(x, y)) ++observation.continuous_ground_count;
       if (!source.terrain_labels.empty() &&
           (source.terrain_labels[i] == 5U || source.terrain_labels[i] == 6U ||
            source.terrain_labels[i] == 7U)) {
@@ -273,7 +397,12 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
                  type != 3U && source.values[i] < 253U) {
         ++observation.ordinary_count;
       }
-      if (type == 3U || source.values[i] >= 253U) observation.occupied = true;
+      if (type == 3U || source.values[i] >= 253U) {
+        observation.occupied = true;
+        const bool inferred_only = height_edge && source.height_discontinuities[i] == 2U &&
+          raw_type != 3U;
+        observation.occupied_not_inferred = observation.occupied_not_inferred || !inferred_only;
+      }
       else ++observation.free_count;
     }
   }
@@ -319,6 +448,34 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
       const auto & o = observations[static_cast<size_t>(y) * ow + x];
       if (!o.occupied && o.free_count < free_coverage && o.terrain_label == 255U) continue;
       auto & cell = next_cells[static_cast<size_t>(by + y - ny) * width + bx + x - nx];
+      // A measured drop is not a transient filled/held obstacle. Preserve it
+      // through sliding and free rays; clear only after fresh, fully covered
+      // continuous ground has been observed on consecutive snapshots.
+      // A barrier bridged across a sparse FREE gap only says the edge lies
+      // somewhere in that span (up to 1 m). The live layer keeps blocking the
+      // whole span; history keeps only adjacent measured jumps. Latching the
+      // span closed narrow landings: their interior is repainted every frame,
+      // so it can never be re-observed as continuous ground and cleared.
+      const bool inferred_only = o.height_discontinuity && !o.height_measured;
+      if (inferred_only) {
+        // History and its clearing progress are intentionally unchanged.
+      } else if (o.height_discontinuity) {
+        cell.height_discontinuity = true;
+        cell.height_clear_hits = 0;
+        cell.last_height_clear_stamp = 0.0;
+      } else if (cell.height_discontinuity && !o.occupied &&
+        o.continuous_ground_count >= free_coverage) {
+        const bool consecutive = cell.last_height_clear_stamp == last_source_stamp_ &&
+          source.stamp - last_source_stamp_ <= config_.confirmation_max_gap_s;
+        cell.height_clear_hits = consecutive ? static_cast<uint8_t>(std::min(
+          config_.occupied_confirmations, static_cast<int>(cell.height_clear_hits) + 1)) : 1U;
+        cell.last_height_clear_stamp = source.stamp;
+        if (cell.height_clear_hits >= config_.occupied_confirmations)
+          cell.height_discontinuity = false;
+      } else {
+        cell.height_clear_hits = 0;
+        cell.last_height_clear_stamp = 0.0;
+      }
       // Confirm special terrain over distinct, consecutive snapshots before
       // retaining it outside the live window. Unknown observations do not erase
       // history; complete ordinary observations can correct a false label.
@@ -366,6 +523,8 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
         cell.ordinary_hits = 0;
       }
       if (!o.occupied && o.free_count < free_coverage) continue;
+      // The live layer blocks a bridged gap; history keeps confirmed ground.
+      if (inferred_only && !o.occupied_not_inferred) continue;
       if (o.occupied && !(cell.observed && cell.evidence >= 0)) {
         const bool consecutive = cell.last_pending_stamp == last_source_stamp_ &&
           source.stamp - cell.last_pending_stamp <= config_.confirmation_max_gap_s;
@@ -405,9 +564,12 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
   next->terrain_labels_.resize(next_cells.size());
   next->uphill_x_.resize(next_cells.size());
   next->uphill_y_.resize(next_cells.size());
+  next->height_discontinuity_mask_.resize(next_cells.size(), 0U);
   for (size_t i = 0; i < next_cells.size(); ++i) {
     const auto & cell = next_cells[i];
     grid.data[i] = !cell.observed ? -1 : (cell.evidence < 0 ? 0 : 100);
+    next->height_discontinuity_mask_[i] = cell.height_discontinuity ? 1U : 0U;
+    if (cell.height_discontinuity) grid.data[i] = 100;
     next->terrain_labels_[i] = cell.terrain_label;
     next->uphill_x_[i] = cell.uphill_x;
     next->uphill_y_[i] = cell.uphill_y;
@@ -420,6 +582,15 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
   if (previous && width == width_ && height == height_ && nx == origin_x_ && ny == origin_y_ &&
     grid.data == previous->grid_.data) next->distances_ = previous->distances_;
   else next->distances_ = buildField(grid, config_.resolution);
+  if (previous && width == width_ && height == height_ && nx == origin_x_ && ny == origin_y_ &&
+    next->height_discontinuity_mask_ == previous->height_discontinuity_mask_)
+    next->height_distances_ = previous->height_distances_;
+  else {
+    auto height_grid = grid;
+    for (size_t i = 0; i < height_grid.data.size(); ++i)
+      height_grid.data[i] = next->height_discontinuity_mask_[i] ? 100 : 0;
+    next->height_distances_ = buildField(height_grid, config_.resolution);
+  }
   cells_ = std::move(next_cells); origin_x_ = nx; origin_y_ = ny; width_ = width; height_ = height;
   last_source_sequence_ = source.sequence; last_source_stamp_ = source.stamp;
   {

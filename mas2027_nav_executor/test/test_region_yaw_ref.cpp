@@ -23,7 +23,7 @@ std::shared_ptr<RegionPlan> makePlan(uint8_t label = 5)
 
 TEST(RegionYawRef, StartsBeforeActivationAndPersistsThroughReleaseWindow)
 {
-  for (const uint8_t label : {5, 6, 7}) {
+  for (const uint8_t label : {5}) {
     RegionController controller(4, 3, 4, 2, 4);
     GimbalFollowAdapter adapter(GimbalFollowParams{});
     controller.setPlan(makePlan(label));
@@ -55,6 +55,23 @@ TEST(RegionYawRef, StartsBeforeActivationAndPersistsThroughReleaseWindow)
     EXPECT_EQ(controller.phase(), RegionPhase::NORMAL);
     EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
     EXPECT_FALSE(adapter.updateHeading(controller.trajectoryHeadingErrorDegrees(0), 0.05).follow_gimbal);
+  }
+}
+
+TEST(RegionYawRef, NonSlopeRegionsKeepTheirModesWithoutRequestingAlignment)
+{
+  for (const uint8_t label : {6, 7}) {
+    RegionController controller(4, 3, 4, 2, 4);
+    GimbalFollowAdapter adapter(GimbalFollowParams{});
+    controller.setPlan(makePlan(label));
+    for (const auto & position : std::vector<Eigen::Vector2d>{
+        {0, 0}, {1.1, 0}, {1.6, 0}, {1.9, 0}, {2, 1}, {2.2, 2}, {2.6, 2}}) {
+      controller.update(position);
+      const auto heading = controller.trajectoryHeadingErrorDegrees(kPi / 4);
+      EXPECT_FALSE(heading) << "label=" << static_cast<int>(label);
+      EXPECT_FALSE(adapter.updateHeading(heading, 0.05).follow_gimbal);
+      if (controller.phase() == RegionPhase::INSIDE) EXPECT_EQ(controller.mode(), label);
+    }
   }
 }
 
@@ -108,6 +125,94 @@ TEST(RegionYawRef, SkipsDuplicateEntryPointsAndClearsOnSemanticRefresh)
   refreshed->segments.clear();
   controller.setPlan(refreshed);
   controller.update({1.1, 0});
+  EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
+}
+
+TEST(RegionYawRef, ReplanningAtThePreparationBoundaryKeepsTheLowerFollowBaseline)
+{
+  RegionController controller(4, 3, 4, 2, 4);
+  GimbalFollowAdapter adapter(GimbalFollowParams{});
+  controller.setPlan(makePlan());
+  controller.update({0, 0});
+  controller.update({1.1, 0});
+  ASSERT_TRUE(adapter.updateHeading(controller.trajectoryHeadingErrorDegrees(0), 0.05).follow_gimbal);
+  const double angle = adapter.integrateMpcYawRate(1.0, 0.05);
+  auto replanned = makePlan();
+  replanned->trajectory_id = 2;
+  replanned->segments.front().prepare_s = 1.15;
+  controller.setPlan(replanned);
+  controller.update({1.1, 0});
+  EXPECT_EQ(controller.phase(), RegionPhase::PREPARING);
+  ASSERT_TRUE(controller.trajectoryHeadingErrorDegrees(0));
+  EXPECT_TRUE(adapter.updateHeading(controller.trajectoryHeadingErrorDegrees(0), 0.05).follow_gimbal);
+  EXPECT_DOUBLE_EQ(adapter.commandDegrees(), angle);
+}
+
+TEST(RegionYawRef, MissingSemanticSamplesKeepAlignmentUntilTheReleaseDistanceIsTravelled)
+{
+  RegionController controller(4, 3, 4, 2, 4);
+  controller.setPlan(makePlan());
+  controller.update({0, 0});
+  controller.update({1.6, 0});
+  ASSERT_EQ(controller.mode(), 5U);
+  auto gap = makePlan();
+  gap->trajectory_id = 2;
+  gap->segments.clear();
+  controller.setPlan(gap);
+  controller.update({1.7, 0});
+  EXPECT_EQ(controller.mode(), 5U);
+  EXPECT_EQ(controller.phase(), RegionPhase::RELEASING);
+  EXPECT_EQ(controller.label(), 5U);
+  EXPECT_TRUE(controller.trajectoryHeadingErrorDegrees(0));
+  controller.update({2.2, 0});
+  EXPECT_EQ(controller.mode(), 4U);
+  EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
+}
+
+TEST(RegionYawRef, ACancelledPlanClearsRetainedAlignmentAndMode)
+{
+  RegionController controller(4, 3, 4, 2, 4);
+  controller.setPlan(makePlan());
+  controller.update({0, 0});
+  controller.update({1.6, 0});
+  ASSERT_EQ(controller.mode(), 5U);
+  controller.setPlan(nullptr);
+  EXPECT_EQ(controller.mode(), 4U);
+  EXPECT_FALSE(controller.label());
+  EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
+}
+
+TEST(RegionYawRef, BrakingDistancePreparesBeforeTheFixedWindowAndSurvivesStopping)
+{
+  RegionController controller(4, 3, 4, 2, 4);
+  controller.setPlan(makePlan());
+  controller.update({0, 0}, 2.5);
+  EXPECT_EQ(controller.phase(), RegionPhase::PREPARING);
+  EXPECT_EQ(controller.mode(), 4U);  // Activation stays at the configured point.
+  ASSERT_TRUE(controller.trajectoryHeadingErrorDegrees(0));
+  controller.update({0.1, 0}, 0.0);
+  EXPECT_EQ(controller.phase(), RegionPhase::PREPARING);
+  EXPECT_TRUE(controller.trajectoryHeadingErrorDegrees(0));
+}
+
+TEST(RegionYawRef, ATrajectoryEndingInsideTheRegionHasFiniteSpatialRelease)
+{
+  RegionController controller(4, 3, 4, 2, 4);
+  auto plan = makePlan();
+  plan->segments.front().exit_s = std::numeric_limits<double>::infinity();
+  plan->segments.front().release_s = std::numeric_limits<double>::infinity();
+  plan->segments.front().release_distance = 0.5;
+  controller.setPlan(plan);
+  controller.update({0, 0});
+  controller.update({1.6, 0});
+  auto gap = makePlan();
+  gap->segments.clear();
+  controller.setPlan(gap);
+  controller.update({1.7, 0});
+  EXPECT_EQ(controller.mode(), 5U);
+  EXPECT_TRUE(controller.trajectoryHeadingErrorDegrees(0));
+  controller.update({2.2, 0});
+  EXPECT_EQ(controller.mode(), 4U);
   EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
 }
 }  // namespace
@@ -319,5 +424,181 @@ TEST(GimbalFollowAdapter, ReversingTheRequestedTurnCanLeaveTheAngleLimit)
   const auto reverse = adapter.updateHeading(-118.0, 0.05);
   EXPECT_GT(reverse.heading_error_deg, 0.0);
   EXPECT_GT(adapter.integrateMpcYawRate(0.2, 0.05), -180.0);
+}
+}  // namespace mas2027_nav_executor
+
+namespace mas2027_nav_executor {
+TEST(GimbalFollowAdapter, SwitchesAxisInsteadOfSaturatingAtTheCommandLimit)
+{
+  // Ideal servo: the measured base_link yaw equals the integrated command.
+  // Path direction 155 deg; starting near -170 the nearer axis needs -205 deg,
+  // beyond the non-wrapping +/-180 deg position command. Without an axis switch
+  // the command saturates at -180 with a constant 25 deg error.
+  GimbalFollowAdapter adapter(GimbalFollowParams{});
+  const auto error_to = [](double path_deg, double yaw_deg) {
+    return std::remainder(path_deg - yaw_deg, 360.0);
+  };
+  for (int i = 0; i <= 340 + 100; ++i) {  // sweep the path slowly to -170 deg
+    const double path = -0.5 * std::min(i, 340);
+    adapter.updateHeading(error_to(path, adapter.commandDegrees()), 0.05);
+    adapter.integrateMpcYawRate(0.0, 0.05);
+  }
+  ASSERT_NEAR(adapter.commandDegrees(), -170.0, 1.0);
+  bool ready = false;
+  for (int i = 0; i < 400 && !ready; ++i) {
+    ready = adapter.updateHeading(error_to(155.0, adapter.commandDegrees()), 0.05).heading_ready;
+    adapter.integrateMpcYawRate(0.0, 0.05);
+    ASSERT_LE(std::abs(adapter.commandDegrees()), 180.0);
+  }
+  EXPECT_TRUE(ready);
+  EXPECT_NEAR(std::abs(std::remainder(155.0 - adapter.commandDegrees(), 180.0)), 0.0, 5.0);
+}
+
+TEST(RegionYawRef, HairpinMovesToRampFrontBeforeStartingAlignment)
+{
+  auto plan=std::make_shared<RegionPlan>();plan->trajectory_id=99;
+  plan->positions_odom={{0,0},{1,0},{1.6,0},{1.6,0.7},{1.6,1.5}};
+  plan->arc_lengths={0,1,1.6,2.3,3.1};
+  RegionSegment segment{5,5,4,5,0,2.1,2.2,2.3,3.1,3.6};
+  segment.entry_position={1.6,0.7};segment.entry_axis={0,1};
+  plan->segments.push_back(segment);
+  RegionController controller(4,3,4,2,4);controller.setFrontEntryGate(true);
+  controller.setPlan(plan);
+  for(const Eigen::Vector2d p : std::vector<Eigen::Vector2d>{{0,0},{0.8,0},{1.4,0},{1.5,0}}) {
+    controller.update(p,5.0); // even a large braking lookahead must not align on the side
+    EXPECT_EQ(controller.mode(),4);EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
+    EXPECT_FALSE(controller.alignmentActive());
+  }
+  controller.update({1.6,0.1},5.0);
+  EXPECT_EQ(controller.phase(),RegionPhase::PREPARING);
+  ASSERT_TRUE(controller.trajectoryHeadingErrorDegrees(0));
+  EXPECT_NEAR(*controller.trajectoryHeadingErrorDegrees(0),90,1e-9);
+  controller.update({1.6,0.55},5.0);EXPECT_EQ(controller.mode(),5);
+  controller.update({1.6,0.85},5.0);EXPECT_EQ(controller.phase(),RegionPhase::INSIDE);
+}
+TEST(RegionYawRef, FrontGateUsesActualPositionAndDoesNotRetainSideApproachAfterReplan)
+{
+  auto plan=makePlan();plan->positions_odom={{0,0},{2,0},{2,2},{4,2}};
+  plan->segments[0].entry_position={2,0};plan->segments[0].entry_axis={0,1};
+  RegionController controller(4,3,4,2,4);controller.setFrontEntryGate(true);
+  controller.setPlan(plan);controller.update({0,0},4);controller.update({1.9,0},4);
+  EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
+  // A short-lived old prepare phase must not re-enable follow from memory.
+  auto next=std::make_shared<RegionPlan>(*plan);next->trajectory_id++;
+  controller.setPlan(next);controller.update({1.9,0},4);
+  EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
+}
+
+TEST(RegionYawRef, FrontEntryDoesNotRestartAlignmentForOneCellOfLateralJitter)
+{
+  auto plan = std::make_shared<RegionPlan>();
+  plan->trajectory_id = 100;
+  plan->positions_odom = {{0, 0}, {0, 1}, {0, 2}};
+  plan->arc_lengths = {0, 1, 2};
+  RegionSegment segment{5, 5, 4, 5, 0, 0.8, 0.9, 1, 1.5, 2};
+  segment.entry_position = {0, 1};
+  segment.entry_axis = {0, 1};
+  plan->segments.push_back(segment);
+  RegionController controller(4, 3, 4, 2, 4);
+  controller.setFrontEntryGate(true);
+  controller.setPlan(plan);
+  GimbalFollowAdapter adapter(GimbalFollowParams{});
+  for (const double lateral : {0.14, 0.16, 0.14, 0.19, 0.16}) {
+    auto replanned = std::make_shared<RegionPlan>(*plan);
+    replanned->trajectory_id++;
+    controller.setPlan(replanned);
+    controller.update({lateral, 0.2}, 1.0);
+    const auto follow = adapter.updateHeading(controller.trajectoryHeadingErrorDegrees(kPi / 2), 0.1);
+    EXPECT_TRUE(follow.follow_gimbal) << lateral;
+  }
+  EXPECT_TRUE(adapter.updateHeading(controller.trajectoryHeadingErrorDegrees(kPi / 2), 0.1).heading_ready);
+  // Hysteresis cannot start alignment from the side or retain a real departure.
+  controller.update({0.26, 0.2}, 1.0);
+  EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
+  controller.update({0.19, 0.2}, 1.0);
+  EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
+}
+
+TEST(RegionYawRef, FrontEntryKeepsSpinningUntilTheConfiguredPrepareWindowEvenAtHighSpeed)
+{
+  auto plan = std::make_shared<RegionPlan>();
+  plan->trajectory_id = 120;
+  plan->positions_odom = {{0, 0}, {0, 1}, {0, 2}};
+  plan->arc_lengths = {0, 1, 2};
+  RegionSegment segment{5, 5, 4, 5, 0.7, 0.8, 0.9, 1, 1.5, 2};
+  segment.entry_position = {0, 1};
+  segment.entry_axis = {0, 1};
+  plan->segments.push_back(segment);
+  RegionController controller(4, 3, 4, 2, 4);
+  controller.setFrontEntryGate(true);
+  controller.setPlan(plan);
+  for (const double y : {0.0, 0.2, 0.5, 0.69}) {
+    controller.update({0, y}, 2.5);
+    EXPECT_EQ(controller.phase(), RegionPhase::NORMAL);
+    EXPECT_FALSE(controller.alignmentActive());
+    EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
+    ASSERT_TRUE(controller.distanceToSlopeAlignment());
+    EXPECT_NEAR(*controller.distanceToSlopeAlignment(), 0.7 - y, 1e-9);
+  }
+  controller.update({0, 0.71}, 2.5);
+  EXPECT_EQ(controller.phase(), RegionPhase::PREPARING);
+  EXPECT_TRUE(controller.alignmentActive());
+  EXPECT_FALSE(controller.distanceToSlopeAlignment());
+  controller.update({0, 0.9}, 0.0);
+  EXPECT_EQ(controller.mode(), 5);
+  EXPECT_TRUE(controller.alignmentActive());
+  controller.setPlan(nullptr);
+  EXPECT_FALSE(controller.distanceToSlopeAlignment());
+}
+
+TEST(RegionYawRef, LateralHysteresisDoesNotTransferToADifferentRampAxis)
+{
+  auto plan = std::make_shared<RegionPlan>();
+  plan->trajectory_id = 110;
+  plan->positions_odom = {{0, 0}, {0, 1}, {0, 2}};
+  plan->arc_lengths = {0, 1, 2};
+  RegionSegment segment{5, 5, 4, 5, 0, 0.8, 0.9, 1, 1.5, 2};
+  segment.entry_position = {0, 1};
+  segment.entry_axis = {0, 1};
+  plan->segments.push_back(segment);
+  RegionController controller(4, 3, 4, 2, 4);
+  controller.setFrontEntryGate(true);
+  controller.setPlan(plan);
+  controller.update({0.14, 0.81}, 1.0);
+  ASSERT_TRUE(controller.trajectoryHeadingErrorDegrees(0));
+  auto next = std::make_shared<RegionPlan>(*plan);
+  next->trajectory_id++;
+  next->positions_odom = {{-0.2, 0.81}, {0.8, 0.81}, {1.8, 0.81}};
+  next->segments[0].entry_position = {0.1, 1};
+  next->segments[0].entry_axis = {1, 0};
+  controller.setPlan(next);
+  controller.update({-0.1, 0.81}, 1.0);
+  EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
+}
+
+TEST(GimbalFollowAdapter, FasterHeadingTrimKeepsTheRateAndReadinessLimits)
+{
+  const auto settle = [](double gain) {
+    GimbalFollowParams params;
+    params.heading_error_gain_s = gain;
+    GimbalFollowAdapter adapter(params);
+    double previous = 0.0;
+    for (int i = 0; i < 200; ++i) {
+      // Ideal lower angle servo, used only to compare the adapter's convergence.
+      // This is not a model of the real chassis or the Gazebo dynamics.
+      const double error = 60.0 - previous;
+      const auto output = adapter.updateHeading(error, 0.05);
+      const double command = adapter.integrateMpcYawRate(0.0, 0.05);
+      EXPECT_LE(std::abs(command - previous), params.max_heading_rate_deg_s * 0.05 + 1e-9);
+      previous = command;
+      if (output.heading_ready) {
+        EXPECT_LE(std::abs(error), params.ready_tolerance_deg);
+        return (i + 1) * 0.05;
+      }
+    }
+    ADD_FAILURE() << "Heading trim never settled";
+    return 10.0;
+  };
+  EXPECT_LT(settle(2.0), 0.7 * settle(1.0));
 }
 }  // namespace mas2027_nav_executor

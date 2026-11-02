@@ -9,10 +9,11 @@
       ready_release_deg: 8.0
       settle_time_s: 0.3
       # Keep base_link +X/-X on the path axis even while translation is blocked.
-      heading_error_gain_s: 1.0
+      # 提高静止对齐时的航向收敛速度；角速度上限、5/8 度就绪门及稳定时间不变。
+      heading_error_gain_s: 2.0
       heading_deadband_deg: 0.5
       max_heading_rate_deg_s: 120.0
-      # If the planner is between trajectories, keep follow_gimbal=1 at the last
+      # On a slope, if the planner is between trajectories, keep follow_gimbal=1 at the last
       # integrated angle and send zero translation instead of returning the lower
       # board to free-spin mode. New trajectories continue from the held angle.
       hold_last_alignment: true
@@ -25,9 +26,17 @@
       speed_blend_rate: 2.0
       acceleration_blend_rate: 4.0
       slope:
+        # 先到入口轴线正前方并完成路径转向，才开启云台/底盘对齐。
+        front_entry:
+          enable: true
+          lateral_tolerance: 0.15
+          # 已进入同一坡道的对齐允许一格定位/语义抖动，避免反复退出、清零再等待。
+          lateral_hysteresis: 0.05
+          min_alignment_cosine: 0.8
         mode: 5
         max_speed: 4.0
         max_acceleration: 5.0
+        # 临近坡脚才退出自转；窗口外仍自转并按原刹车能力提前平滑收速。
         prepare_distance: 0.3
         activation_distance: 0.2
         commit_distance: 0.1

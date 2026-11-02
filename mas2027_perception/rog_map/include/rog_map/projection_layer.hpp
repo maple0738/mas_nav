@@ -42,12 +42,22 @@ struct CellData
   float confidence{0.0f};
   float occupied_z_min_abs{std::numeric_limits<float>::quiet_NaN()};
   float occupied_z_max_abs{std::numeric_limits<float>::quiet_NaN()};
+  // Last observed support surface, in world Z. Free rays above a floor do
+  // not disprove that floor or a drop at its boundary. Sliding resets it;
+  // a fresh thin-surface observation replaces it.
+  float ground_reference_z{std::numeric_limits<float>::quiet_NaN()};
   float height_delta{0.0f};
   float vertical_occupancy_ratio{0.0f};
   float free_gap_ratio{0.0f};
   ProjectionClassReason raw_reason{ProjectionClassReason::INSUFFICIENT_OBSERVATION};
   uint8_t traversable{0};
   bool hole_filled{false};
+  bool height_discontinuity{false};
+  // True only for a jump between two adjacent measured cells. Cells inside a
+  // bridged FREE gap carry an inferred barrier: the edge lies somewhere in the
+  // gap, so the live layer blocks all of it, but history must not treat ring
+  // gaps on a measured surface as permanent steps.
+  bool height_discontinuity_measured{false};
   float last_hit_time{0.0f};
   float last_update_time{0.0f};
   double occupied_clear_deadline{0.0};
@@ -58,6 +68,7 @@ struct ProjectionLayerConfig
   bool unknown_as_occupied{false};
   int min_observed_voxels{2};
   double surface_height_delta_max{0.10};
+  double max_step_height{0.08};
   bool ground_filter_en{false};
   double ground_filter_max_span{0.15};
   double ground_filter_plane_tolerance{0.075};

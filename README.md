@@ -3,6 +3,7 @@
 ROS 2 Jazzy，运行链路统一为独立 `nav_executor`：不依赖 Nav2 server、Behavior Tree、Costmap 插件、
 `minco_planner` / `minco_controller` 插件包。唯一入口 `mas2027_nav_bringup/nav_executor_launch.py`。
 本文件是链路、TF、话题与排障总说明；专题文档见[在线导航](docs/online_navigation.md)、[现场记录与调试](docs/field_debugging.md)和[RoboMaster 无图导航优化方案](docs/robomaster_no_map_navigation.md)。
+坡道专用对齐、红蓝基地两轮往返计时与验证边界见[本轮仿真记录](docs/simulation_slope_only_20261102.md)。
 
 ## 组件职责
 
@@ -61,6 +62,10 @@ ROGMap → /rog_map/terrain_label ───────────────�
 输出可用 `node.output_in_body_frame` 切到车体系。
 
 ## 净空判据与排障
+
+在线坡道侧边约束只阻止已推断的长侧边进入。坡面内部的零散普通/未知语义格，若沿同一坡向的前后两端均有一致观测支持，不再生成虚假的侧边障碍；这不把未知占据格改为自由，也不放宽台阶与碰撞门。`Slope side rejection` 日志会注明实时或累计约束来源及失败线段，便于区分坡道入口和语义采样孔洞。
+
+几字型坡道现按“先到入口正前方，再开启对齐”规划：预留 0.5 m 坡前接近区，MINCO 加入助跑暴露量/曲率正则，并用实测入口位置门阻止侧方提前对齐。实现、开关回退和待完成的闭环验收见[几字坡入口说明](docs/directed_ramp_approach.md)。
 
 安全链路只保留两道硬门：
 

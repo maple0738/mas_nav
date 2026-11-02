@@ -10,6 +10,7 @@
 #include <Eigen/Core>
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "sensor_msgs/msg/image.hpp"
+#include "rog_map/terrain_direction.hpp"
 
 namespace mas2027_nav_executor {
 
@@ -28,6 +29,12 @@ public:
     sensor_msgs::msg::Image labels;
     sensor_msgs::msg::Image directions;
     std::vector<uint8_t> slope_side_mask;
+    std::vector<uint8_t> terrain_labels;
+    std::vector<float> uphill_x, uphill_y;
+    rog_map::TerrainDirectionSample sampleTerrain(double x, double y) const
+    { return rog_map::sampleTerrainDirection(cost.info.width, cost.info.height,
+        cost.info.resolution, cost.info.origin.position.x, cost.info.origin.position.y,
+        terrain_labels, uphill_x, uphill_y, x, y); }
 
     bool contains(const Eigen::Vector2d & point) const;
     bool traversable(const Eigen::Vector2d & point) const;

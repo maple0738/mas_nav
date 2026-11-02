@@ -246,6 +246,7 @@ public:
     min_observed_voxels = 2;
     unknown_as_occupied = true;
     surface_height_delta_max = 0.10;
+    max_step_height = 0.08;
     wall_height_delta_min = 0.20;
     wall_occupancy_ratio_min = 0.80;
     tunnel_height_delta_min = 0.24;
@@ -267,6 +268,7 @@ public:
     load("projection.min_observed_voxels", min_observed_voxels);
     load("projection.unknown_as_occupied", unknown_as_occupied);
     load("projection.surface_height_delta_max", surface_height_delta_max);
+    load("projection.max_step_height", max_step_height);
     load("projection.ground_filter.enable", ground_filter_en);
     load("projection.ground_filter.max_span", ground_filter_max_span);
     load("projection.ground_filter.plane_tolerance", ground_filter_plane_tolerance);
@@ -319,6 +321,9 @@ public:
     if (!std::isfinite(surface_height_delta_max) || surface_height_delta_max < 0.0) {
       throw std::invalid_argument(
         "projection.surface_height_delta_max must be a non-negative vertical height difference.");
+    }
+    if (!std::isfinite(max_step_height) || max_step_height <= 0.0) {
+      throw std::invalid_argument("projection.max_step_height must be positive and finite");
     }
     if (!std::isfinite(ground_filter_max_span) || ground_filter_max_span <= 0.0 ||
         !std::isfinite(ground_filter_plane_tolerance) || ground_filter_plane_tolerance <= 0.0 ||
@@ -537,6 +542,7 @@ public:
   int min_observed_voxels{2};
   bool unknown_as_occupied{true};
   double surface_height_delta_max{0.10};
+  double max_step_height{0.08};
   bool ground_filter_en{false};
   double ground_filter_max_span{0.15};
   double ground_filter_plane_tolerance{0.075};

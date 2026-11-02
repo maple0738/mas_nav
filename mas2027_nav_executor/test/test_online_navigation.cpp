@@ -9,6 +9,7 @@
 #include "rog_map/query_adapter.hpp"
 
 #include "mas2027_nav_executor/path_executor/monitoring/command_safety.hpp"
+#include "mas2027_nav_executor/common/control/odometry_velocity.hpp"
 #include "mas2027_nav_executor/common/environment/online_global_map.hpp"
 #include "mas2027_nav_executor/path_planner/search/global_path_searcher.hpp"
 #include "mas2027_nav_executor/path_planner/search/route_commitment.hpp"
@@ -198,6 +199,106 @@ TEST_F(OnlineNavigation, PlansToObservedGoalWithoutStaticMapOrTF)
   ASSERT_GE(path.size(), 2U);
   EXPECT_NEAR(path.back().pose.position.x, 2.55, 0.1);
   EXPECT_EQ(path.back().header.frame_id, "odom");
+}
+
+TEST_F(OnlineNavigation, BaseReferencedOdometryKeepsZeroTranslationDuringSpinAndMatchesMpcAxes)
+{
+  nav_msgs::msg::Odometry odom;
+  odom.header.frame_id = "odom";
+  odom.child_frame_id = "base_link";
+  for (const double yaw : {-2.4,-.7,0.,1.2,3.0}) {
+    odom.pose.pose.orientation.z = std::sin(yaw/2);
+    odom.pose.pose.orientation.w = std::cos(yaw/2);
+    for (const double omega : {-2.0,-1.2,0.,1.2,2.0}) {
+      odom.twist.twist.angular.z = omega;
+      odom.twist.twist.linear = geometry_msgs::msg::Vector3{};
+      EXPECT_LT(mas2027_nav_executor::odometryVelocityInPlanningFrame(odom).norm(),1e-12);
+      odom.twist.twist.linear.x = .4;
+      odom.twist.twist.linear.y = .2;
+      const auto velocity = mas2027_nav_executor::odometryVelocityInPlanningFrame(odom);
+      EXPECT_NEAR(velocity.x(),std::cos(yaw)*.4-std::sin(yaw)*.2,1e-12);
+      EXPECT_NEAR(velocity.y(),std::sin(yaw)*.4+std::cos(yaw)*.2,1e-12);
+    }
+  }
+}
+
+TEST_F(OnlineNavigation, OffCenterStartNearRememberedDropCanSearchAwayWithoutLosingClearance)
+{
+  auto q = std::make_shared<OnlineQuery>();
+  Search s(q, true);
+  mas2027_nav_executor::OnlineGlobalMapConfig cfg;
+  cfg.occupied_confirmations = 1;
+  auto history = std::make_shared<mas2027_nav_executor::OnlineGlobalMap>(cfg, "odom");
+  rog_map::MapSnapshot observation;
+  observation.width = observation.height = 40;
+  observation.resolution = .1;
+  observation.sequence = 1;
+  observation.stamp = 42;
+  observation.max_step_height = .08;
+  observation.values.assign(1600, 0);
+  observation.types.assign(1600, 1);
+  observation.height_discontinuities.assign(1600, 0);
+  for (int x = 0; x < 40; ++x) {
+    const int i = 10 * 40 + x;
+    observation.values[i] = 254;
+    observation.types[i] = 3;
+    observation.height_discontinuities[i] = 1;
+  }
+  ASSERT_EQ(history->update(observation), mas2027_nav_executor::OnlineGlobalMap::UpdateResult::UPDATED);
+  const auto map = history->snapshot();
+  const Eigen::Vector2d actual(1.55, 1.36);
+  EXPECT_NEAR(map->queryHeight({actual.x(), actual.y(), 0}).distance, .26, 1e-6);
+  // The cell center lies closer to the drop than the actual robot. The exact
+  // safety gate must keep rejecting that artificial dip, but allow moving out.
+  EXPECT_FALSE(map->terrainTransition(1.55, 1.35, 1.55, 1.45, .27, actual));
+  ASSERT_TRUE(map->terrainTransition(actual.x(), actual.y(), 1.55, 1.45, .27, actual));
+  s.search.setOnlineTerrainMap(history);
+  std::vector<geometry_msgs::msg::PoseStamped> path;
+  ASSERT_TRUE(s.search.plan(pose(actual.x(), actual.y()), pose(1.55, 2.55), s.context, path));
+  ASSERT_GE(path.size(), 2U);
+  EXPECT_NEAR(path.front().pose.position.y, actual.y(), 1e-9);
+  for (size_t i = 1; i < path.size(); ++i) {
+    EXPECT_TRUE(map->terrainTransition(path[i-1].pose.position.x, path[i-1].pose.position.y,
+      path[i].pose.position.x, path[i].pose.position.y, .27, actual));
+  }
+  // Toward-edge motion is still rejected with the same near-field requirement.
+  EXPECT_FALSE(map->terrainTransition(actual.x(), actual.y(), 1.55, 1.30, .27, actual));
+}
+
+TEST_F(OnlineNavigation, KnownRouteLookaheadAdvancesBeforeStoppingAtAnOldWaypoint)
+{
+  auto live = std::make_shared<OnlineQuery>();
+  live->observed_end = 2.0;
+  Search search(live, true);
+  auto remembered = std::make_shared<mas2027_nav_executor::OnlineGlobalMap>(
+    mas2027_nav_executor::OnlineGlobalMapConfig{}, "odom");
+  rog_map::MapSnapshot observed;
+  observed.width = 80; observed.height = 40; observed.resolution = .1;
+  observed.sequence = 1; observed.stamp = 42;
+  observed.types.assign(80 * 40, 1U);
+  observed.values.assign(80 * 40, 0U);
+  remembered->update(observed);
+  search.search.setOnlineTerrainMap(remembered);
+  std::vector<geometry_msgs::msg::PoseStamped> path;
+  const auto goal = pose(6.55);
+  ASSERT_TRUE(search.search.plan(pose(.55), goal, search.context, path));
+  ASSERT_FALSE(path.empty());
+  const double old_endpoint = path.back().pose.position.x;
+  EXPECT_LT(old_endpoint, 2.0);
+
+  // New live observations extend the same known corridor. The robot has
+  // only moved 20 cm and is still well short of the old waypoint.
+  live->observed_end = 3.8;
+  live->stamp += .5;
+  ASSERT_TRUE(search.search.plan(pose(.75), goal, search.context, path));
+  ASSERT_FALSE(path.empty());
+  EXPECT_GT(path.back().pose.position.x, 3.0);
+  EXPECT_GT(path.back().pose.position.x, old_endpoint + .5);
+  for (const auto & point : path) {
+    const auto field = live->query({point.pose.position.x, point.pose.position.y, 0});
+    ASSERT_TRUE(field.ok);
+    EXPECT_GE(field.distance, .27);
+  }
 }
 
 TEST_F(OnlineNavigation, ExploresSideOfWallWhenEverySafeStepInitiallyMovesAwayFromGoal)
@@ -952,4 +1053,40 @@ TEST_F(OnlineNavigation, PriorModeStillRequiresStaticSnapshot)
     mas2027_nav_executor::ExecutorStatus::TERRAIN_BLOCKED);
 }
 
+
+TEST_F(OnlineNavigation, DirectedRunupEscapesPocketWhoseLiveWindowIsInsideDeadEndExclusion)
+{
+  mas2027_nav_executor::OnlineGlobalMapConfig config;
+  config.occupied_confirmations=1;config.terrain_confirmations=1;
+  auto history=std::make_shared<mas2027_nav_executor::OnlineGlobalMap>(config,"odom");
+  rog_map::MapSnapshot remembered;
+  remembered.width=100;remembered.height=40;remembered.resolution=0.1;
+  remembered.sequence=1;remembered.stamp=42;
+  remembered.types.assign(4000,1);remembered.values.assign(4000,0);
+  remembered.terrain_labels.assign(4000,0);remembered.uphill_x.assign(4000,0);
+  remembered.uphill_y.assign(4000,0);
+  for(int y=0;y<40;++y)for(int x=0;x<100;++x) {
+    const size_t k=y*100+x;
+    if(x<5){remembered.types[k]=0;remembered.values[k]=255;}
+    if(x>=80||y<10||y>=30){remembered.types[k]=3;remembered.values[k]=254;}
+    if(x>=50&&x<80&&y>=10&&y<30){remembered.terrain_labels[k]=5;remembered.uphill_x[k]=1;}
+  }
+  ASSERT_EQ(history->update(remembered),mas2027_nav_executor::OnlineGlobalMap::UpdateResult::UPDATED);
+  auto live=std::make_shared<rog_map::MapSnapshot>();
+  live->width=15;live->height=20;live->resolution=0.1;live->origin_x=6.5;live->origin_y=1;
+  live->sequence=1;live->stamp=42;live->field_stale=false;live->field_stamp=42;live->field_sequence=1;
+  live->types.assign(300,1);live->values.assign(300,0);live->distances.assign(300,1);
+  live->terrain_labels.assign(300,5);live->uphill_x.assign(300,1);live->uphill_y.assign(300,0);
+  auto query=std::make_shared<rog_map::QueryAdapter>();query->update(live,nullptr);
+  Search planner(query,true);planner.search.setOnlineTerrainMap(history);
+  planner.search.setDirectedTerrain({true,0.8,0.5});
+  std::vector<geometry_msgs::msg::PoseStamped> route;
+  ASSERT_TRUE(planner.search.plan(pose(7.55),pose(10),planner.context,route));
+  ASSERT_GE(route.size(),2);
+  EXPECT_LT(route.back().pose.position.x,7.0); // backs out, despite goal being east
+  // Every transit point is inside the 2 m exclusion around the new dead end.
+  // Applying final-target exclusions to these points previously deleted the exit.
+  EXPECT_LT(std::hypot(route.back().pose.position.x-7.55,route.back().pose.position.y-2.05),2.0);
+  for(const auto & p:route) EXPECT_NEAR(p.pose.position.y,2.05,0.11);
+}
 }  // namespace

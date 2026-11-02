@@ -62,6 +62,7 @@ add_library(${PROJECT_NAME}_planner STATIC
   src/path_planner/trajectory/minco_planner.cpp
   src/path_planner/trajectory/trajectory_safety_checker.cpp
   src/common/environment/online_global_map.cpp
+  src/common/environment/history_frontier.cpp
   src/common/environment/fused_map_query.cpp
   src/common/environment/terrain_grid.cpp
   src/common/environment/terrain_map_query.cpp
@@ -141,7 +142,7 @@ if(BUILD_TESTING)
   target_include_directories(test_region_online_priority PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
   ament_target_dependencies(test_region_online_priority
-    geometry_msgs interfaces nav_msgs rclcpp sensor_msgs tf2 tf2_geometry_msgs tf2_ros)
+    geometry_msgs interfaces nav_msgs rclcpp rog_map sensor_msgs tf2 tf2_geometry_msgs tf2_ros)
   target_link_libraries(test_region_online_priority Eigen3::Eigen)
   ament_add_gtest(test_replan_continuity test/test_replan_continuity.cpp)
   target_include_directories(test_replan_continuity PRIVATE
@@ -165,7 +166,7 @@ if(BUILD_TESTING)
   target_include_directories(test_region_yaw_ref PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
   ament_target_dependencies(test_region_yaw_ref
-    geometry_msgs interfaces nav_msgs rclcpp sensor_msgs tf2 tf2_geometry_msgs tf2_ros)
+    geometry_msgs interfaces nav_msgs rclcpp rog_map sensor_msgs tf2 tf2_geometry_msgs tf2_ros)
   target_link_libraries(test_region_yaw_ref Eigen3::Eigen)
 
   ament_add_gtest(test_global_goal_cell_clearance
@@ -176,6 +177,10 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_global_goal_cell_clearance
     geometry_msgs nav_msgs rclcpp rog_map tf2_ros)
   target_link_libraries(test_global_goal_cell_clearance ${PROJECT_NAME}_planner Eigen3::Eigen)
+  ament_add_gtest(test_directed_ramp test/test_directed_ramp.cpp)
+  target_include_directories(test_directed_ramp PRIVATE include)
+  ament_target_dependencies(test_directed_ramp rog_map)
+  target_link_libraries(test_directed_ramp ${PROJECT_NAME}_planner Eigen3::Eigen)
   ament_add_gtest(test_minco_two_stage
     test/test_minco_two_stage.cpp)
   target_include_directories(test_minco_two_stage PRIVATE

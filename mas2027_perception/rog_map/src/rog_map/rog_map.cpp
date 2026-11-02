@@ -401,6 +401,7 @@ void ROGMap::refreshLayers()
   layer_cfg.unknown_as_occupied = cfg_.unknown_as_occupied;
   layer_cfg.min_observed_voxels = cfg_.min_observed_voxels;
   layer_cfg.surface_height_delta_max = cfg_.surface_height_delta_max;
+  layer_cfg.max_step_height = cfg_.max_step_height;
   layer_cfg.ground_filter_en = cfg_.ground_filter_en;
   layer_cfg.ground_filter_max_span = cfg_.ground_filter_max_span;
   layer_cfg.ground_filter_plane_tolerance = cfg_.ground_filter_plane_tolerance;
@@ -899,11 +900,18 @@ void ROGMap::refreshQuery()
   snapshot->types.resize(layer_->cells().size(), 0U);
   snapshot->raw_types.resize(layer_->cells().size(), 0U);
   snapshot->height_deltas.resize(layer_->cells().size(), 0.0f);
+  snapshot->ground_heights.resize(layer_->cells().size());
+  snapshot->height_discontinuities.resize(layer_->cells().size(), 0U);
+  snapshot->max_step_height = cfg_.max_step_height;
   snapshot->confidence.resize(layer_->cells().size(), 0.0f);
   for (size_t i = 0; i < layer_->cells().size(); ++i) {
     snapshot->types[i] = static_cast<uint8_t>(layer_->cells()[i].type);
     snapshot->raw_types[i] = static_cast<uint8_t>(layer_->cells()[i].raw_type);
     snapshot->height_deltas[i] = layer_->cells()[i].height_delta;
+    snapshot->ground_heights[i] = layer_->cells()[i].ground_reference_z;
+    // 1 = measured adjacent jump, 2 = inferred across a bridged FREE gap.
+    snapshot->height_discontinuities[i] = !layer_->cells()[i].height_discontinuity ? 0U :
+      (layer_->cells()[i].height_discontinuity_measured ? 1U : 2U);
     snapshot->confidence[i] = layer_->cells()[i].confidence;
   }
   auto terrain = layer_->terrainGeometry();

@@ -129,6 +129,8 @@ PathPlanner::PathPlanner(std::shared_ptr<TerrainGrid> terrain, double odom_timeo
     global_terrain_pub_ = rclcpp::create_publisher<nav_msgs::msg::OccupancyGrid>(
       *node_, "/nav_executor/online_terrain_map",
       rclcpp::QoS(1).reliable().transient_local());
+    global_height_pub_ = rclcpp::create_publisher<nav_msgs::msg::OccupancyGrid>(
+      *node_, "/nav_executor/online_height_barriers", rclcpp::QoS(1).reliable().transient_local());
     global_uphill_pub_ = rclcpp::create_publisher<sensor_msgs::msg::Image>(
       *node_, "/nav_executor/online_terrain_uphill",
       rclcpp::QoS(1).reliable().transient_local());
@@ -155,6 +157,7 @@ PathPlanner::PathPlanner(std::shared_ptr<TerrainGrid> terrain, double odom_timeo
               cells, max_cells,
               static_cast<unsigned long long>(snapshot->revision()), update_ms);
             global_map_pub_->publish(snapshot->grid());
+            global_height_pub_->publish(snapshot->heightGrid());
             const auto terrain_grid = snapshot->terrainGrid();
             global_terrain_pub_->publish(terrain_grid);
             global_uphill_pub_->publish(snapshot->uphillImage());

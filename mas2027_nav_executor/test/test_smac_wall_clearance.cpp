@@ -1,6 +1,7 @@
 #include "mas2027_nav_executor/path_planner/search/smac/smac_planner_2d_simple.hpp"
 
 #include <gtest/gtest.h>
+#include <rog_map/projection_layer.hpp>
 
 #include <cmath>
 #include <limits>
@@ -140,6 +141,36 @@ TEST(SmacWallClearance, FreeGoalStillRequiresValidDistanceFieldAndClearance)
   EXPECT_FALSE(planner.createPath(1U, 1U, 10U, 11U, path));
   EXPECT_TRUE(path.empty());
   EXPECT_TRUE(planner.createPath(1U, 1U, 18U, 18U, path));
+}
+
+TEST(SmacWallClearance, OnlineThinStairBoundaryCannotBeCrossed)
+{
+  constexpr int size = 21;
+  rog_map::ProjectionLayer projection;
+  rog_map::ProjectionLayerConfig config;
+  config.hysteresis_en = false;
+  config.mask_filter_en = false;
+  projection.updateFull(size, size, 0.05, Eigen::Vector2d::Zero(), 1.0, config,
+    [](int x, int) {
+      rog_map::ColumnStats stats;
+      stats.observed_count = 10;
+      stats.occupied_count = 1;
+      stats.occupied_z_index_min = stats.occupied_z_index_max = x < 10 ? 0 : 4;
+      stats.occupied_z_min_abs = stats.occupied_z_max_abs = x < 10 ? 0.0 : 0.2;
+      return stats;
+    });
+  auto map = std::make_shared<GridQuery>(size, size, 0.05);
+  for (unsigned int y = 0; y < size; ++y) {
+    for (unsigned int x = 0; x < size; ++x) {
+      if (projection.values()[y * size + x] == 254U) map->block(x, y);
+    }
+  }
+  mas2027_nav_executor::smac::SmacPlanner2DSimple planner;
+  planner.setMap(map);
+  planner.setParameters(false, 10000, 0.0F);
+  mas2027_nav_executor::smac::SmacPlanner2DSimple::CoordinateVector path;
+  EXPECT_FALSE(planner.createPath(4U, 10U, 16U, 10U, path));
+  EXPECT_TRUE(planner.createPath(2U, 3U, 7U, 16U, path));
 }
 
 }  // namespace

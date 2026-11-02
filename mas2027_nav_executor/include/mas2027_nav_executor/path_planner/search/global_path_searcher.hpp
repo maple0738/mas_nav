@@ -8,6 +8,7 @@
 #include <Eigen/Core>
 
 #include "minco_core/header.hpp"
+#include "mas2027_nav_executor/path_planner/search/directed_terrain.hpp"
 #include "mas2027_nav_executor/common/environment/terrain_grid.hpp"
 #include "mas2027_nav_executor/path_planner/search/smac/smac_planner_2d_simple.hpp"
 
@@ -28,6 +29,9 @@ public:
     double tolerance,
     rclcpp::Logger logger);
 
+  void setDirectedTerrain(const mas2027_nav_executor::DirectedTerrainConfig & config)
+  { directed_terrain_ = config; }
+
   void setOnlineSubgoalClearance(double clearance) { online_subgoal_clearance_ = clearance; }
   void setGoalApproachMaxShorten(double distance)
   { goal_approach_max_shorten_ = std::max(0.0, distance); }
@@ -36,6 +40,11 @@ public:
   /// 窄道续行门，搜索放宽本身不会降低执行侧硬阈值。
   void setRelaxedMinimumClearance(double clearance)
   { relaxed_minimum_clearance_ = std::max(0.0, clearance); }
+
+  /// 探索/脱困目标偏好的台阶边界距离。用于选点评分，不代替路线与目标
+  /// 的硬净空门；0 表示关闭，避免窄平台上所有前沿都被额外门槛删除。
+  void setTargetHeightClearance(double clearance)
+  { target_height_clearance_ = std::max(0.0, clearance); }
 
   /// 最近一次 plan() 是否确认“任务目标在已知障碍内且附近没有安全排出点”。
   /// 调用方据此停止旧轨迹，不能把它当成普通的临时搜索失败继续跟随。
@@ -112,6 +121,8 @@ private:
   double online_subgoal_clearance_{0.33};
   double goal_approach_max_shorten_{1.5};
   double relaxed_minimum_clearance_{0.0};
+  double target_height_clearance_{0.0};
+  mas2027_nav_executor::DirectedTerrainConfig directed_terrain_;
   bool last_goal_invalid_{false};
   bool last_goal_blocked_retryable_{false};
   bool last_goal_shifted_{false};
@@ -132,6 +143,11 @@ private:
   std::vector<FailedOnlineSubgoal> failed_online_subgoals_;
   std::optional<Eigen::Vector2d> suspended_history_subgoal_;
   double suspended_history_stamp_{0.0};
+  // Dead-end escape: places where no live candidate or frontier existed, and
+  // the accumulated-map frontier currently being driven to.
+  std::vector<FailedOnlineSubgoal> dead_ends_;
+  std::optional<Eigen::Vector2d> recovery_target_;
+  double recovery_stamp_{0.0};
   mutable std::mutex search_mutex_;
   rclcpp::Logger logger_{rclcpp::get_logger("GlobalPathSearcher")};
 };

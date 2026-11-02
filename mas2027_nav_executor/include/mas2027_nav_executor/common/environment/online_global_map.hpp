@@ -3,12 +3,14 @@
 #include <memory>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "sensor_msgs/msg/image.hpp"
 #include "rog_map/map_query_interface.hpp"
+#include "rog_map/terrain_direction.hpp"
 namespace rog_map { struct MapSnapshot; }
 
 namespace mas2027_nav_executor {
@@ -31,11 +33,19 @@ struct OnlineGlobalMapConfig
 class OnlineGlobalMapSnapshot final : public rog_map::MapQueryInterface
 {
 public:
+  rog_map::TerrainDirectionSample sampleTerrain(double x, double y) const
+  { return rog_map::sampleTerrainDirection(sizeX(), sizeY(), resolution_, originX(), originY(),
+      terrain_labels_, uphill_x_, uphill_y_, x, y); }
   const nav_msgs::msg::OccupancyGrid & grid() const { return grid_; }
   nav_msgs::msg::OccupancyGrid terrainGrid() const;
+  nav_msgs::msg::OccupancyGrid heightGrid() const;
   sensor_msgs::msg::Image uphillImage() const;
-  bool terrainTransition(double from_x, double from_y, double to_x, double to_y) const;
+  bool terrainTransition(double from_x, double from_y, double to_x, double to_y,
+    double height_clearance = 0.0,
+    std::optional<Eigen::Vector2d> clearance_origin = std::nullopt) const;
+  rog_map::QueryResult queryHeight(const Eigen::Vector3d & position) const;
   const std::vector<uint8_t> & slopeSideMask() const { return slope_side_mask_; }
+  const std::vector<uint8_t> & heightDiscontinuityMask() const { return height_discontinuity_mask_; }
   uint64_t revision() const { return revision_; }
   bool worldToMap(double x, double y, unsigned int & mx, unsigned int & my) const override;
   void mapToWorld(unsigned int mx, unsigned int my, double & x, double & y) const override;
@@ -56,12 +66,16 @@ public:
 
 private:
   friend class OnlineGlobalMap;
+  rog_map::QueryResult queryField(const Eigen::Vector3d & position,
+    const std::shared_ptr<const std::vector<double>> & field) const;
   nav_msgs::msg::OccupancyGrid grid_;
   std::vector<uint8_t> terrain_labels_;
   std::vector<float> uphill_x_;
   std::vector<float> uphill_y_;
   std::vector<uint8_t> slope_side_mask_;
+  std::vector<uint8_t> height_discontinuity_mask_;
   std::shared_ptr<const std::vector<double>> distances_;
+  std::shared_ptr<const std::vector<double>> height_distances_;
   uint64_t revision_{0};
   double resolution_{0.1};
   double stamp_{0.0};
@@ -92,6 +106,9 @@ private:
     uint8_t terrain_hits{0};
     uint8_t ordinary_hits{0};
     uint64_t last_terrain_observation_sequence{0};
+    bool height_discontinuity{false};
+    uint8_t height_clear_hits{0};
+    double last_height_clear_stamp{0.0};
   };
   OnlineGlobalMapConfig config_;
   std::string frame_;
