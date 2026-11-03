@@ -10,6 +10,8 @@
 namespace small_point_lio {
 
     void Preprocess::reset() {
+        adaptive_sampler.reset();
+        sampled_ranges.clear();
         imu_deque.clear();
         point_deque.clear();
         dense_point_deque.clear();
@@ -24,8 +26,16 @@ namespace small_point_lio {
         dense_points.reserve(pointcloud.size());
         filtered_points.clear();
         filtered_points.reserve(pointcloud.size());
+        const bool adaptive = parameters->space_downsample;
+        double sampling_begin = std::numeric_limits<double>::infinity();
+        double sampling_end = -std::numeric_limits<double>::infinity();
         for (size_t i = 0; i < pointcloud.size(); i++) {
             const auto &point = pointcloud[i];
+            // Measure acquisition span before range/stride filtering, without another input pass.
+            if (adaptive && std::isfinite(point.timestamp) && point.timestamp >= last_timestamp_lidar) {
+                sampling_begin = std::min(sampling_begin, point.timestamp);
+                sampling_end = std::max(sampling_end, point.timestamp);
+            }
             // 盲区（min_distance）以 blind_center 为球心量，量程（max_distance）仍以雷达原点量：
             // 前者要贴合车身，后者是传感器能力。blind_center 默认 (0,0,0) 时两者同心，行为不变。
             const float dist_from_blind_center = (point.position - parameters->blind_center).squaredNorm();
@@ -50,7 +60,20 @@ namespace small_point_lio {
             filtered_points.push_back(point);
         }
         if (parameters->space_downsample) {
-            downsampler.voxelgrid_sampling(filtered_points, processed_pointcloud, parameters->space_downsample_leaf_size);
+            const double leaf = sampling_leaf_size();
+            downsampler.voxelgrid_sampling(filtered_points, processed_pointcloud, leaf);
+            if (!filtered_points.empty()) {
+                sampled_ranges.clear();
+                sampled_ranges.reserve(processed_pointcloud.size());
+                for (const auto &point : processed_pointcloud) {
+                    sampled_ranges.push_back(point.position.norm());
+                }
+                adaptive_sampler.observe(sampled_ranges, sampling_end - sampling_begin, parameters->adaptive_sampling);
+                RCLCPP_DEBUG(rclcpp::get_logger("small_point_lio"),
+                    "Adaptive sampling: input=%zu sampled=%zu target=%.1f leaf=%.3f next_leaf=%.3f",
+                    filtered_points.size(), processed_pointcloud.size(), adaptive_sampler.target(),
+                    leaf, sampling_leaf_size());
+            }
         } else {
             processed_pointcloud = std::move(filtered_points);
         }

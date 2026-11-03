@@ -27,6 +27,8 @@ namespace small_point_lio {
     }
 
     void SmallPointLio::reset() {
+        point_batches_ = accepted_points_ = 0;
+        adaptive_timing.reset();
         preprocess.reset();
         estimator.reset();
         pointcloud_odom_frame.clear();
@@ -110,9 +112,20 @@ namespace small_point_lio {
                 compensated.push_back((rotation_lidar_imu.transpose() *
                     (point_imu_at_end - translation_lidar_imu)).cast<float>());
             }
-            estimator.kf.update_point_batch(compensated.size(), [this, &compensated](std::size_t i) {
+            AdaptiveTiming::Information mean_information;
+            const auto accepted = estimator.kf.update_point_batch(compensated.size(), [this, &compensated](std::size_t i) {
                 estimator.point_lidar_frame = compensated[i];
-            });
+            }, &mean_information);
+            ++point_batches_;
+            accepted_points_ += accepted;
+            {
+                adaptive_timing.observeBatch(world_acceleration, mean_information, accepted,
+                    parameters.point_update_batch_interval_s, parameters.adaptive_timing);
+                RCLCPP_DEBUG(rclcpp::get_logger("small_point_lio"),
+                    "Adaptive timing: points=%zu matches=%zu span_ms=%.3f next_interval_ms=%.3f",
+                    point_batch.size(), accepted, (point_batch.back().timestamp - point_batch.front().timestamp) * 1000,
+                    adaptive_timing.interval(parameters.point_update_batch_interval_s, parameters.adaptive_timing) * 1000);
+            }
             const auto &updated = estimator.kf.x;
             const Eigen::Matrix3d updated_rotation_lidar_imu = parameters.extrinsic_est_en ?
                 updated.offset_R_L_I : estimator.Lidar_R_wrt_IMU;
@@ -166,14 +179,19 @@ namespace small_point_lio {
                     preprocess.point_deque.pop_front();
                     continue;
                 }
+                // Flush BEFORE advancing the state past an adaptive batch deadline.
+                if (!point_batch.empty() &&
+                    point_lidar_frame.timestamp - point_batch.front().timestamp >=
+                        adaptive_timing.interval(parameters.point_update_batch_interval_s, parameters.adaptive_timing)) {
+                    flush_point_batch();
+                }
                 time_current = point_lidar_frame.timestamp;
 
                 // predict
                 estimator.kf.predict_state(time_current);
 
                 point_batch.push_back(point_lidar_frame);
-                if (point_batch.size() >= parameters.point_update_batch_max_points ||
-                    time_current - point_batch.front().timestamp >= parameters.point_update_batch_interval_s) {
+                if (point_batch.size() >= parameters.point_update_batch_max_points) {
                     flush_point_batch();
                 }
                 preprocess.point_deque.pop_front();
@@ -193,7 +211,14 @@ namespace small_point_lio {
                 // update
                 estimator.angular_velocity = imu_msg.angular_velocity.cast<state::value_type>();
                 estimator.linear_acceleration = imu_msg.linear_acceleration.cast<state::value_type>();
-                estimator.kf.update_imu();
+                const bool imu_updated = estimator.kf.update_imu();
+                {
+                    const bool saturated = parameters.check_satu &&
+                        (estimator.angular_velocity.cwiseAbs().maxCoeff() >= parameters.satu_gyro ||
+                         estimator.linear_acceleration.cwiseAbs().maxCoeff() >= parameters.satu_acc);
+                    adaptive_timing.observeImu(time_current, estimator.angular_velocity,
+                        imu_updated && !saturated, parameters.adaptive_timing);
+                }
 
                 preprocess.imu_deque.pop_front();
             }

@@ -31,6 +31,17 @@ namespace small_point_lio {
         space_downsample = node.declare_parameter<bool>("space_downsample");
         space_downsample_leaf_size = node.declare_parameter<float>("space_downsample_leaf_size");
 
+        adaptive_sampling.min_leaf = node.declare_parameter<double>("adaptive_sampling.min_leaf_size", 0.25);
+        adaptive_sampling.max_leaf = node.declare_parameter<double>("adaptive_sampling.max_leaf_size", 1.0);
+        adaptive_sampling.min_points_per_second = node.declare_parameter<double>("adaptive_sampling.min_points_per_second", 16000.0);
+        adaptive_sampling.max_points_per_second = node.declare_parameter<double>("adaptive_sampling.max_points_per_second", 40000.0);
+        adaptive_sampling.reference_range = node.declare_parameter<double>("adaptive_sampling.reference_range", 15.0);
+        adaptive_sampling.validate();
+        if (point_filter_num < 1 || (space_downsample &&
+            (!std::isfinite(space_downsample_leaf_size) || space_downsample_leaf_size <= 0))) {
+            throw std::invalid_argument("point_filter_num and sampling leaf size must be positive");
+        }
+
         // IMU处理
         std::vector<double> gravity_temp = node.declare_parameter<std::vector<double>>("gravity");
         gravity << gravity_temp[0], gravity_temp[1], gravity_temp[2];
@@ -51,6 +62,10 @@ namespace small_point_lio {
             point_update_batch_interval_s > 0.1) {
             throw std::invalid_argument("invalid iVox capacity or point update batch parameters");
         }
+        adaptive_timing.min_interval = node.declare_parameter<double>("adaptive_timing.min_interval_s", 0.001);
+        adaptive_timing.max_interval = node.declare_parameter<double>("adaptive_timing.max_interval_s", 0.005);
+        adaptive_timing.normalized_error = node.declare_parameter<double>("adaptive_timing.normalized_error", 0.05);
+        adaptive_timing.validate();
         ivox_capacity = static_cast<size_t>(configured_capacity);
         point_update_batch_max_points = static_cast<size_t>(configured_batch_points);
 

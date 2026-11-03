@@ -199,24 +199,26 @@ def _launch_setup(context):
     # 默认随 nav 栈起 bridge：8766 避开 mapping Web UI 占用的 8765。
     # SSH 隧道场景绑 127.0.0.1；直连改 foxglove_address:=0.0.0.0。
     # 不需要可视化时用 use_foxglove:=False；已有独立 bridge 时也关掉，避免端口冲突。
-    foxglove_bridge = IncludeLaunchDescription(
-        FrontendLaunchDescriptionSource(
-            os.path.join(
-                get_package_share_directory("foxglove_bridge"),
-                "launch",
-                "foxglove_bridge_launch.xml",
-            )
-        ),
-        condition=IfCondition(use_foxglove),
-        launch_arguments={
-            "address": foxglove_address,
-            "port": foxglove_port,
-            "use_sim_time": use_sim_time,
-        }.items(),
-    )
+    foxglove_bridge = None
+    if use_foxglove.perform(context).lower() in ("true", "1"):
+        foxglove_bridge = IncludeLaunchDescription(
+            FrontendLaunchDescriptionSource(
+                os.path.join(
+                    get_package_share_directory("foxglove_bridge"),
+                    "launch",
+                    "foxglove_bridge_launch.xml",
+                )
+            ),
+            condition=IfCondition(use_foxglove),
+            launch_arguments={
+                "address": foxglove_address,
+                "port": foxglove_port,
+                "use_sim_time": use_sim_time,
+            }.items(),
+        )
 
     actions = [robot_state_publisher, mid360_driver, small_point_lio, tf_maintainer,
-        nav_executor, nav_serial_bridge, rviz, foxglove_bridge]
+        nav_executor, nav_serial_bridge, rviz, *([foxglove_bridge] if foxglove_bridge else [])]
     if not online:
         actions[3:3] = [odom_localizer, terrain_map_server]
     return actions

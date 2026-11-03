@@ -127,7 +127,9 @@ namespace small_point_lio {
         // Linearize all points against one state and apply one covariance update.
         // The selector supplies the next lidar point to the measurement model.
         inline std::size_t update_point_batch(std::size_t count,
-                                              const std::function<void(std::size_t)> &select_point) {
+                                              const std::function<void(std::size_t)> &select_point,
+                                              Eigen::Matrix<state::value_type, 6, 6> *mean_pose_information = nullptr) {
+            if (mean_pose_information) mean_pose_information->setZero();
             using Scalar = state::value_type;
             Eigen::Matrix<Scalar, 12, 12> information = Eigen::Matrix<Scalar, 12, 12>::Zero();
             Eigen::Matrix<Scalar, 12, 1> residual = Eigen::Matrix<Scalar, 12, 1>::Zero();
@@ -165,6 +167,9 @@ namespace small_point_lio {
             }
             x.plus(correction);
             P = Scalar(0.5) * (updated_covariance + updated_covariance.transpose()).eval();
+            if (mean_pose_information) {
+                *mean_pose_information = information.template topLeftCorner<6, 6>() / static_cast<Scalar>(valid_count);
+            }
             return valid_count;
         }
 

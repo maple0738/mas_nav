@@ -61,6 +61,13 @@ small_point_lio:
     max_distance: 300.0                               # 最大有效距离，单位米
     space_downsample: true                            # 是否启用体素降采样
     space_downsample_leaf_size: 0.5                   # 体素降采样分辨率，单位米
+    # 固定启用自适应，只调整定位点云；完整去畸变点云不受影响。
+    adaptive_sampling:
+      min_leaf_size: 0.25                           # 体素边长下限，m
+      max_leaf_size: 1.0                            # 体素边长上限，m
+      min_points_per_second: 16000.0                # 近场目标；50 ms 输入约 800 点
+      max_points_per_second: 40000.0                # 开阔场景目标；50 ms 输入约 2000 点
+      reference_range: 15.0                         # 代表点距离中位数达到此值时使用最大目标，m
 
     # IMU 处理
     # 重力向量（雷达系，单位 g）= 静止时 IMU 加速度均值取反；fix_gravity_direction=true 时只用模长
@@ -78,6 +85,10 @@ small_point_lio:
     init_map_size: 10                                 # 初始化地图所需的最少点数
     ivox_capacity: 1000000                            # iVox 最大体素数，避免地图无限增长
     point_update_batch_interval_s: 0.005              # 定位点在最多 5 ms 窗口内合并为一次 ESKF 更新
+    adaptive_timing:
+      min_interval_s: 0.001                         # 急变运动时缩短至 1 ms
+      max_interval_s: 0.005                         # 平稳时最多 5 ms；IMU/点数/输入边界仍可提前刷新
+      normalized_error: 0.05                        # 二阶运动项的归一化点面残差预算
     point_update_batch_max_points: 128                # 每批定位点上限；IMU 更新前也会强制刷新
 
     # LiDAR 到 IMU 的外参

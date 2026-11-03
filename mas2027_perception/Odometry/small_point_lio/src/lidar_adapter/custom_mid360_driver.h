@@ -18,9 +18,11 @@ namespace small_point_lio {
 
     public:
         inline void setup_subscription(rclcpp::Node *node, const std::string &topic, std::function<void(const std::vector<common::Point> &)> callback) override {
+            auto qos = rclcpp::SensorDataQoS().keep_last(node->get_parameter("lidar_queue_depth").as_int());
+            if (node->get_parameter("reliable_input").as_bool()) qos.reliable();
             subscription = node->create_subscription<sensor_msgs::msg::PointCloud2>(
                     topic,
-                    rclcpp::SensorDataQoS(),
+                    qos,
                     [callback](const sensor_msgs::msg::PointCloud2 &msg) {
                         sensor_msgs::PointCloud2ConstIterator<float> out_x(msg, "x");
                         sensor_msgs::PointCloud2ConstIterator<float> out_y(msg, "y");

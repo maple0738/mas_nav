@@ -5,12 +5,17 @@ ROS 2 Jazzy，运行链路统一为独立 `nav_executor`：不依赖 Nav2 server
 本文件是链路、TF、话题与排障总说明；专题文档见[在线导航](docs/online_navigation.md)、[现场记录与调试](docs/field_debugging.md)和[RoboMaster 无图导航优化方案](docs/robomaster_no_map_navigation.md)。
 坡道专用对齐、红蓝基地两轮往返计时与验证边界见[本轮仿真记录](docs/simulation_slope_only_20261102.md)。
 
+LIO 前端为 **Small Point-LIO，时间与空间自适应固定启用，无切换参数**。
+双雷达驱动、全局定位和规划控制沿用现有组件，前端提供 `/Odometry`
+和 `/cloud_registered_full`，动态 TF 仍由 `tf_maintainer` 唯一发布。
+此前接入的 ZLIO 前端已移除；自适应前后实包对比见 [自适应效果](docs/small_lio_adaptation_comparison_20261103.md)。
+
 ## 组件职责
 
 | 组件 | 职责（输入 → 输出） |
 |---|---|
 | `mid360_driver` | 双 MID360 驱动内融合到参考雷达系 → `/mid360_driver/lidar`、`/mid360_driver/imu` |
-| `small_point_lio` | 融合点云 + IMU → `/Odometry`、`/cloud_registered` |
+| `small_point_lio` | 融合点云 + IMU → `/Odometry`、完整去畸变点云 |
 | `odom_localizer` | GICP 六自由度先验定位（`lab3.pcd`）→ `/tf_maintainer/map_to_odom` |
 | `tf_maintainer` | 唯一动态 TF 发布者：`map→odom`、`odom→base_link` |
 | `terrain_map_server` | 静态地形服务 → `/cost_map`、`/terrain_label_map` |
@@ -24,7 +29,7 @@ ROS 2 Jazzy，运行链路统一为独立 `nav_executor`：不依赖 Nav2 server
 ## 在线链路
 
 ```text
-MID360 ×2 → mid360_driver → small_point_lio → /Odometry + /cloud_registered
+MID360 ×2 → mid360_driver → Small Point-LIO → /Odometry + /cloud_registered
                      ├─→ odom_localizer → map→odom → tf_maintainer → odom→base_link
                      └─→ ROGMap（进程内：在线占据 / 距离场 / 坡道隧道语义）
 

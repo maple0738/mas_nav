@@ -25,6 +25,8 @@ namespace small_point_lio {
         double last_timestamp_lidar = -1;
         double last_timestamp_dense_point = -1;
         double last_timestamp_imu = -1;
+        AdaptiveSampling adaptive_sampler;
+        std::vector<double> sampled_ranges;
         util::VoxelgridSampling downsampler;
         std::vector<common::Point> filtered_points;
         std::vector<common::Point> dense_points;
@@ -33,6 +35,10 @@ namespace small_point_lio {
     public:
         Preprocess() = default;
 
+        // Leaf used by the next input; adaptive sampling is always active when downsampling.
+        double sampling_leaf_size() {
+            return adaptive_sampler.leaf(parameters->space_downsample_leaf_size, parameters->adaptive_sampling);
+        }
         void reset();
         void on_point_cloud_callback(const std::vector<common::Point> &pointcloud);
         void on_imu_callback(const common::ImuMsg &imu_msg);

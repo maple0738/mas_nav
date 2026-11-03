@@ -52,6 +52,7 @@ find_package(nav_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(mid360_driver REQUIRED)
 find_package(livox_ros_driver2 QUIET)
 if(OPENMP_FOUND)
@@ -73,6 +74,11 @@ configure_file(include/param_deliver.h.in include/param_deliver.h @ONLY)
 
 file(GLOB_RECURSE SOURCE src/*.cpp 3rdparty/*.c 3rdparty/*.cpp)
 
+# Parameter/input validity checks must survive the package's fast-math optimization.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(src/small_point_lio/parameters.cpp src/small_point_lio/preprocess.cpp src/small_point_lio/small_point_lio.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-finite-math-only" SKIP_PRECOMPILE_HEADERS ON)
+endif()
 ament_auto_add_library(${PROJECT_NAME} SHARED ${SOURCE})
 target_precompile_headers(${PROJECT_NAME} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/include/pch.h>")
 target_include_directories(${PROJECT_NAME} PUBLIC
@@ -95,6 +101,7 @@ ament_target_dependencies(${PROJECT_NAME}
     tf2_ros
     tf2_geometry_msgs
     std_srvs
+    std_msgs
 )
 if(livox_ros_driver2_FOUND)
     ament_target_dependencies(${PROJECT_NAME}
@@ -117,6 +124,16 @@ if(BUILD_TESTING)
     target_link_libraries(test_dense_frame_boundary ${PROJECT_NAME})
     ament_add_gtest(test_point_batch test/test_point_batch.cpp)
     target_link_libraries(test_point_batch ${PROJECT_NAME})
+    ament_add_gtest(test_adaptive_sampling test/test_adaptive_sampling.cpp)
+    target_link_libraries(test_adaptive_sampling ${PROJECT_NAME})
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_adaptive_sampling PRIVATE -fno-finite-math-only)
+    endif()
+    ament_add_gtest(test_adaptive_timing test/test_adaptive_timing.cpp)
+    target_link_libraries(test_adaptive_timing ${PROJECT_NAME})
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_adaptive_timing PRIVATE -fno-finite-math-only)
+    endif()
     find_package(ament_lint_auto REQUIRED)
     list(APPEND AMENT_LINT_AUTO_EXCLUDE
         ament_cmake_copyright

@@ -7,6 +7,8 @@
 #pragma once
 
 #include <pch.h>
+#include "adaptive_sampling.h"
+#include "adaptive_timing.h"
 
 namespace small_point_lio {
 
@@ -22,6 +24,7 @@ namespace small_point_lio {
         Eigen::Vector3f blind_center;
         bool space_downsample;
         float space_downsample_leaf_size;
+        AdaptiveSamplingConfig adaptive_sampling;
 
         Eigen::Vector3d gravity;
         bool check_satu;
@@ -35,6 +38,7 @@ namespace small_point_lio {
         size_t ivox_capacity = 1000000;
         double point_update_batch_interval_s = 0.005;
         size_t point_update_batch_max_points = 128;
+        AdaptiveTimingConfig adaptive_timing;
 
         bool extrinsic_est_en;
         Eigen::Vector3d extrinsic_T;

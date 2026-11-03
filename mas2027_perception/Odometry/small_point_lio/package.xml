@@ -19,6 +19,7 @@
   <depend>tf2_ros</depend>
   <depend>tf2_geometry_msgs</depend>
   <depend>std_srvs</depend>
+    <depend>std_msgs</depend>
   <depend>mid360_driver</depend>
   <test_depend>ament_cmake_gtest</test_depend>
 

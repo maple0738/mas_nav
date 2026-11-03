@@ -19,12 +19,15 @@ namespace small_point_lio {
         Parameters parameters;
         Preprocess preprocess;
         Estimator estimator;
+        AdaptiveTiming adaptive_timing;
         double time_current = 0.0;
         double last_odom_publish_time = -std::numeric_limits<double>::infinity();
         std::vector<Eigen::Vector3f> pointcloud_odom_frame;
         std::function<void(const std::vector<Eigen::Vector3f> &pointcloud, double stamp)> pointcloud_callback;
         std::function<void(const common::Odometry &odometry)> odometry_callback;
         bool is_init = false;
+        std::size_t point_batches_ = 0, accepted_points_ = 0;
+
 
     public:
         Eigen::Matrix<state::value_type, state::DIM, state::DIM> Q;
@@ -32,6 +35,10 @@ namespace small_point_lio {
         explicit SmallPointLio(rclcpp::Node &node);
 
         void reset();
+        // Cumulative completed batch/match counters for profiling and health checks.
+        std::size_t point_batches() const { return point_batches_; }
+        std::size_t accepted_points() const { return accepted_points_; }
+
 
         void on_point_cloud_callback(const std::vector<common::Point> &pointcloud);
 

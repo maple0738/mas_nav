@@ -33,7 +33,26 @@ namespace small_point_lio {
         if (!std::isfinite(full_cloud_publish_interval_s) || full_cloud_publish_interval_s < 0.0) {
             throw std::invalid_argument("full_cloud_publish_interval_s must be finite and nonnegative");
         }
+        const auto imu_queue_depth = declare_parameter<int>("imu_queue_depth", 5);
+        const auto lidar_queue_depth = declare_parameter<int>("lidar_queue_depth", 5);
+        const bool reliable_input = declare_parameter<bool>("reliable_input", false);
+        if (imu_queue_depth < 1 || imu_queue_depth > 65536 || lidar_queue_depth < 1 || lidar_queue_depth > 65536)
+            throw std::invalid_argument("invalid input queue depth");
+        auto imu_qos = rclcpp::SensorDataQoS().keep_last(imu_queue_depth);
+        if (reliable_input) imu_qos.reliable();
         small_point_lio = std::make_unique<small_point_lio::SmallPointLio>(*this);
+        if (declare_parameter<bool>("publish_processing_stats", false)) {
+            processing_stats_publisher = create_publisher<std_msgs::msg::String>("~/processing_stats", 1);
+            processing_stats_timer = create_wall_timer(std::chrono::seconds(1), [this]() {
+                std_msgs::msg::String stats;
+                stats.data = "{\"point_batches\":" + std::to_string(small_point_lio->point_batches()) +
+                    ",\"accepted_points\":" + std::to_string(small_point_lio->accepted_points()) +
+                    ",\"received_scans\":" + std::to_string(received_scans) +
+                    ",\"received_imus\":" + std::to_string(received_imus) +
+                    ",\"received_points\":" + std::to_string(received_points) + "}";
+                processing_stats_publisher->publish(stats);
+            });
+        }
         odometry_publisher = create_publisher<nav_msgs::msg::Odometry>("/Odometry", rclcpp::QoS(10).best_effort());
         // 点云可丢，故取 best_effort + 深度 1：深度 10 会让旧帧在高负载下排队，下游只能拿到滞后点云。
         // /cloud_registered_full 是 ROGMap 稠密去畸变点云输入；/cloud_registered 同内容供旧下游与离线存图。
@@ -340,13 +359,16 @@ namespace small_point_lio {
             return;
         }
         lidar_adapter->setup_subscription(this, lidar_topic, [this](const std::vector<common::Point> &pointcloud) {
+            ++received_scans;
+            received_points += pointcloud.size();
             small_point_lio->on_point_cloud_callback(pointcloud);
             small_point_lio->handle_once();
         });
         imu_subsciber = create_subscription<sensor_msgs::msg::Imu>(
                 imu_topic,
-                rclcpp::SensorDataQoS(),
+                imu_qos,
                 [this](const sensor_msgs::msg::Imu &msg) {
+                    ++received_imus;
                     common::ImuMsg imu_msg;
                     imu_msg.angular_velocity = Eigen::Vector3d(msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z);
                     imu_msg.linear_acceleration = Eigen::Vector3d(msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z);

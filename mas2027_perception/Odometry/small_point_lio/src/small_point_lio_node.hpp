@@ -18,6 +18,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <tf2/LinearMath/Transform.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_broadcaster.hpp>
@@ -38,6 +39,9 @@ namespace small_point_lio {
         std::unique_ptr<tf2_ros::Buffer> tf_buffer;
         std::shared_ptr<tf2_ros::TransformListener> tf_listener;
         rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_trigger;
+        rclcpp::Publisher<std_msgs::msg::String>::SharedPtr processing_stats_publisher;
+        rclcpp::TimerBase::SharedPtr processing_stats_timer;
+        std::size_t received_scans = 0, received_imus = 0, received_points = 0;
         bool odom_frame_initialized = false;
         tf2::Transform transform_odom_from_internal_world = tf2::Transform::getIdentity();
         common::Odometry last_odometry;
