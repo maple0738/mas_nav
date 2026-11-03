@@ -21,6 +21,7 @@ namespace small_point_lio {
     }
 
     void Estimator::reset() {
+        plane_cache.clear();
         ivox = std::make_shared<SmallIVox>(parameters->map_resolution, parameters->ivox_capacity);
         kf.P = Eigen::Matrix<state::value_type, state::DIM, state::DIM>::Identity() * 0.01;
         kf.P.block<3, 3>(state::gravity_index, state::gravity_index).diagonal().fill(0.0001);
@@ -52,38 +53,10 @@ namespace small_point_lio {
         if (nearest_points.size() != NUM_MATCH_POINTS) {
             return;
         }
-        // estimate plane
-#if 0
-        Eigen::Matrix<float, NUM_MATCH_POINTS, 3> A;
-        for (int j = 0; j < NUM_MATCH_POINTS; j++) {
-            A.row(j) = nearest_points[j];
-        }
-        Eigen::Matrix<float, NUM_MATCH_POINTS, 1> b;
-        b.setConstant(-1);
-        Eigen::Vector3f normal = A.colPivHouseholderQr().solve(b);
-        float d = 1.0f / normal.norm();
-#else
-        Eigen::Vector3f centroid = Eigen::Vector3f::Zero();
-        for (const auto &p: nearest_points) {
-            centroid.noalias() += p;
-        }
-        centroid /= static_cast<float>(nearest_points.size());
-        Eigen::Matrix3f covariance = Eigen::Matrix3f::Zero();
-        for (const auto &p: nearest_points) {
-            Eigen::Vector3f centered = p - centroid;
-            covariance.noalias() += centered * centered.transpose();
-        }
-        covariance /= static_cast<float>(nearest_points.size() - 1);
-        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> solver(covariance);
-        Eigen::Vector3f normal = solver.eigenvectors().col(0);
-        float d = -normal.dot(centroid);
-#endif
-        for (int j = 0; j < NUM_MATCH_POINTS; j++) {
-            float point_distanace = std::abs(normal.dot(nearest_points[j]) + d);
-            if (point_distanace > parameters->plane_threshold) {
-                return;
-            }
-        }
+        const auto surface = plane_cache.fit(nearest_points);
+        if (!surface.valid || surface.maximum_residual > parameters->plane_threshold) return;
+        const auto &normal = surface.normal;
+        const float d = surface.offset;
         float point_distanace = normal.dot(point_odom_frame) + d;
         if (point_lidar_frame.norm() <= parameters->match_sqaured * point_distanace * point_distanace) {
             return;

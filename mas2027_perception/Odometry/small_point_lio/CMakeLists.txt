@@ -134,6 +134,11 @@ if(BUILD_TESTING)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(test_adaptive_timing PRIVATE -fno-finite-math-only)
     endif()
+    ament_add_gtest(test_cache_prediction test/test_cache_prediction.cpp)
+    target_link_libraries(test_cache_prediction ${PROJECT_NAME})
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_cache_prediction PRIVATE -fno-finite-math-only)
+    endif()
     find_package(ament_lint_auto REQUIRED)
     list(APPEND AMENT_LINT_AUTO_EXCLUDE
         ament_cmake_copyright

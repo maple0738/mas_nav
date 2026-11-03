@@ -100,9 +100,11 @@ def run(args, mode, index, database, topics, first_record, last_record):
     params = small_parameters()
     small_path = out / 'small.yaml'
     small_path.write_text(yaml.safe_dump({'small_point_lio': {'ros__parameters': params}}))
-    commands = [[str(ROOT / 'install/small_point_lio/lib/small_point_lio/small_point_lio_node'),
+    commands = [[str(args.executable or ROOT / 'install/small_point_lio/lib/small_point_lio/small_point_lio_node'),
                  '--ros-args', '--params-file', str(small_path)]]
     stats_topic = '/small_point_lio/processing_stats'
+    if args.library_path:
+        env['LD_LIBRARY_PATH'] = str(args.library_path.resolve()) + ':' + env.get('LD_LIBRARY_PATH', '')
     logs = [(out / f'node-{i}.log').open('w') for i in range(len(commands))]
     processes = [subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
                                  start_new_session=True) for command, log in zip(commands, logs)]
@@ -120,7 +122,7 @@ def run(args, mode, index, database, topics, first_record, last_record):
     imu = node.create_publisher(Imu, '/bench/imu', QoSProfile(depth=4000, reliability=ReliabilityPolicy.RELIABLE))
     stats = {'published_scans': 0, 'published_imus': 0, 'raw_points': 0, 'published_points': 0,
              'odometry': 0, 'clouds': 0, 'cloud_points': 0, 'matches': 0,
-             'finite': True, 'session_failed': False, 'processing': {}, 'max_speed_mps': 0.,
+             'finite': True, 'monotonic_odometry': True, 'session_failed': False, 'processing': {}, 'max_speed_mps': 0.,
              'max_position_m': 0., 'first_output_elapsed_s': None}
     latencies = []
     trajectory = []
@@ -134,7 +136,9 @@ def run(args, mode, index, database, topics, first_record, last_record):
         stats['finite'] &= all(math.isfinite(x) for x in [p.x, p.y, p.z, v.x, v.y, v.z, q.x, q.y, q.z, q.w])
         stats['max_speed_mps'] = max(stats['max_speed_mps'], math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z))
         stats['max_position_m'] = max(stats['max_position_m'], math.sqrt(p.x*p.x + p.y*p.y + p.z*p.z))
-        last_output_stamp = message.header.stamp.sec + message.header.stamp.nanosec * 1e-9
+        output_stamp = message.header.stamp.sec + message.header.stamp.nanosec * 1e-9
+        stats['monotonic_odometry'] &= last_output_stamp is None or output_stamp > last_output_stamp
+        last_output_stamp = output_stamp
         trajectory.append([last_output_stamp, p.x, p.y, p.z, q.x, q.y, q.z, q.w, v.x, v.y, v.z])
         if started is not None:
             if stats['first_output_elapsed_s'] is None:
@@ -222,7 +226,7 @@ def run(args, mode, index, database, topics, first_record, last_record):
         matched = delivered.get('accepted_points', 0)
         stats['matches'] = matched
         lag = limit * 1e-9 - last_output_stamp if last_output_stamp else None
-        healthy = bool(delivery_equal and stats['finite'] and not stats['session_failed'] and
+        healthy = bool(delivery_equal and stats['finite'] and stats['monotonic_odometry'] and not stats['session_failed'] and
                        matched > 100 and stats['clouds'] > 10 and lag is not None and lag < .5)
         elapsed = wall_end - wall_steady if wall_steady else None
         used = cpu_end - cpu_steady if cpu_steady is not None else None
@@ -264,6 +268,9 @@ def run(args, mode, index, database, topics, first_record, last_record):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--executable', type=Path, help='independent reference executable for binary A/B')
+    parser.add_argument('--library-path', type=Path, help='library directory matching the reference executable')
+    parser.add_argument('--label', default='adaptive', help='result label, not an algorithm switch')
     parser.add_argument('--bag', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--rate', type=float, default=2.)
@@ -294,7 +301,7 @@ def main():
         'last_record_ns': last, 'duration_seconds': (last-first)*1e-9, 'rate': args.rate,
         'tag_mask': '(tag & 0x3f) == 0', 'imu_scale': 1., 'adaptation': 'spatial and temporal are built in; no switches', 'mount_assumption':
         'identity base_link<-lidar_link for benchmark; factory lidar<-IMU translation retained'}, indent=2)+'\n')
-    run(args, "adaptive", 0, databases[0], topics, first, last)
+    run(args, args.label, 0, databases[0], topics, first, last)
 
 
 if __name__ == '__main__':

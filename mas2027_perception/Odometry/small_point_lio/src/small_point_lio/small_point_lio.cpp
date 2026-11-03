@@ -29,6 +29,7 @@ namespace small_point_lio {
     void SmallPointLio::reset() {
         point_batches_ = accepted_points_ = 0;
         adaptive_timing.reset();
+        output_prediction.reset();
         preprocess.reset();
         estimator.reset();
         pointcloud_odom_frame.clear();
@@ -41,6 +42,13 @@ namespace small_point_lio {
     }
 
     void SmallPointLio::on_imu_callback(const common::ImuMsg &imu_msg) {
+        const bool predicted = output_prediction.add(imu_msg, estimator.imu_acceleration_scale,
+            parameters.check_satu, parameters.satu_gyro, parameters.satu_acc);
+        if (predicted && parameters.publish_odometry_without_downsample &&
+            output_prediction.time() - last_odom_publish_time >= parameters.odom_publish_interval_s - 1e-9) {
+            publish_odometry(output_prediction.time(), output_prediction.value());
+            last_odom_publish_time = output_prediction.time();
+        }
         preprocess.on_imu_callback(imu_msg);
     }
 
@@ -90,8 +98,9 @@ namespace small_point_lio {
                                    preprocess.imu_deque.front().timestamp < preprocess.point_deque.back().timestamp;
         std::vector<std::pair<double, std::vector<Eigen::Vector3f>>> completed_clouds;
         std::vector<common::Point> point_batch;
+        bool posterior_changed = false;
         point_batch.reserve(parameters.point_update_batch_max_points);
-        const auto flush_point_batch = [this, &point_batch]() {
+        const auto flush_point_batch = [this, &point_batch, &posterior_changed]() {
             if (point_batch.empty()) {
                 return;
             }
@@ -117,6 +126,7 @@ namespace small_point_lio {
                 estimator.point_lidar_frame = compensated[i];
             }, &mean_information);
             ++point_batches_;
+            posterior_changed = true;
             accepted_points_ += accepted;
             {
                 adaptive_timing.observeBatch(world_acceleration, mean_information, accepted,
@@ -134,11 +144,6 @@ namespace small_point_lio {
             for (const auto &point : compensated) {
                 const Eigen::Vector3d point_imu = updated_rotation_lidar_imu * point.cast<double>() + updated_translation_lidar_imu;
                 estimator.ivox->add_point((updated.rotation * point_imu + updated.position).cast<float>());
-            }
-            if (parameters.publish_odometry_without_downsample &&
-                time_current - last_odom_publish_time >= parameters.odom_publish_interval_s - 1e-9) {
-                publish_odometry(time_current);
-                last_odom_publish_time = time_current;
             }
             point_batch.clear();
         };
@@ -212,6 +217,7 @@ namespace small_point_lio {
                 estimator.angular_velocity = imu_msg.angular_velocity.cast<state::value_type>();
                 estimator.linear_acceleration = imu_msg.linear_acceleration.cast<state::value_type>();
                 const bool imu_updated = estimator.kf.update_imu();
+                posterior_changed = true;
                 {
                     const bool saturated = parameters.check_satu &&
                         (estimator.angular_velocity.cwiseAbs().maxCoeff() >= parameters.satu_gyro ||
@@ -226,6 +232,10 @@ namespace small_point_lio {
 
         flush_point_batch();
 
+        // Idle IMU callbacks must not replay the same delayed posterior repeatedly.
+        if (posterior_changed)
+            output_prediction.correct(estimator.kf.x, estimator.kf.time_state(), estimator.imu_acceleration_scale,
+                parameters.check_satu, parameters.satu_gyro, parameters.satu_acc);
         if (is_publish_odometry || !completed_clouds.empty()) {
             if (!parameters.publish_odometry_without_downsample) {
                 publish_odometry(time_current);
@@ -247,17 +257,21 @@ namespace small_point_lio {
     }
 
     void SmallPointLio::publish_odometry(double timestamp) {
+        publish_odometry(timestamp, estimator.kf.x);
+    }
+
+    void SmallPointLio::publish_odometry(double timestamp, const state &snapshot) {
         if (odometry_callback) {
             common::Odometry odometry;
             odometry.timestamp = timestamp;
-            odometry.position = estimator.kf.x.position.cast<double>();
-            odometry.velocity = estimator.kf.x.velocity.cast<double>();
-            odometry.orientation = estimator.kf.x.rotation.cast<double>();
-            odometry.angular_velocity = estimator.kf.x.omg.cast<double>();
-            odometry.gravity = estimator.kf.x.gravity.cast<double>();
+            odometry.position = snapshot.position.cast<double>();
+            odometry.velocity = snapshot.velocity.cast<double>();
+            odometry.orientation = snapshot.rotation.cast<double>();
+            odometry.angular_velocity = snapshot.omg.cast<double>();
+            odometry.gravity = snapshot.gravity.cast<double>();
             if (parameters.extrinsic_est_en) {
-                odometry.translation_lidar_imu_from_lidar_link = estimator.kf.x.offset_T_L_I.cast<double>();
-                odometry.rotation_lidar_imu_from_lidar_link = estimator.kf.x.offset_R_L_I.cast<double>();
+                odometry.translation_lidar_imu_from_lidar_link = snapshot.offset_T_L_I.cast<double>();
+                odometry.rotation_lidar_imu_from_lidar_link = snapshot.offset_R_L_I.cast<double>();
             } else {
                 odometry.translation_lidar_imu_from_lidar_link = estimator.Lidar_T_wrt_IMU.cast<double>();
                 odometry.rotation_lidar_imu_from_lidar_link = estimator.Lidar_R_wrt_IMU.cast<double>();

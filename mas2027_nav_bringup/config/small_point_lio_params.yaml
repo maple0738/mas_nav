@@ -113,6 +113,6 @@ small_point_lio:
     match_sqaured: 81.0                               # 点面匹配阈值，越小越严格
 
     # 数据发布
-    publish_odometry_without_downsample: true         # 每次批量定位更新后可发布 odom
+    publish_odometry_without_downsample: true         # IMU 独立预测输出，后验超过 150 ms 则停止
     odom_publish_interval_s: 0.01                     # odom 发布至少间隔 10 ms，目标上限 100 Hz
     full_cloud_publish_interval_s: 0.05               # 完整点云独立限速，当前目标约 20 Hz

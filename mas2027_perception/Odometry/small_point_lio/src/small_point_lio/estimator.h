@@ -9,6 +9,7 @@
 #include "eskf.h"
 #include "parameters.h"
 #include "small_ivox.h"
+#include "plane_cache.h"
 #include <pch.h>
 
 namespace small_point_lio {
@@ -18,6 +19,7 @@ namespace small_point_lio {
         // for common
         Parameters *parameters = nullptr;
         eskf kf;
+        PlaneCache plane_cache;
         // for h_point
         std::shared_ptr<SmallIVox> ivox;
         Eigen::Matrix<state::value_type, 3, 1> Lidar_T_wrt_IMU;

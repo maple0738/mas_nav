@@ -47,6 +47,8 @@ namespace small_point_lio {
                 std_msgs::msg::String stats;
                 stats.data = "{\"point_batches\":" + std::to_string(small_point_lio->point_batches()) +
                     ",\"accepted_points\":" + std::to_string(small_point_lio->accepted_points()) +
+                    ",\"plane_cache_hits\":" + std::to_string(small_point_lio->plane_cache_hits()) +
+                    ",\"plane_cache_misses\":" + std::to_string(small_point_lio->plane_cache_misses()) +
                     ",\"received_scans\":" + std::to_string(received_scans) +
                     ",\"received_imus\":" + std::to_string(received_imus) +
                     ",\"received_points\":" + std::to_string(received_points) + "}";
