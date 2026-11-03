@@ -126,13 +126,16 @@ namespace small_point_lio {
 
         // Linearize all points against one state and apply one covariance update.
         // The selector supplies the next lidar point to the measurement model.
+        // ObservationDim=6 requires the extrinsic Jacobian columns to be zero.
+        template<int ObservationDim = 12>
         inline std::size_t update_point_batch(std::size_t count,
                                               const std::function<void(std::size_t)> &select_point,
                                               Eigen::Matrix<state::value_type, 6, 6> *mean_pose_information = nullptr) {
             if (mean_pose_information) mean_pose_information->setZero();
+            static_assert(ObservationDim == 6 || ObservationDim == 12);
             using Scalar = state::value_type;
-            Eigen::Matrix<Scalar, 12, 12> information = Eigen::Matrix<Scalar, 12, 12>::Zero();
-            Eigen::Matrix<Scalar, 12, 1> residual = Eigen::Matrix<Scalar, 12, 1>::Zero();
+            Eigen::Matrix<Scalar, ObservationDim, ObservationDim> information = Eigen::Matrix<Scalar, ObservationDim, ObservationDim>::Zero();
+            Eigen::Matrix<Scalar, ObservationDim, 1> residual = Eigen::Matrix<Scalar, ObservationDim, 1>::Zero();
             std::size_t valid_count = 0;
             for (std::size_t i = 0; i < count; ++i) {
                 select_point(i);
@@ -144,24 +147,25 @@ namespace small_point_lio {
                     continue;
                 }
                 const Scalar inverse_variance = Scalar(1) / measurement.laser_point_cov;
-                information.noalias() += inverse_variance * measurement.H.transpose() * measurement.H;
-                residual.noalias() += inverse_variance * measurement.H.transpose() * measurement.z;
+                const auto observed = measurement.H.template head<ObservationDim>();
+                information.noalias() += inverse_variance * observed.transpose() * observed;
+                residual.noalias() += inverse_variance * observed.transpose() * measurement.z;
                 ++valid_count;
             }
             if (valid_count == 0) {
                 return 0;
             }
 
-            const Eigen::Matrix<Scalar, 12, 12> system =
-                Eigen::Matrix<Scalar, 12, 12>::Identity() + information * P.template topLeftCorner<12, 12>();
-            Eigen::FullPivLU<Eigen::Matrix<Scalar, 12, 12>> solver(system);
+            const Eigen::Matrix<Scalar, ObservationDim, ObservationDim> system =
+                Eigen::Matrix<Scalar, ObservationDim, ObservationDim>::Identity() + information * P.template topLeftCorner<ObservationDim, ObservationDim>();
+            Eigen::FullPivLU<Eigen::Matrix<Scalar, ObservationDim, ObservationDim>> solver(system);
             if (!solver.isInvertible()) {
                 return 0;
             }
-            const auto prior_cross = P.template leftCols<12>().eval();
+            const auto prior_cross = P.template leftCols<ObservationDim>().eval();
             const Eigen::Matrix<Scalar, state::DIM, 1> correction = prior_cross * solver.solve(residual);
             const Eigen::Matrix<Scalar, state::DIM, state::DIM> updated_covariance =
-                P - prior_cross * solver.solve(information * P.template topRows<12>());
+                P - prior_cross * solver.solve(information * P.template topRows<ObservationDim>());
             if (!correction.allFinite() || !updated_covariance.allFinite()) {
                 return 0;
             }

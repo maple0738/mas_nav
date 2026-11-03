@@ -33,6 +33,8 @@ namespace small_point_lio {
         preprocess.reset();
         estimator.reset();
         pointcloud_odom_frame.clear();
+        point_batch.clear();
+        compensated.clear();
         last_odom_publish_time = -std::numeric_limits<double>::infinity();
         is_init = false;
     }
@@ -97,10 +99,10 @@ namespace small_point_lio {
         bool is_publish_odometry = !preprocess.imu_deque.empty() && !preprocess.dense_point_deque.empty() && !preprocess.point_deque.empty() &&
                                    preprocess.imu_deque.front().timestamp < preprocess.point_deque.back().timestamp;
         std::vector<std::pair<double, std::vector<Eigen::Vector3f>>> completed_clouds;
-        std::vector<common::Point> point_batch;
+        point_batch.clear();
         bool posterior_changed = false;
         point_batch.reserve(parameters.point_update_batch_max_points);
-        const auto flush_point_batch = [this, &point_batch, &posterior_changed]() {
+        const auto flush_point_batch = [this, &posterior_changed]() {
             if (point_batch.empty()) {
                 return;
             }
@@ -110,7 +112,7 @@ namespace small_point_lio {
             const auto rotation_lidar_imu = parameters.extrinsic_est_en ? s.offset_R_L_I : estimator.Lidar_R_wrt_IMU;
             const auto translation_lidar_imu = parameters.extrinsic_est_en ? s.offset_T_L_I : estimator.Lidar_T_wrt_IMU;
             const Eigen::Vector3d world_acceleration = s.rotation * s.acceleration + s.gravity;
-            std::vector<Eigen::Vector3f> compensated;
+            compensated.clear();
             compensated.reserve(point_batch.size());
             for (const auto &point : point_batch) {
                 const double dt = point.timestamp - estimator.kf.time_state();
@@ -122,9 +124,14 @@ namespace small_point_lio {
                     (point_imu_at_end - translation_lidar_imu)).cast<float>());
             }
             AdaptiveTiming::Information mean_information;
-            const auto accepted = estimator.kf.update_point_batch(compensated.size(), [this, &compensated](std::size_t i) {
+            const auto select_point = [this](std::size_t i) {
                 estimator.point_lidar_frame = compensated[i];
-            }, &mean_information);
+            };
+            // Fixed extrinsics have six identically zero Jacobian columns.
+            // Keep all 30 state/covariance dimensions, solve only the observed block.
+            const auto accepted = parameters.extrinsic_est_en ?
+                estimator.kf.update_point_batch<12>(compensated.size(), select_point, &mean_information) :
+                estimator.kf.update_point_batch<6>(compensated.size(), select_point, &mean_information);
             ++point_batches_;
             posterior_changed = true;
             accepted_points_ += accepted;

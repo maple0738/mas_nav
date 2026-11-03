@@ -64,3 +64,22 @@ TEST(Prediction, RejectsInvalidPosteriorAndOutOfOrderImu) {
     s=state{}; ASSERT_TRUE(p.correct(s,2.,1,false,10,10));
     EXPECT_FALSE(p.add({2.2,{0,0,0},{0,0,0}},1,false,10,10));
 }
+
+TEST(Prediction, RollingHistoryAndBetweenSampleCorrectionsPreserveIntegration) {
+    OutputPrediction p; state s;
+    p.add({1.,{2,0,0},{0,0,0}},1,false,10,10);
+    ASSERT_TRUE(p.correct(s,1.,1,false,10,10));
+    for (int i=1; i<=1000; ++i) {
+        const double elapsed=i*.005;
+        ASSERT_TRUE(p.add({1.+elapsed,{2,0,0},{0,0,0}},1,false,10,10));
+        EXPECT_NEAR(p.value().position.x(),elapsed*elapsed,1e-10);
+        EXPECT_NEAR(p.value().velocity.x(),2*elapsed,1e-10);
+        if (i%20==0) {
+            const double lagged=elapsed-.0025;
+            s.position.x()=lagged*lagged; s.velocity.x()=2*lagged;
+            ASSERT_TRUE(p.correct(s,1.+lagged,1,false,10,10));
+            EXPECT_NEAR(p.value().position.x(),elapsed*elapsed,1e-10);
+            EXPECT_NEAR(p.value().velocity.x(),2*elapsed,1e-10);
+        }
+    }
+}

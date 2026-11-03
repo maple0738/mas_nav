@@ -25,6 +25,9 @@ namespace small_point_lio {
         double time_current = 0.0;
         double last_odom_publish_time = -std::numeric_limits<double>::infinity();
         std::vector<Eigen::Vector3f> pointcloud_odom_frame;
+        // Scratch storage is reused across callbacks and batches.
+        std::vector<common::Point> point_batch;
+        std::vector<Eigen::Vector3f> compensated;
         std::function<void(const std::vector<Eigen::Vector3f> &pointcloud, double stamp)> pointcloud_callback;
         std::function<void(const common::Odometry &odometry)> odometry_callback;
         bool is_init = false;

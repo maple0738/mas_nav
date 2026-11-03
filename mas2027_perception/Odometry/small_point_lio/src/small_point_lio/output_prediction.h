@@ -2,6 +2,7 @@
 #include "eskf.h"
 #include "common/common.h"
 #include <deque>
+#include <algorithm>
 
 namespace small_point_lio {
 // Independent output state: corrected from the estimator, never fed back to it.
@@ -38,7 +39,11 @@ public:
     double time() const { return time_; }
 private:
     void advance(double scale, bool check, double gyro_limit, double accel_limit) {
-        for (std::size_t i = 1; i < history_.size(); ++i) {
+        // History is ordered; skip intervals already integrated, including after
+        // a delayed posterior correction or deque eviction.
+        const auto next = std::upper_bound(history_.begin(), history_.end(), time_,
+            [](double stamp, const common::ImuMsg &sample) { return stamp < sample.timestamp; });
+        for (std::size_t i = std::max<std::size_t>(1, next - history_.begin()); i < history_.size(); ++i) {
             const auto &left = history_[i - 1], &right = history_[i];
             if (right.timestamp <= time_) continue;
             const double start = std::max(time_, left.timestamp), dt = right.timestamp - start;
