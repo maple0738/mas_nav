@@ -382,7 +382,14 @@ void PerformanceMonitor::writeDetailedHeader()
       "viz_skipped_count",
       "terrain_label_flat",
       "terrain_label_slope",
-      "terrain_label_tunnel"});
+      "terrain_label_tunnel",
+      "terrain_geometry_time_ms",
+      "terrain_slope_prefilter_rejections",
+      "terrain_slope_fit_count",
+      "terrain_wave_candidate_count",
+      "terrain_wave_profile_check_count",
+      "terrain_wave_profile_cache_hits",
+      "terrain_label_undulating"});
 }
 
 void PerformanceMonitor::writeSummaryHeader()
@@ -420,7 +427,14 @@ void PerformanceMonitor::writeSummaryHeader()
       "last_unknown_count",
       "last_terrain_label_flat",
       "last_terrain_label_slope",
-      "last_terrain_label_tunnel"});
+      "last_terrain_label_tunnel",
+      "last_terrain_geometry_time_ms",
+      "last_terrain_slope_prefilter_rejections",
+      "last_terrain_slope_fit_count",
+      "last_terrain_wave_candidate_count",
+      "last_terrain_wave_profile_check_count",
+      "last_terrain_wave_profile_cache_hits",
+      "last_terrain_label_undulating"});
 }
 
 void PerformanceMonitor::writeDetailedRow(const RuntimeStats & s)
@@ -488,7 +502,14 @@ void PerformanceMonitor::writeDetailedRow(const RuntimeStats & s)
       num(s.viz_skipped_count),
       num(s.terrain_label_flat_count),
       num(s.terrain_label_slope_count),
-      num(s.terrain_label_tunnel_count)});
+      num(s.terrain_label_tunnel_count),
+      num(s.terrain_geometry_time),
+      num(s.terrain_slope_prefilter_rejections),
+      num(s.terrain_slope_fit_count),
+      num(s.terrain_wave_candidate_count),
+      num(s.terrain_wave_profile_check_count),
+      num(s.terrain_wave_profile_cache_hits),
+      num(s.terrain_label_undulating_count)});
   flushIfNeeded(detailed_csv_, detailed_csv_rows_);
 }
 
@@ -543,7 +564,14 @@ void PerformanceMonitor::maybeWriteSummary(double stamp)
         num(stats_.unknown_count),
         num(stats_.terrain_label_flat_count),
         num(stats_.terrain_label_slope_count),
-        num(stats_.terrain_label_tunnel_count)});
+        num(stats_.terrain_label_tunnel_count),
+        num(stats_.terrain_geometry_time),
+        num(stats_.terrain_slope_prefilter_rejections),
+        num(stats_.terrain_slope_fit_count),
+        num(stats_.terrain_wave_candidate_count),
+        num(stats_.terrain_wave_profile_check_count),
+        num(stats_.terrain_wave_profile_cache_hits),
+        num(stats_.terrain_label_undulating_count)});
     flushIfNeeded(summary_csv_, summary_csv_rows_);
   }
 

@@ -40,10 +40,20 @@ rog_map::ColumnStats ground(double z)
   return stats;
 }
 
-std::vector<uint8_t> labelsFor(const rog_map::ProjectionLayer::ColumnScanner & scanner)
+rog_map::ColumnStats measuredGround(double z)
+{
+  auto stats = ground(z);
+  stats.surface_valid = true;
+  stats.surface_z = stats.surface_low = stats.surface_high = z;
+  return stats;
+}
+
+std::vector<uint8_t> labelsFor(const rog_map::ProjectionLayer::ColumnScanner & scanner,
+  const rog_map::TerrainRecognitionConfig & terrain = {})
 {
   rog_map::ProjectionLayer layer;
   rog_map::ProjectionLayerConfig config;
+  config.terrain = terrain;
   config.min_observed_voxels = 1;
   config.hysteresis_en = false;
   config.mask_filter_en = false;
@@ -56,6 +66,78 @@ TEST(ProjectionTerrain, FlatGroundIsNotSlope)
 {
   const auto labels = labelsFor([](int, int) { return ground(1.0); });
   EXPECT_EQ(labels[10 * kSize + 10], 0U);
+}
+
+TEST(ProjectionTerrain, RecognitionThresholdsAndEnableFlagsTakeEffect)
+{
+  rog_map::TerrainRecognitionConfig config;
+  const auto slope = [](int x, int) { return measuredGround(.2 * x * kResolution); };
+  EXPECT_EQ(labelsFor(slope)[10*kSize+10], 5U);
+  config.slope.min_height_change_m = .2;
+  EXPECT_NE(labelsFor(slope, config)[10*kSize+10], 5U);
+  config.slope.min_height_change_m = .06;
+  config.slope.enable = false;
+  EXPECT_NE(labelsFor(slope, config)[10*kSize+10], 5U);
+  const auto wave = [](int x, int) {
+    return measuredGround(.035 * std::sin(2 * M_PI * x * kResolution / .24));
+  };
+  EXPECT_EQ(labelsFor(wave, config)[10*kSize+10], 7U);
+  config.undulating.min_peak_to_trough_m = .08;
+  EXPECT_NE(labelsFor(wave, config)[10*kSize+10], 7U);
+  config.undulating.min_peak_to_trough_m = .035;
+  config.undulating.enable = false;
+  EXPECT_NE(labelsFor(wave, config)[10*kSize+10], 7U);
+}
+
+TEST(ProjectionTerrain, WaveCacheDoesNotSurviveNewHeightsOrParameters)
+{
+  rog_map::ProjectionLayer layer;
+  rog_map::ProjectionLayerConfig config;
+  config.hysteresis_en = false; config.mask_filter_en = false;
+  const auto scan = [](int x, int) {
+    return measuredGround(.035 * std::sin(2 * M_PI * x * kResolution / .24));
+  };
+  layer.updateFull(kSize,kSize,kResolution,Eigen::Vector2d::Zero(),1,config,scan);
+  const auto wave = layer.terrainGeometry();
+  EXPECT_EQ(wave.labels[10*kSize+10],7U);
+  EXPECT_GT(wave.wave_profile_cache_hits,0U);
+  config.terrain.undulating.min_peak_to_trough_m = .08;
+  layer.updateFull(kSize,kSize,kResolution,Eigen::Vector2d::Zero(),2,config,scan);
+  EXPECT_NE(layer.terrainLabels()[10*kSize+10],7U);
+  layer.updateFull(kSize,kSize,kResolution,Eigen::Vector2d::Zero(),3,config,
+    [](int,int){return measuredGround(0.0);});
+  EXPECT_EQ(layer.terrainLabels()[10*kSize+10],0U);
+}
+
+TEST(ProjectionTerrain, TunnelSemanticThresholdsTakeEffect)
+{
+  const auto tunnel = [](int,int) {
+    auto stats=ground(0.0); stats.occupied_count=2;
+    stats.occupied_z_index_max=7; stats.occupied_z_max_abs=.35;
+    stats.free_between_occupied_count=4;
+    return stats;
+  };
+  rog_map::TerrainRecognitionConfig config;
+  EXPECT_EQ(labelsFor(tunnel,config)[10*kSize+10],6U);
+  config.tunnel.min_free_gap_ratio=.9;
+  EXPECT_NE(labelsFor(tunnel,config)[10*kSize+10],6U);
+  config.tunnel.min_free_gap_ratio=.5;
+  config.tunnel.enable=false;
+  EXPECT_NE(labelsFor(tunnel,config)[10*kSize+10],6U);
+}
+
+TEST(TerrainConfig, RejectsInvalidParameterCombinations)
+{
+  rog_map::TerrainRecognitionConfig config;
+  EXPECT_NO_THROW(config.validate());
+  config.slope.fit_radius_cells=1;
+  EXPECT_THROW(config.validate(),std::invalid_argument);
+  config={};config.undulating.min_wavelength_m=.5;
+  EXPECT_THROW(config.validate(),std::invalid_argument);
+  config={};config.undulating.min_neighbor_correlation=1.1;
+  EXPECT_THROW(config.validate(),std::invalid_argument);
+  config={};config.tunnel.min_neighbor_support=10;
+  EXPECT_THROW(config.validate(),std::invalid_argument);
 }
 
 TEST(LocalSurface, RequiresCoverageFreshnessAndRejectsRingAliases)
@@ -276,13 +358,50 @@ TEST(ProjectionGround, DirectRawReturnsRefreshRetainedGroundAfterRayClearing)
   EXPECT_FALSE(std::isfinite(layer.cells()[10*kSize+10].ground_reference_z));
 }
 
-TEST(ProjectionTerrain, Repeated240mm70mmWavesBecomeUndulating)
+TEST(ProjectionTerrain, CoarseHeightWavesAloneDoNotProveUndulatingGround)
 {
   for (double phase : {0.0, 0.5, 1.0, 1.5}) {
     const auto labels = labelsFor([phase](int x, int) {
       const double z = .035 * std::sin(2 * M_PI * x * kResolution / .24 + phase);
       // Match the actual map's five-centimeter height quantization.
       return ground(std::round(z / kResolution) * kResolution);
+    });
+    EXPECT_NE(labels[10 * kSize + 10], 7U) << phase;
+  }
+}
+
+TEST(ProjectionTerrain, FlatGroundNearVoxelBoundaryIsNotUndulating)
+{
+  for (bool precise : {false, true}) {
+    const auto labels = labelsFor([=](int x, int) {
+      // Four millimetres of actual ripple becomes a 50 mm voxel pattern.
+      const double z = .025 + .002 * std::sin(2 * M_PI * x * kResolution / .24);
+      auto stats = ground(std::round(z / kResolution) * kResolution);
+      if (precise) {
+        stats.surface_valid = true;
+        stats.surface_z = stats.surface_low = stats.surface_high = z;
+      }
+      return stats;
+    });
+    EXPECT_NE(labels[10 * kSize + 10], 7U) << precise;
+  }
+}
+
+TEST(ProjectionTerrain, NeighboringWavesMustHaveConsistentPhase)
+{
+  const auto labels = labelsFor([](int x, int y) {
+    return measuredGround(.035 * std::sin(2 * M_PI * x * kResolution / .24 +
+      (y % 2) * M_PI));
+  });
+  EXPECT_NE(labels[10 * kSize + 10], 7U);
+}
+
+TEST(ProjectionTerrain, MeasuredWavesWithNoiseRemainUndulating)
+{
+  for (double phase : {0.0, 0.5, 1.0, 1.5}) {
+    const auto labels = labelsFor([=](int x, int y) {
+      const double noise = ((x * 13 + y * 7) % 11 - 5) * .001;
+      return measuredGround(.035 * std::sin(2 * M_PI * x * kResolution / .24 + phase) + noise);
     });
     EXPECT_EQ(labels[10 * kSize + 10], 7U) << phase;
   }
@@ -292,10 +411,10 @@ TEST(ProjectionTerrain, SingleBumpStepAndMissingSupportAreNotUndulating)
 {
   for (int kind = 0; kind < 3; ++kind) {
     const auto labels = labelsFor([kind](int x, int y) {
-      if (kind == 0) return ground(x == 10 ? .07 : 0.0);
-      if (kind == 1) return ground(x >= 10 ? .07 : 0.0);
+      if (kind == 0) return measuredGround(x == 10 ? .07 : 0.0);
+      if (kind == 1) return measuredGround(x >= 10 ? .07 : 0.0);
       if ((x >= 5 && x <= 8) || y == 9) return rog_map::ColumnStats{};
-      return ground(.035 * std::sin(2 * M_PI * x * kResolution / .24));
+      return measuredGround(.035 * std::sin(2 * M_PI * x * kResolution / .24));
     });
     EXPECT_NE(labels[10 * kSize + 10], 7U) << kind;
   }
@@ -307,12 +426,12 @@ TEST(ProjectionTerrain, RotatedWavesAreUndulatingButSmallNoiseIsNot)
     const auto labels = labelsFor([angle](int x, int y) {
       const double distance = kResolution * (x * std::cos(angle) + y * std::sin(angle));
       const double z = .035 * std::sin(2 * M_PI * distance / .24);
-      return ground(z);
+      return measuredGround(z);
     });
     EXPECT_EQ(labels[10 * kSize + 10], 7U) << angle;
   }
   const auto labels = labelsFor([](int x, int y) {
-    return ground(.01 * std::sin(x * 1.7 + y * 3.1));
+    return measuredGround(.01 * std::sin(x * 1.7 + y * 3.1));
   });
   EXPECT_NE(labels[10 * kSize + 10], 7U);
   // A coarse diagonal observation can quantize to 10 cm jumps. Preserve the

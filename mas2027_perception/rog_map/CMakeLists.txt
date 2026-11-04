@@ -151,6 +151,13 @@ if(BUILD_TESTING)
         target_link_libraries(test_projection_terrain ${library_name})
         ament_add_gtest(test_query_adapter_cell_centers test/test_query_adapter_cell_centers.cpp)
         target_link_libraries(test_query_adapter_cell_centers ${library_name})
+        ament_add_gtest(test_terrain_config test/test_terrain_config.cpp)
+        target_link_libraries(test_terrain_config ${library_name})
+        target_compile_definitions(test_terrain_config PRIVATE
+                TERRAIN_CONFIG_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../mas2027_nav_executor/config/terrain_recognition.yaml"
+                PERCEPTION_CONFIG_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../mas2027_nav_executor/config/perception.yaml")
+        add_executable(benchmark_terrain_geometry test/benchmark_terrain_geometry.cpp)
+        target_link_libraries(benchmark_terrain_geometry ${library_name})
 endif()
 
 ament_package()

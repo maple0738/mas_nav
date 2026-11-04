@@ -83,7 +83,7 @@ RViz 的 `ROGMAP` 分组默认开启 `Online Terrain (orange=slope, cyan=tunnel)
 
 ## ⚙️ 关键配置
 
-参数位于 `src/mas2027_nav_executor/config/planner_params.yaml` 的 **`planner.rog_map`** 子树
+参数位于 `mas2027_nav_executor/config/perception.yaml` 的 **`planner.rog_map`** 子树；坡面、隧道、起伏路识别参数集中在同目录 `terrain_recognition.yaml`
 （`path_planner.cpp:25` `config.loadFromRosNode(node_, "planner.rog_map")`）。安装目录里那份是该文件的
 **软链**，改 src 即生效、不用重编；但 `Config::loadFromRosNode()` 只在 configure 时读一次，
 **没有 on-set-parameters 回调**，所以改完必须重启节点 / 重新 launch。独立跑 `rog_map_node` 时前缀是

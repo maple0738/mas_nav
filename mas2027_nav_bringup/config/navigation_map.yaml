@@ -1,7 +1,14 @@
-# 主导航地图唯一配置入口。
-#
-# 相对路径以 mas2027_nav_bringup 的 share 目录为基准；也可以填写绝对路径。
-# 三个文件必须来自同一次 mapping_web_ui 导出/编辑流程，并保持同一 map 坐标系。
+# 运行模式和地图选择的唯一默认入口；修改后重启导航。
+# online：无先验图，只用 LIO + 在线 ROGMap，不启动定位匹配/静态地图服务。
+# prior：有图，必须提供同一次建图导出的 PCD、占据 YAML/图像及地形 msgpack。
+map_source: online
+
+# 性能日志目录，支持 ~；启动时自动创建。
+log_dir: ~/.local/state/mas_nav
+
+# 相对于本配置文件所在目录；也可以填写绝对路径，如 /data/navigation/maps/lab。
+# 默认 .. 指向 mas2027_nav_bringup share/源码包根目录，地图分别在 pcd/、map/。
+map_root: ..
 map_files:
   localization_pcd: pcd/lab_map_20260921_211523.pcd
   occupancy_yaml: map/lab_map_20260921_211523.yaml

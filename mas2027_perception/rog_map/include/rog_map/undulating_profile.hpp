@@ -2,13 +2,15 @@
 
 #include <array>
 #include <cmath>
+#include <rog_map/terrain_config.hpp>
 
 namespace rog_map {
 
 // Recognize repeated short waves, not a single bump or a monotonic grade.
 // Heights must be measured support surfaces, sampled at a constant spacing.
 template<std::size_t N>
-inline bool isUndulatingProfile(std::array<double, N> heights, double spacing)
+inline bool isUndulatingProfile(std::array<double, N> heights, double spacing,
+  const UndulatingRecognitionConfig & config = {})
 {
   static_assert(N==13 || N==17);
   if (!std::isfinite(spacing) || spacing <= 0.0 || spacing > 0.08) return false;
@@ -36,27 +38,27 @@ inline bool isUndulatingProfile(std::array<double, N> heights, double spacing)
     mean += heights[i] / N;
     trend += (i - center) * heights[i] / denominator;
   }
-  if (std::abs(trend / spacing) > 0.25) return false;
+  if (std::abs(trend / spacing) > config.max_trend_gradient) return false;
   for (int i = 0; i < static_cast<int>(N); ++i) heights[i] -= mean + trend * (i - center);
   std::array<int, N> extrema{};
   int count = 0, previous_sign = 0;
   for (int i = 1; i < static_cast<int>(N); ++i) {
     const double delta = heights[i] - heights[i - 1];
-    const int sign = delta > 0.01 ? 1 : delta < -0.01 ? -1 : 0;
+    const int sign = delta > config.min_delta_m ? 1 : delta < -config.min_delta_m ? -1 : 0;
     if (!sign) continue;
     if (previous_sign && sign != previous_sign) extrema[count++] = i - 1;
     previous_sign = sign;
   }
   if (N==13 && count==2 && last>extrema[count-1] &&
-      std::abs(heights[last]-heights[extrema[count-1]])>=.035)
+      std::abs(heights[last]-heights[extrema[count-1]])>=config.min_peak_to_trough_m)
     extrema[count++]=last;
   if (count < (N==13 ? 3 : 5)) return false;
   for (int i = 1; i < count; ++i) {
     const double height = std::abs(heights[extrema[i]] - heights[extrema[i - 1]]);
-    if (height < 0.035 || height > 0.12) return false;
+    if (height < config.min_peak_to_trough_m || height > config.max_peak_to_trough_m) return false;
     if (i >= 2) {
       const double wavelength = (extrema[i] - extrema[i - 2]) * spacing;
-      if (wavelength < 0.18 || wavelength > 0.34) return false;
+      if (wavelength < config.min_wavelength_m || wavelength > config.max_wavelength_m) return false;
     }
   }
   return true;

@@ -2,13 +2,11 @@
 
 ROS 2 Jazzy，运行链路统一为独立 `nav_executor`：不依赖 Nav2 server、Behavior Tree、Costmap 插件、
 `minco_planner` / `minco_controller` 插件包。唯一入口 `mas2027_nav_bringup/nav_executor_launch.py`。
-本文件是链路、TF、话题与排障总说明；专题文档见[在线导航](docs/online_navigation.md)、[现场记录与调试](docs/field_debugging.md)和[RoboMaster 无图导航优化方案](docs/robomaster_no_map_navigation.md)。
-坡道专用对齐、红蓝基地两轮往返计时与验证边界见[本轮仿真记录](docs/simulation_slope_only_20261102.md)。
+启动、模式切换、地图路径和参数入口见[使用说明](docs/usage.md)。
 
 LIO 前端为 **Small Point-LIO，时间与空间自适应固定启用，无切换参数**。
 双雷达驱动、全局定位和规划控制沿用现有组件，前端提供 `/Odometry`
 和 `/cloud_registered_full`，动态 TF 仍由 `tf_maintainer` 唯一发布。
-此前接入的 ZLIO 前端已移除；自适应前后实包对比见 [自适应效果](docs/small_lio_adaptation_comparison_20261103.md)。
 
 ## 组件职责
 
@@ -70,7 +68,7 @@ ROGMap → /rog_map/terrain_label ───────────────�
 
 在线坡道侧边约束只阻止已推断的长侧边进入。坡面内部的零散普通/未知语义格，若沿同一坡向的前后两端均有一致观测支持，不再生成虚假的侧边障碍；这不把未知占据格改为自由，也不放宽台阶与碰撞门。`Slope side rejection` 日志会注明实时或累计约束来源及失败线段，便于区分坡道入口和语义采样孔洞。
 
-几字型坡道现按“先到入口正前方，再开启对齐”规划：预留 0.5 m 坡前接近区，MINCO 加入助跑暴露量/曲率正则，并用实测入口位置门阻止侧方提前对齐。实现、开关回退和待完成的闭环验收见[几字坡入口说明](docs/directed_ramp_approach.md)。
+几字型坡道现按“先到入口正前方，再开启对齐”规划：预留 0.5 m 坡前接近区，MINCO 加入助跑暴露量/曲率正则，并用实测入口位置门阻止侧方提前对齐。实现、开关回退和待完成的闭环验收见[使用说明](docs/usage.md)。
 
 安全链路只保留两道硬门：
 
@@ -93,7 +91,7 @@ effective_clearance = max(0, collision_dist - kEsdfJitterTolerance)
 
 失败原因按 `failure_log_first_n`(10) 逐条、每 `failure_log_every_n`(25) 次采样、每 `failure_summary_every`(50) 次汇总。`LOCAL_SEED_INVALID` / `..._AFTER_REPAIR` = 没进优化器；`OPTIMIZER_FAILED` = 不收敛；`COLLISION` / `TERRAIN_COLLISION` = 硬校验被否。局部兜底全败时 `Live obstacle blocks the local route...` 会带 `*_reject=` 现场与自动判读 `verdict=`：`GEOMETRY` 连近场规则都过不了（拒绝正确，别动阈值）、`SEED_GATE_STRICTER` 只被更严的种子门否掉、`PREFIX_TOO_SHORT` 卡安全段长度、`TERRAIN` 死在 terrain/动态层、`NONE` 未捕获。
 
-反复急停时先看 `Braking:` 的 `reason=`：`rog_map_stale` / `tf_unavailable` 是数据新鲜度问题，`clearance` 是执行侧指令净空，`terrain_transition` 是地形方向门；不要直接减小 `collision_dist`。窄道碰撞与轨迹拒绝的现场核对步骤见[现场记录与调试](docs/field_debugging.md#窄道碰撞与轨迹拒绝)。
+反复急停时先看 `Braking:` 的 `reason=`：`rog_map_stale` / `tf_unavailable` 是数据新鲜度问题，`clearance` 是执行侧指令净空，`terrain_transition` 是地形方向门；不要直接减小 `collision_dist`。窄道碰撞与轨迹拒绝的现场核对步骤见[使用说明](docs/usage.md)。
 
 ## ROGMap 与 RViz
 
@@ -166,12 +164,12 @@ ros2 launch mas2027_nav_bringup nav_executor_launch.py
 `force_follow_gimbal` 启动参数已删除；跟随请求完全由特殊地形区域阶段控制。修改跟随控制参数需重启导航，不需要改下位机。
 
 常用启动参数：`use_rviz`、`use_odom_localizer`、`use_nav_serial`、`nav_serial_device`、`output_topic`。
-启动模式仅由 `mas2027_nav_executor/config/node_params.yaml` 中的 `node.map_source` 选择，修改后重启生效。
+启动模式由 `mas2027_nav_bringup/config/navigation_map.yaml` 中的 `map_source` 选择；也可传 `map_source:=online/prior` 临时覆盖，修改后重启生效。
 设为 `prior` 时，先验地图文件统一在 `mas2027_nav_bringup/config/navigation_map.yaml` 中选择。
 设为 `online` 时使用无先验模式：不读取地图文件、不启动 GICP 定位器和静态地图服务，
 使用 `odom` 下的 LIO 与在线 ROGMap 分段推进；速度与加速度采用规划器、MPC 和区域控制 YAML，未知区域作为障碍。
 在线模式默认启用 B1 累计地图，在 `/nav_executor/online_global_map` 保留本次启动内的历史观测，并提供固定版本的全局查询接口；当前任务搜索仍使用 A 方案，后续 B2 接入累计地图路线。
-具体启动、目标坐标和能力范围见 [无先验地图导航](docs/online_navigation.md)。
+具体启动、目标坐标和能力范围见 [无先验地图导航](docs/usage.md)。
 `use_nav_serial` 默认 `True`，通过 CDC1 发送 `vx`、`vy`、小 yaw ref 和请求标志；只想观察导航时置
 `False`。导航桥默认读取 USB 接口自身的 `iInterface`，仅连接字符串为 `PCCOMM-NAV` 的
 CDC 串口，不依赖 `/dev/ttyACM*` 编号、`if02` 顺序或设备产品名称；
@@ -224,7 +222,9 @@ cd /home/mas/桌面/mas_vision/build
 
 - `mas2027_nav_executor/config/node_params.yaml`：频率、话题、坐标系、轨迹/里程计/ROGMap 超时。
 - `mas2027_nav_executor/config/planner_params.yaml`：全局搜索（`use_smac`、`smac_2d.*`、`tolerance`）、
-  MINCO 与恢复参数、`planner.rog_map.*`、`planner.online_global_map.*`。
+  MINCO 与恢复参数、`planner.online_global_map.*`。
+- `mas2027_nav_executor/config/perception.yaml`：ROGMap、障碍/台阶、ESDF、性能统计。
+- `mas2027_nav_executor/config/terrain_recognition.yaml`：坡面、隧道和起伏路识别。
 - `mas2027_nav_executor/config/mpc_params.yaml`：MPC 约束与权重。
 - `mas2027_nav_bringup/config/small_point_lio_params.yaml`：雷达与 LIO（含双雷达降级超时）。
 - `mas2027_nav_bringup/config/navigation_map.yaml`：导航地图唯一选择入口（定位 PCD、二维地图
@@ -269,13 +269,15 @@ cp data/map/<名称>_terrain.msgpack  "$DST"/map/
 
 ```yaml
 # mas2027_nav_bringup/config/navigation_map.yaml
+map_source: prior
+map_root: ..
 map_files:
   localization_pcd: pcd/<名称>.pcd
   occupancy_yaml: map/<名称>.yaml
   terrain_msgpack: map/<名称>_terrain.msgpack
 ```
 
-相对路径以安装后的 `mas2027_nav_bringup` share 目录为基准，也可以填写绝对路径。随后重新执行
+`map_root` 相对于清单所在目录，默认 `..` 指向 bringup 包根目录；地图条目相对于 `map_root`，也可以填写绝对路径。随后重新执行
 `colcon build --symlink-install --packages-select mas2027_nav_bringup`，让清单选中的 PCD、地图 YAML、
 该 YAML 引用的 PGM 和 terrain msgpack 进入 `install/`，再启动导航。其他历史地图留在源码目录，
 不会复制到新安装包；绝对路径指向仓库外时，部署机器需要自行提供该文件。`map_server` 会直接读取 `occupancy_yaml` 中的
@@ -294,5 +296,4 @@ ros2 run tf2_ros tf2_echo map odom && ros2 run tf2_ros tf2_echo odom base_link
 
 点目标后没有轨迹：依次确认 ROGMap 已收到点云与里程计、目标在当前滑窗可达范围内、`/opt_path`
 有发布；MPC 输入过期、TF 失败或求解失败时执行器发零速。实车复跑要保留地图与轨迹证据时，先按
-按[现场记录与调试](docs/field_debugging.md#现场录包)启动记录器；[在线导航说明](docs/online_navigation.md)解释无先验模式。修改记录见
-[`docs/change-history.md`](docs/change-history.md)。
+按[使用说明](docs/usage.md)启动记录器；[在线导航说明](docs/usage.md)解释无先验模式。

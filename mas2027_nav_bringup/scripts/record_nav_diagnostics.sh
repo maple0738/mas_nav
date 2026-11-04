@@ -206,7 +206,7 @@ find "${ROS_LOG_DIR:-${HOME}/.ros/log}" -maxdepth 3 -type f -newer "${RUN_DIR}/s
   while IFS= read -r -d '' file; do
     cp -f "${file}" "${RUN_DIR}/logs/$(basename "${file}")" 2>/dev/null || true
   done
-find "${WORKSPACE}/.scratch" -maxdepth 1 -type f -newer "${RUN_DIR}/start.marker" \
+find "${WORKSPACE}/.scratch" "${FIELD_PERF_LOG_DIR:-${HOME}/.local/state/mas_nav}" -maxdepth 1 -type f -newer "${RUN_DIR}/start.marker" \
   \( -name '*perf*.csv' -o -name 'minco*.csv' \) -print0 2>/dev/null |
   while IFS= read -r -d '' file; do
     cp -f "${file}" "${RUN_DIR}/csv/$(basename "${file}")" 2>/dev/null || true

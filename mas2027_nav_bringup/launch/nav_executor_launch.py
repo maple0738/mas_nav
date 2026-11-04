@@ -1,13 +1,10 @@
 """Standalone map_server + MINCO + MPC navigation bringup."""
 
-import glob
 import os
-
-import yaml
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import (
     FrontendLaunchDescriptionSource,
@@ -15,53 +12,16 @@ from launch.launch_description_sources import (
 )
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterValue
-
-
-def _load_navigation_map_files(bringup_dir):
-    """Load and validate the single map-selection manifest."""
-    config_path = os.path.join(bringup_dir, "config", "navigation_map.yaml")
-    with open(config_path, encoding="utf-8") as stream:
-        document = yaml.safe_load(stream)
-
-    if not isinstance(document, dict) or not isinstance(document.get("map_files"), dict):
-        raise RuntimeError(f"{config_path}: missing map_files mapping")
-
-    def resolve(key):
-        value = document["map_files"].get(key)
-        if not isinstance(value, str) or not value.strip():
-            raise RuntimeError(f"{config_path}: map_files.{key} must be a non-empty path")
-        path = value if os.path.isabs(value) else os.path.join(bringup_dir, value)
-        path = os.path.realpath(path)
-        if not os.path.isfile(path):
-            raise RuntimeError(f"{config_path}: map_files.{key} does not exist: {path}")
-        return path
-
-    return {
-        "localization_pcd": resolve("localization_pcd"),
-        "occupancy_yaml": resolve("occupancy_yaml"),
-        "terrain_msgpack": resolve("terrain_msgpack"),
-    }
-
-
-def _load_map_source(executor_dir):
-    """Use the executor YAML as the single startup mode selector."""
-    config_path = os.path.join(executor_dir, "config", "node_params.yaml")
-    with open(config_path, encoding="utf-8") as stream:
-        document = yaml.safe_load(stream)
-    try:
-        map_source = document["/**"]["ros__parameters"]["node"]["map_source"]
-    except (KeyError, TypeError) as exc:
-        raise RuntimeError(f"{config_path}: missing node.map_source") from exc
-    if map_source not in ("prior", "online"):
-        raise RuntimeError(f"{config_path}: node.map_source must be prior or online")
-    return map_source
+from mas2027_nav_bringup.configuration import parameter_files, read_manifest, resolve_map_files
 
 
 def _launch_setup(context):
     bringup_dir = get_package_share_directory("mas2027_nav_bringup")
-    executor_dir = get_package_share_directory("mas2027_nav_executor")
-    map_source = _load_map_source(executor_dir)
+    manifest = read_manifest(
+        LaunchConfiguration("navigation_config").perform(context),
+        LaunchConfiguration("map_source").perform(context).strip(),
+    )
+    map_source = manifest["map_source"]
     online = map_source == "online"
     launch_dir = os.path.join(bringup_dir, "launch")
     system_first_library_path = os.pathsep.join(
@@ -76,17 +36,28 @@ def _launch_setup(context):
     use_foxglove = LaunchConfiguration("use_foxglove")
     foxglove_address = LaunchConfiguration("foxglove_address")
     foxglove_port = LaunchConfiguration("foxglove_port")
-    output_topic = LaunchConfiguration("output_topic")
-    normal_mode = LaunchConfiguration("normal_mode")
-    normal_mode_parameter = ParameterValue(normal_mode, value_type=int)
+    control_overrides = {}
+    output_topic = LaunchConfiguration("output_topic").perform(context).strip()
+    if output_topic:
+        control_overrides["node.topics.cmd_vel_pub"] = output_topic
+    normal_mode = LaunchConfiguration("normal_mode").perform(context).strip()
+    if normal_mode:
+        control_overrides["region_control.normal_mode"] = int(normal_mode)
 
     lio_params = os.path.join(bringup_dir, "config", "small_point_lio_params.yaml")
-    map_files = {} if online else _load_navigation_map_files(bringup_dir)
-    executor_params = sorted(glob.glob(os.path.join(executor_dir, "config", "*.yaml")))
-    localizer_params = os.path.join(
-        get_package_share_directory("odom_localizer"), "config", "params.yaml"
-    )
-
+    map_files = {} if online else resolve_map_files(manifest)
+    config_dir = LaunchConfiguration("config_dir").perform(context)
+    executor_params = parameter_files(config_dir)
+    os.makedirs(manifest["log_dir"], exist_ok=True)
+    startup_params = {
+        "use_sim_time": use_sim_time,
+        "node.map_source": map_source,
+        "planner.rog_map.performance.summary_csv_path": os.path.join(manifest["log_dir"], "rog_map_perf_summary.csv"),
+        "planner.rog_map.performance.detailed_csv_path": os.path.join(manifest["log_dir"], "rog_map_perf_detailed.csv"),
+        **control_overrides,
+    }
+    if not online:
+        startup_params["planner.rog_map.projection.prior_map.yaml_path"] = map_files["occupancy_yaml"]
     robot_state_publisher = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(launch_dir, "robot_state_publisher_launch.py")
@@ -107,23 +78,25 @@ def _launch_setup(context):
         output="screen",
         parameters=[lio_params, {"use_sim_time": use_sim_time, "publish_odom_tf": False}],
     )
-    odom_localizer = Node(
-        package="odom_localizer",
-        executable="odom_localizer_node",
-        name="odom_localizer",
-        output="screen",
-        emulate_tty=True,
-        condition=IfCondition(use_odom_localizer),
-        additional_env={"LD_LIBRARY_PATH": system_first_library_path},
-        parameters=[
-            localizer_params,
-            {
-                "map.prior_pcd_file": map_files.get("localization_pcd", ""),
-                "use_sim_time": use_sim_time,
-                "tf.publish_direct": False,
-            },
-        ],
-    )
+    odom_localizer = None
+    if not online:
+        odom_localizer = Node(
+            package="odom_localizer",
+            executable="odom_localizer_node",
+            name="odom_localizer",
+            output="screen",
+            emulate_tty=True,
+            condition=IfCondition(use_odom_localizer),
+            additional_env={"LD_LIBRARY_PATH": system_first_library_path},
+            parameters=[
+                os.path.join(get_package_share_directory("odom_localizer"), "config", "params.yaml"),
+                {
+                    "map.prior_pcd_file": map_files.get("localization_pcd", ""),
+                    "use_sim_time": use_sim_time,
+                    "tf.publish_direct": False,
+                },
+            ],
+        )
     tf_maintainer = Node(
         package="tf_maintainer",
         executable="tf_maintainer_node",
@@ -155,27 +128,27 @@ def _launch_setup(context):
             "OMP_WAIT_POLICY": "PASSIVE",
         },
         parameters=executor_params
-        + [{"use_sim_time": use_sim_time, "node.topics.cmd_vel_pub": output_topic,
-            "region_control.normal_mode": normal_mode_parameter,
-            "node.map_source": map_source}, online_params],
+        + [startup_params, online_params],
     )
-    terrain_map_server = Node(
-        package="map_server",
-        executable="map_server_node",
-        name="terrain_map_server",
-        output="screen",
-        additional_env={"LD_LIBRARY_PATH": system_first_library_path},
-        parameters=[{
-            "use_sim_time": use_sim_time,
-            "terrain_map_path": map_files.get("terrain_msgpack", ""),
-            "map_yaml_path": map_files.get("occupancy_yaml", ""),
-            "frame_id": "map",
-        }],
-        remappings=[
-            ("cost_map", "/cost_map"),
-            ("terrain_label_map", "/terrain_label_map"),
-        ],
-    )
+    terrain_map_server = None
+    if not online:
+        terrain_map_server = Node(
+            package="map_server",
+            executable="map_server_node",
+            name="terrain_map_server",
+            output="screen",
+            additional_env={"LD_LIBRARY_PATH": system_first_library_path},
+            parameters=[{
+                "use_sim_time": use_sim_time,
+                "terrain_map_path": map_files.get("terrain_msgpack", ""),
+                "map_yaml_path": map_files.get("occupancy_yaml", ""),
+                "frame_id": "map",
+            }],
+            remappings=[
+                ("cost_map", "/cost_map"),
+                ("terrain_label_map", "/terrain_label_map"),
+            ],
+        )
     nav_serial_bridge = Node(
         package="nav_serial_bridge",
         executable="nav_serial_bridge_node",
@@ -217,15 +190,22 @@ def _launch_setup(context):
             }.items(),
         )
 
-    actions = [robot_state_publisher, mid360_driver, small_point_lio, tf_maintainer,
+    actions = [LogInfo(msg=f"Navigation: mode={map_source}, manifest={manifest['path']}, "
+        f"config_dir={os.path.realpath(os.path.expanduser(config_dir))}, maps={map_files}, logs={manifest['log_dir']}"),
+        robot_state_publisher, mid360_driver, small_point_lio, tf_maintainer,
         nav_executor, nav_serial_bridge, rviz, *([foxglove_bridge] if foxglove_bridge else [])]
     if not online:
-        actions[3:3] = [odom_localizer, terrain_map_server]
+        actions[4:4] = [odom_localizer, terrain_map_server]
     return actions
 
 
 def generate_launch_description():
     return LaunchDescription([
+        DeclareLaunchArgument("navigation_config", default_value=os.path.join(
+            get_package_share_directory("mas2027_nav_bringup"), "config", "navigation_map.yaml")),
+        DeclareLaunchArgument("config_dir", default_value=os.path.join(
+            get_package_share_directory("mas2027_nav_executor"), "config")),
+        DeclareLaunchArgument("map_source", default_value="", description="online/prior; empty uses navigation_config"),
         DeclareLaunchArgument("use_sim_time", default_value="False"),
         # RViz 默认关闭，需要图形窗口时显式传 use_rviz:=True。
         DeclareLaunchArgument("use_rviz", default_value="false"),
@@ -240,7 +220,7 @@ def generate_launch_description():
         DeclareLaunchArgument("use_foxglove", default_value="True"),
         DeclareLaunchArgument("foxglove_address", default_value="127.0.0.1"),
         DeclareLaunchArgument("foxglove_port", default_value="8766"),
-        DeclareLaunchArgument("output_topic", default_value="/cmd_vel"),
-        DeclareLaunchArgument("normal_mode", default_value="4"),
+        DeclareLaunchArgument("output_topic", default_value="", description="Empty uses node_params.yaml"),
+        DeclareLaunchArgument("normal_mode", default_value="", description="Empty uses region_control.yaml"),
         OpaqueFunction(function=_launch_setup),
     ])

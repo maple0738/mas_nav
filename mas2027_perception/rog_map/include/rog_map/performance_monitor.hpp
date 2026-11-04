@@ -157,6 +157,13 @@ struct RuntimeStats
   double query_snapshot_alloc_time{0.0};
   double query_copy_values_time{0.0};
   double query_copy_types_height_delta_confidence_time{0.0};
+  double terrain_geometry_time{0.0};
+  double terrain_slope_prefilter_rejections{0.0};
+  double terrain_slope_fit_count{0.0};
+  double terrain_wave_candidate_count{0.0};
+  double terrain_wave_profile_check_count{0.0};
+  double terrain_wave_profile_cache_hits{0.0};
+  double terrain_label_undulating_count{0.0};
   double cpu_thread_hint{0.0};
 };
 

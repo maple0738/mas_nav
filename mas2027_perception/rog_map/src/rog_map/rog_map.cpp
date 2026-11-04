@@ -421,6 +421,7 @@ void ROGMap::refreshLayers()
   }
 
   ProjectionLayerConfig layer_cfg;
+  layer_cfg.terrain = cfg_.terrain;
   layer_cfg.unknown_as_occupied = cfg_.unknown_as_occupied;
   layer_cfg.min_observed_voxels = cfg_.min_observed_voxels;
   layer_cfg.surface_height_delta_max = cfg_.surface_height_delta_max;
@@ -969,10 +970,18 @@ void ROGMap::refreshQuery()
       (layer_->cells()[i].height_discontinuity_measured ? 1U : 2U);
     snapshot->confidence[i] = layer_->cells()[i].confidence;
   }
+  const auto terrain_start = std::chrono::steady_clock::now();
   auto terrain = layer_->terrainGeometry();
+  runtime_stats_.terrain_geometry_time = elapsedMs(terrain_start);
+  runtime_stats_.terrain_slope_prefilter_rejections = terrain.slope_prefilter_rejections;
+  runtime_stats_.terrain_slope_fit_count = terrain.slope_fit_count;
+  runtime_stats_.terrain_wave_candidate_count = terrain.wave_candidate_count;
+  runtime_stats_.terrain_wave_profile_check_count = terrain.wave_profile_check_count;
+  runtime_stats_.terrain_wave_profile_cache_hits = terrain.wave_profile_cache_hits;
   runtime_stats_.terrain_label_flat_count = 0.0;
   runtime_stats_.terrain_label_slope_count = 0.0;
   runtime_stats_.terrain_label_tunnel_count = 0.0;
+  runtime_stats_.terrain_label_undulating_count = 0.0;
   for (const uint8_t label : terrain.labels) {
     if (label == 0U) {
       runtime_stats_.terrain_label_flat_count += 1.0;
@@ -980,6 +989,8 @@ void ROGMap::refreshQuery()
       runtime_stats_.terrain_label_slope_count += 1.0;
     } else if (label == 6U) {
       runtime_stats_.terrain_label_tunnel_count += 1.0;
+    } else if (label == 7U) {
+      runtime_stats_.terrain_label_undulating_count += 1.0;
     }
   }
   snapshot->terrain_labels = std::move(terrain.labels);

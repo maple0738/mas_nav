@@ -1,0 +1,112 @@
+# 导航使用说明
+
+以下路径均相对仓库根目录 `mas_nav/`。参数在启动时读取，修改后重启导航。默认使用无图模式。
+
+## 编译与启动
+
+```bash
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-up-to mas2027_nav_bringup --cmake-args -DBUILD_TESTING=ON
+source install/setup.bash
+ros2 launch mas2027_nav_bringup nav_executor_launch.py use_rviz:=True
+```
+
+默认启用底盘串口；仅观察时加 `use_nav_serial:=False`。RViz 中用 2D Goal Pose 下目标。无图模式目标使用 `odom`，有图模式使用 `map`。
+
+启动默认读取安装目录中的配置。调试源码参数时，可直接指定配置路径，修改 YAML 后重启即可，无需为 YAML 改动重新编译：
+
+```bash
+ros2 launch mas2027_nav_bringup nav_executor_launch.py \
+  navigation_config:="$PWD/mas2027_nav_bringup/config/navigation_map.yaml" \
+  config_dir:="$PWD/mas2027_nav_executor/config" use_rviz:=True
+```
+
+程序改动需要重新编译。`navigation_config` 管模式、地图和日志；`config_dir` 管下表六份执行器参数。启动日志打印本次采用的配置、模式和地图绝对路径。
+
+## 有图与无图
+
+唯一默认入口：`mas2027_nav_bringup/config/navigation_map.yaml` 的 `map_source`。
+
+| 值 | 工作方式 | 地图要求 |
+| --- | --- | --- |
+| `online` | LIO + 在线 ROGMap；不启动先验定位和静态地图服务 | 不需要地图文件；RViz 固定坐标系为 `odom` |
+| `prior` | PCD 定位 + 静态全局地形，ROGMap 提供实时局部障碍 | PCD、占据 YAML/图像、地形 msgpack 必须齐全；固定坐标系为 `map` |
+
+也可以临时传 `map_source:=online` 或 `map_source:=prior`，覆盖配置文件。不要在 `node_params.yaml` 再写一份模式；启动器会统一注入。无图模式强制未知区域不可通行，不能通过修改普通搜索参数放开。
+
+## 地图放哪里
+
+默认地图在 `mas2027_nav_bringup/pcd/` 和 `mas2027_nav_bringup/map/`，具体文件由 `navigation_map.yaml` 选择。也可将同一场地的一套地图放到外部目录，例如：
+
+```text
+/data/navigation/maps/lab/
+  lab.pcd
+  lab.yaml
+  lab.pgm
+  lab_terrain.msgpack
+```
+
+对应配置：
+
+```yaml
+map_source: prior
+map_root: /data/navigation/maps/lab
+log_dir: ~/.local/state/mas_nav
+map_files:
+  localization_pcd: lab.pcd
+  occupancy_yaml: lab.yaml
+  terrain_msgpack: lab_terrain.msgpack
+```
+
+`map_root` 的相对路径以此配置文件所在目录为基准；`map_files` 的相对路径以 `map_root` 为基准；YAML 的 `image` 以该地图 YAML 所在目录为基准。以上均支持绝对路径和 `~`。四个文件应来自同一次建图、使用同一坐标系、原点和分辨率。有图启动前会检查文件存在性；不检查地图是否来自同一次导出。外部地图不会复制进 `install/`，运行机器上需保留该目录。
+
+默认 `map_root: ..` 指向 bringup 包根目录。构建时将清单选中的包内地图安装到 share 目录；无图构建允许地图缺失。先验定位的 PCD、地图服务和可选 ROGMap 先验融合路径均由这份清单绑定。
+
+## 修改哪个参数文件
+
+执行器配置目录：`mas2027_nav_executor/config/`。
+
+| 文件 | 内容 |
+| --- | --- |
+| `node_params.yaml` | 话题、坐标系、控制/规划频率、超时与显示 |
+| `perception.yaml` | ROGMap 分辨率、范围、点云、衰减、障碍/台阶、ESDF 与性能统计 |
+| `terrain_recognition.yaml` | 坡面 5、隧道 6、起伏路 7 的在线识别阈值 |
+| `planner_params.yaml` | 全局搜索、MINCO、探索恢复、在线累计图的确认与清除 |
+| `region_control.yaml` | 各地形模式、速度/加速度、准备/激活距离、航向对齐与起伏定长锁存 |
+| `mpc_params.yaml` | 跟踪控制的约束、预测窗口与权重 |
+
+雷达/LIO 参数在 `mas2027_nav_bringup/config/small_point_lio_params.yaml`；先验定位算法参数在 `mas2027_perception/Localization/odom_localizer/config/params.yaml`。启动器按固定文件清单加载，额外放入的 YAML 不会自动覆盖参数；清单内重复定义同一参数会在启动前报错。命令行 `normal_mode`、`output_topic` 仅在显式填写时覆盖 YAML。
+
+## 地形调参
+
+`terrain_recognition.yaml` 中的长度单位为米。坡度为“高差/水平距离”，不是角度；峰谷差是最高点到最低点的差，不是单边振幅。默认阈值保持当前算法行为，不能代表现场标定结果。
+
+| 地形 | 优先调整 | 作用 |
+| --- | --- | --- |
+| 坡面 | `terrain.slope.min_gradient/max_gradient` | 默认 0.14～0.70，约 8°～35° |
+| 坡面 | `fit_radius_cells`、`min_samples` | 默认 11×11 窗口、30 个有效地面格；窗口变大计算更多，也可能混入邻近物体 |
+| 坡面 | `min_height_change_m`、`max_plane_rms_m`、`max_plane_residual_m` | 高差下限和拟合误差上限；后两项减小更严格 |
+| 隧道 | `projection.tunnel_height_delta_min/max`、`tunnel_occupancy_ratio_max` | 柱上下占据回波的跨度和竖直占据率，用于柱分类；不是底盘可通行净空 |
+| 隧道 | `terrain.tunnel.min_free_gap_ratio`、`min_neighbor_support` | 中间明确为空闲的比例、3×3 邻域支持格数；提高更严格 |
+| 起伏路 | `terrain.undulating.min_peak_to_trough_m/max_peak_to_trough_m` | 默认峰谷差 0.035～0.12；提高下限可抑制小扰动 |
+| 起伏路 | `min_wavelength_m/max_wavelength_m` | 默认同类极值间距 0.18～0.34 |
+| 起伏路 | `min_delta_m`、`min_neighbor_correlation`、`min_common_samples` | 反转噪声门、邻条带一致性和共同实测覆盖；提高更严格 |
+| 起伏路 | `entry_window_enable` | 关闭后仅使用完整窗口，识别更晚；默认保留入口短窗口 |
+
+`terrain.*.enable` 仅关闭对应在线语义识别，不会关闭障碍分类，也不会关闭静态地图里已有的标签。起伏路必须有精细地面高度，粗体素高度不能单独生成标签。四方向、三邻条带、17 点完整窗口/13 点入口窗口是算法结构；覆盖不足时拒识。
+
+平地误报起伏路时，先检查精细高度、峰谷差和邻条带一致性，再逐项调整阈值。已经记忆的标签受 `planner.online_global_map.terrain_clear_confirmations` 影响；起伏对齐保持距离在 `region_control.undulating.alignment_latch_distance`，调识别阈值不会立即解除已有锁存。需要重新评估一次识别时重启进程清空本次累计状态。
+
+## 查看状态
+
+```bash
+ros2 param get /nav_executor node.map_source
+ros2 param get /nav_executor planner.rog_map.projection.terrain.undulating.min_peak_to_trough_m
+ros2 topic echo /nav_executor/region_status --once
+ros2 topic hz /Odometry
+ros2 topic hz /cloud_registered_full
+```
+
+性能 CSV 默认位于 `~/.local/state/mas_nav/`，由清单中的 `log_dir` 修改，启动时自动创建。`terrain_geometry_time_ms` 看地形识别总耗时；`terrain_slope_fit_count` 看平面求解次数；`terrain_wave_profile_check_count` 看未命中缓存的条带检测次数；`terrain_wave_profile_cache_hits` 看同帧复用次数。Detailed CSV 为每次更新，Summary CSV 的 `last_*` 为最近一次更新值。统计开关位于 `perception.yaml` 的 `performance`。
+
+出现 `rog_map_stale`/`tf_unavailable` 先检查数据和 TF，`clearance` 检查净空，`terrain_transition` 检查地形方向。识别标签不代替碰撞、台阶和制动门。

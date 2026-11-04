@@ -1,0 +1,47 @@
+/**:
+  ros__parameters:
+    planner:
+      rog_map:
+        projection:
+          # 在线地形识别统一入口。单位 m；修改后重启导航，不支持运行中热更新。
+          # 障碍/台阶在 perception.yaml；速度/对齐在 region_control.yaml。
+          # 柱分类的中空通道条件：上下回波的竖直跨度和占据率，不等于底盘净空。
+          # min 必须高于 surface_height_delta_max，ratio 必须小于 wall_occupancy_ratio_min。
+          tunnel_height_delta_min: 0.25
+          tunnel_height_delta_max: 0.75
+          tunnel_occupancy_ratio_max: 0.45
+          terrain:
+            tunnel:
+              enable: true  # 仅控制标签 6，不改变柱分类和碰撞判定
+              min_free_gap_ratio: 0.50  # 上下占据回波之间明确为空闲的比例
+              min_neighbor_support: 5  # 3×3 邻域中满足隧道条件的格数，范围 1..9
+            slope:
+              enable: true
+              # 半径格数，窗口边长=2r+1；50 mm 地图下 r=5 为 0.55 m。
+              # 增大更平滑、计算更多，可能把邻近几何混入；范围 2..20。
+              fit_radius_cells: 5
+              min_samples: 30
+              # 坡度=高差/水平距离，约对应 8°..35°，不是角度值。
+              min_gradient: 0.14
+              max_gradient: 0.70
+              min_height_change_m: 0.06
+              # 越小越严格；残差门用于拒绝箱顶/台阶等混入的薄面。
+              max_plane_rms_m: 0.04
+              max_plane_residual_m: 0.05
+            undulating:
+              enable: true
+              # 短入口窗口可提前识别；关闭时只使用完整 17 点窗口。
+              entry_window_enable: true
+              # 峰谷差，不是单边振幅。抬高下限可抑制较小地面扰动。
+              min_peak_to_trough_m: 0.035
+              max_peak_to_trough_m: 0.12
+              # 相邻同类极值的距离。实测路面周期变化时同时调整上下界。
+              min_wavelength_m: 0.18
+              max_wavelength_m: 0.34
+              # 相邻采样的反转噪声门；提高可减少细碎峰谷，也可能漏检。
+              min_delta_m: 0.01
+              # 去趋势前允许的整体坡度；仍用高差/水平距离表示。
+              max_trend_gradient: 0.25
+              # 邻条带相关系数，越接近 1 越严格；共同实测点数范围 3..17。
+              min_neighbor_correlation: 0.80
+              min_common_samples: 9

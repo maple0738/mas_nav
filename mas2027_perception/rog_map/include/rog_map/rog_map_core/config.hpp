@@ -29,6 +29,7 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <rog_map/rog_map_core/common_lib.hpp>
+#include <rog_map/terrain_config.hpp>
 
 #ifndef ORIGIN_AT_CORNER
 #ifndef ORIGIN_AT_CENTER
@@ -269,6 +270,30 @@ public:
     load("projection.unknown_as_occupied", unknown_as_occupied);
     load("projection.surface_height_delta_max", surface_height_delta_max);
     load("projection.max_step_height", max_step_height);
+    terrain = TerrainRecognitionConfig{};
+    load("projection.terrain.slope.enable", terrain.slope.enable);
+    load("projection.terrain.slope.fit_radius_cells", terrain.slope.fit_radius_cells);
+    load("projection.terrain.slope.min_samples", terrain.slope.min_samples);
+    load("projection.terrain.slope.min_gradient", terrain.slope.min_gradient);
+    load("projection.terrain.slope.max_gradient", terrain.slope.max_gradient);
+    load("projection.terrain.slope.min_height_change_m", terrain.slope.min_height_change_m);
+    load("projection.terrain.slope.max_plane_rms_m", terrain.slope.max_plane_rms_m);
+    load("projection.terrain.slope.max_plane_residual_m", terrain.slope.max_plane_residual_m);
+    load("projection.terrain.undulating.enable", terrain.undulating.enable);
+    load("projection.terrain.undulating.entry_window_enable", terrain.undulating.entry_window_enable);
+    load("projection.terrain.undulating.min_peak_to_trough_m", terrain.undulating.min_peak_to_trough_m);
+    load("projection.terrain.undulating.max_peak_to_trough_m", terrain.undulating.max_peak_to_trough_m);
+    load("projection.terrain.undulating.min_wavelength_m", terrain.undulating.min_wavelength_m);
+    load("projection.terrain.undulating.max_wavelength_m", terrain.undulating.max_wavelength_m);
+    load("projection.terrain.undulating.min_delta_m", terrain.undulating.min_delta_m);
+    load("projection.terrain.undulating.max_trend_gradient", terrain.undulating.max_trend_gradient);
+    load("projection.terrain.undulating.min_neighbor_correlation", terrain.undulating.min_neighbor_correlation);
+    load("projection.terrain.undulating.min_common_samples", terrain.undulating.min_common_samples);
+    load("projection.terrain.tunnel.enable", terrain.tunnel.enable);
+    load("projection.terrain.tunnel.min_free_gap_ratio", terrain.tunnel.min_free_gap_ratio);
+    load("projection.terrain.tunnel.min_neighbor_support", terrain.tunnel.min_neighbor_support);
+    terrain.validate();
+
     load("projection.ground_filter.enable", ground_filter_en);
     load("projection.ground_filter.max_span", ground_filter_max_span);
     load("projection.ground_filter.plane_tolerance", ground_filter_plane_tolerance);
@@ -543,6 +568,7 @@ public:
   bool unknown_as_occupied{true};
   double surface_height_delta_max{0.10};
   double max_step_height{0.08};
+  TerrainRecognitionConfig terrain;
   bool ground_filter_en{false};
   double ground_filter_max_span{0.15};
   double ground_filter_plane_tolerance{0.075};

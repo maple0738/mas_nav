@@ -1,9 +1,7 @@
 /**:
   ros__parameters:
     node:
-      # prior requires static terrain; online uses only live ROGMap in odom.
-      # The launch reads this value to select the complete startup profile; restart to change.
-      map_source: online
+      # 启动模式统一由 bringup/config/navigation_map.yaml 选择并注入 node.map_source。
       control_rate_hz: 20.0
       planner_frequency: 20.0
       trajectory_timeout_s: 0.6

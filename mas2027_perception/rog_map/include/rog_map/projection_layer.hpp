@@ -7,6 +7,7 @@
 #include <limits>
 #include <vector>
 
+#include <rog_map/terrain_config.hpp>
 #include <rog_map/rog_map_core/common_lib.hpp>
 #include <rog_map/rog_map_core/sliding_map.h>
 
@@ -68,6 +69,7 @@ struct CellData
 
 struct ProjectionLayerConfig
 {
+  TerrainRecognitionConfig terrain;
   bool unknown_as_occupied{false};
   int min_observed_voxels{2};
   double surface_height_delta_max{0.10};
@@ -137,6 +139,13 @@ struct TerrainGeometry
   // Unit vector toward increasing ground height; zero outside a fitted slope.
   std::vector<float> uphill_x;
   std::vector<float> uphill_y;
+  // Per-call work counters; profile checks count uncached 17-point strips,
+  // including their short-window fallbacks. Candidates count (cell, axis) pairs.
+  size_t slope_prefilter_rejections{0};
+  size_t slope_fit_count{0};
+  size_t wave_candidate_count{0};
+  size_t wave_profile_check_count{0};
+  size_t wave_profile_cache_hits{0};
 };
 
 class ProjectionLayer : protected SlidingMap
