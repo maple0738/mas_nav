@@ -134,20 +134,50 @@ source install/setup.bash
 
 ### 代码跳转（clangd）
 
-`CMAKE_EXPORT_COMPILE_COMMANDS=ON`（已在上面的构建命令里）让每个包导出自己的编译命令，再把它们合并成
-一份给编辑器用：
+在仓库根目录打开编辑器，安装推荐的 clangd 扩展和与 clangd 主版本一致的 OpenMP 开发头文件
+（本机 `clangd --version` 为 18，对应 `sudo apt install libomp-18-dev`）。
+无 sudo 的环境可以在仓库根目录把开发包解压到忽略目录，脚本会自动使用本地 OpenMP 头文件：
 
 ```bash
-bash src/tools/gen_compile_commands.sh   # 重新 configure 各包，合并到 build/compile_commands.json
+mkdir -p build/clangd-deps
+(cd build/clangd-deps && apt-get download libomp-18-dev)
+for deb in build/clangd-deps/libomp-18-dev_*.deb; do
+  dpkg-deb -x "$deb" build/clangd-deps
+done
 ```
 
-编译库只能放 `build/`（不入库），所以仓库里用 `src/.clangd` 显式指向它——这几行配置与编辑器无关，
-clangd 打开任意文件都能拿到正确的 `-I`/`-D`（ROS 2 Jazzy、PCL、Eigen、本工作区各包头文件）。
-`src/compile_commands.json` 是一条指向同一文件的软链（不入库），给只认目录祖先搜索的工具兜底。
+脚本也会把该目录的 `usr`、`opt/ros/jazzy` 加入 CMake 查找路径；本机缺失的
+`libmsgpack-cxx-dev`、`ros-jazzy-pcl-ros` 已按同样方式下载并解压。
+首次使用需先构建依赖，生成 ROS 消息头文件。随后执行：
 
-**新增/删除源文件、切分支、改过 `CMakeLists.txt` 之后要重跑一次**；只改注释或函数体不必重跑。
-症状对照：编译库里没有该文件时，clangd 会拿别的文件的命令去猜，表现为满屏
-`'xxx.hpp' file not found`、`use of undeclared identifier`，同时跨文件跳转失效。
+```bash
+bash tools/gen_compile_commands.sh
+# 如果部分包使用单独的构建目录，将其一起合并；后面的目录优先：
+bash tools/gen_compile_commands.sh build-adaptive
+```
+
+脚本跳过尚未完成配置的包（会输出提示），重新 configure 已有包，启用 `CMAKE_EXPORT_COMPILE_COMMANDS=ON`，不编译或安装目标；
+依赖仓库 `install/` 中已构建的包。合并结果位于 `build/compile_commands.json`，
+根目录的 `compile_commands.json` 软链供编辑器查找。生成文件和本机编辑器配置不提交。
+额外构建目录只在实际存在且需要时传入。如需显式指定 clangd 的编译库位置，可在本地
+创建根目录 `.clangd`（已有配置时只合并以下字段）：
+
+```yaml
+CompileFlags:
+  CompilationDatabase: build
+```
+
+**新增/删除源文件、切分支、修改 `CMakeLists.txt` 或切换构建目录后重新运行脚本。**
+完成后在 VS Code 执行 `clangd: Restart language server`，等待后台索引，使用 F12 跳转定义、
+Shift+F12 查找引用。可脱离编辑器检查文件，例如：
+
+```bash
+clangd --check=mas2027_nav_executor/src/nav_executor_node.cpp
+```
+
+日志应显示从本仓库 `build/compile_commands.json` 加载编译命令。若显示 `Generic fallback command`
+或命令来自其他源文件，检查是否漏合并对应包；若缺少 ROS 生成消息头，先构建并安装依赖包再生成编译库。
+OpenMP 头文件应使用 LLVM 配套版本，避免把 GCC 的整个内部 include 目录加入 clangd。
 
 ## 启动
 

@@ -16,6 +16,11 @@ mas_nav_image.tar
 # 排障用的一次性脚本 / 回放日志 / 台架输出。约定留在本地，不进仓库
 .scratch/
 
-# 给编辑器用的编译库软链（指向 build/compile_commands.json，由 src/tools/gen_compile_commands.sh
-# 生成）。内容是绝对路径、随机器与构建变化，不进仓库；clangd 侧由 src/.clangd 指路。
+# 给编辑器用的编译库软链（指向 build/compile_commands.json，由 tools/gen_compile_commands.sh
+# 生成）。内容是绝对路径、随机器与构建变化，不进仓库；clangd 侧由 .clangd 指路。
 /compile_commands.json
+
+# 本机编辑器配置；扩展推荐列表仍保留版本管理。
+/.clangd
+/.vscode/c_cpp_properties.json
+/.vscode/settings.json

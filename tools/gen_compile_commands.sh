@@ -1,67 +1,101 @@
 #!/usr/bin/env bash
-# 为 clangd / IDE 生成完整的 compile_commands.json。
-#
-# 背景：本工作区的构建目录由 colcon 逐个包生成，默认不导出编译命令；而 clangd 只认
-# 「离源文件最近的 compile_commands.json」。缺条目时 clangd 会拿别的文件的命令来猜，
-# 于是满屏 'xxx.hpp file not found' / 'use of undeclared identifier'，跨文件跳转也失效。
-#
-# 本脚本做两件事：
-#   1. 对 build/ 下每个已配置的包重新 configure 一次，打开 CMAKE_EXPORT_COMPILE_COMMANDS
-#      （只重新生成构建文件，不重新编译源码）；
-#   2. 把所有包的编译命令合并成一份 build/compile_commands.json。
-#
-# 新增/删除源文件、切分支、改 CMakeLists 之后重跑一次即可；只改注释/普通源码不必重跑。
-#
-# 用法： bash src/tools/gen_compile_commands.sh
+# 重新 configure 已构建的 colcon 包并合并编译命令，不编译或安装目标。
+# 用法：bash tools/gen_compile_commands.sh [额外构建目录 ...]
+# 默认处理仓库 build/；额外目录优先覆盖同一源文件（例如 build-adaptive）。
 set -euo pipefail
 
-WS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+WS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="$WS/build"
 OUT="$BUILD/compile_commands.json"
+BUILD_DIRS=("$BUILD")
+for extra in "$@"; do
+  BUILD_DIRS+=("$(cd "$extra" && pwd)")
+done
 
+# 各包依赖 ROS 和本工作区已经生成的消息/库；沿用缓存中的其他配置。
+set +u
 if [ -f /opt/ros/jazzy/setup.bash ]; then
-  set +u  # ROS 的 setup.bash 会引用未定义变量，与 set -u 冲突
-  # shellcheck disable=SC1091
   source /opt/ros/jazzy/setup.bash
-  set -u
+fi
+if [ -f "$WS/install/local_setup.bash" ]; then
+  source "$WS/install/local_setup.bash"
+fi
+set -u
+# 可选的本地开发包（按原始 deb 布局解压），不会修改系统安装。
+if [ -d "$BUILD/clangd-deps/usr" ]; then
+  export CMAKE_PREFIX_PATH="$BUILD/clangd-deps/usr:$BUILD/clangd-deps/opt/ros/jazzy:${CMAKE_PREFIX_PATH:-}"
 fi
 
 echo "[1/2] 重新 configure 各包（打开 CMAKE_EXPORT_COMPILE_COMMANDS）"
-for cache in "$BUILD"/*/CMakeCache.txt; do
-  [ -e "$cache" ] || continue
-  bdir="$(dirname "$cache")"
-  sdir="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$cache" | head -1)"
-  if [ -z "$sdir" ] || [ ! -f "$sdir/CMakeLists.txt" ]; then
-    echo "  跳过 $(basename "$bdir")：缓存里的源码目录无效（$sdir）"
-    continue
-  fi
-  echo "  $(basename "$bdir")"
-  cmake -S "$sdir" -B "$bdir" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >/dev/null
+for base in "${BUILD_DIRS[@]}"; do
+  for cache in "$base"/*/CMakeCache.txt; do
+    [ -e "$cache" ] || continue
+    bdir="$(dirname "$cache")"
+    if [ ! -f "$bdir/Makefile" ] && [ ! -f "$bdir/build.ninja" ]; then
+      echo "  跳过未完成配置的包：$bdir（先解决构建依赖并 colcon build）" >&2
+      continue
+    fi
+    sdir="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$cache" | head -1)"
+    if [ -z "$sdir" ] || [ ! -f "$sdir/CMakeLists.txt" ]; then
+      echo "错误：$cache 中的源码目录无效（$sdir），请先重新 colcon build。" >&2
+      exit 1
+    fi
+    echo "  $bdir"
+    cmake -S "$sdir" -B "$bdir" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >"$bdir/clangd-configure.log" 2>&1 || {
+      cat "$bdir/clangd-configure.log" >&2
+      exit 1
+    }
+  done
 done
 
 echo "[2/2] 合并 → $OUT"
-python3 - "$BUILD" "$OUT" <<'PY'
-import json, os, sys
+python3 - "$OUT" "${BUILD_DIRS[@]}" <<'PYTHON'
+import json
+from pathlib import Path
+import sys
 
-build, out = sys.argv[1], sys.argv[2]
-merged, seen, sources = [], set(), []
-for root, dirs, files in os.walk(build):
-    if "compile_commands.json" not in files:
-        continue
-    path = os.path.join(root, "compile_commands.json")
-    if os.path.abspath(path) == os.path.abspath(out):
-        continue
-    sources.append(path)
-    with open(path) as f:
-        for entry in json.load(f):
-            key = os.path.realpath(entry.get("file", ""))
-            if not key or key in seen:
+out = Path(sys.argv[1])
+merged, sources = {}, []
+# 无 sudo 环境可把 libomp 开发包解压到此目录；仅影响编辑器编译库。
+local_omp = sorted((out.parent / "clangd-deps/usr/lib").glob("llvm-*/lib/clang/*/include/omp.h"))
+
+for base in map(Path, sys.argv[2:]):
+    # 只读取包级数据库，不重复读上次合并结果或嵌套第三方库。
+    for path in sorted(base.glob("*/compile_commands.json")):
+        sources.append(path)
+        for entry in json.loads(path.read_text()):
+            directory = Path(entry["directory"])
+            if not directory.is_absolute():
+                directory = path.parent / directory
+            directory = directory.resolve()
+            source = Path(entry["file"])
+            if not source.is_absolute():
+                source = directory / source
+            source = source.resolve()
+            if not source.is_file():
+                raise SystemExit(f"失效的源文件：{source}（来自 {path}）")
+            # 预编译头是构建辅助文件，无需作为独立翻译单元索引。
+            if source.name.startswith("cmake_pch."):
                 continue
-            seen.add(key)
-            merged.append(entry)
-
-with open(out, "w") as f:
-    json.dump(merged, f, indent=1)
-
+            entry["directory"], entry["file"] = str(directory), str(source)
+            if local_omp:
+                include = str(local_omp[-1].parent.resolve())
+                if "arguments" in entry:
+                    entry["arguments"] += ["-idirafter", include]
+                else:
+                    import shlex
+                    entry["command"] += " -idirafter " + shlex.quote(include)
+            merged[str(source)] = entry
+if not merged:
+    raise SystemExit("没有找到编译命令，请先 colcon build --cmake-args -DCMAKE_EXPORT_COMPILE_COMMANDS=ON")
+out.parent.mkdir(parents=True, exist_ok=True)
+tmp = out.with_suffix(".json.tmp")
+tmp.write_text(json.dumps(list(merged.values()), indent=2) + "\n")
+tmp.replace(out)
 print(f"  来源数据库 {len(sources)} 份，条目 {len(merged)} 条")
-PY
+PYTHON
+
+# 为只沿父目录搜索编译库的工具提供入口；不覆盖手动维护的普通文件。
+if [ ! -e "$WS/compile_commands.json" ] || [ -L "$WS/compile_commands.json" ]; then
+  ln -sfn build/compile_commands.json "$WS/compile_commands.json"
+fi
