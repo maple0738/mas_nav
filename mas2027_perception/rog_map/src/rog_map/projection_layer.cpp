@@ -1,4 +1,5 @@
 #include <rog_map/projection_layer.hpp>
+#include <rog_map/undulating_profile.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -8,6 +9,18 @@
 #include <Eigen/LU>
 
 namespace rog_map {
+
+bool preciseSurfaceExplainsColumn(const ColumnStats & stats, double resolution, double max_span)
+{
+  return stats.surface_valid && !stats.surface_conflict && std::isfinite(stats.surface_z) &&
+    std::isfinite(stats.surface_low) && std::isfinite(stats.surface_high) &&
+    stats.surface_low <= stats.surface_z && stats.surface_z <= stats.surface_high &&
+    stats.surface_high - stats.surface_low <= max_span &&
+    stats.occupied_z_max_abs - stats.occupied_z_min_abs <=
+      stats.surface_high - stats.surface_low + resolution + 1e-5 &&
+    stats.occupied_z_min_abs >= stats.surface_low - .5 * resolution - .01 &&
+    stats.occupied_z_max_abs <= stats.surface_high + .5 * resolution + .01;
+}
 
 namespace {
 
@@ -45,7 +58,18 @@ CellType classifyCell(
   }
 
   const int span_steps = stats.occupied_z_index_max - stats.occupied_z_index_min;
-  const double height_delta = static_cast<double>(span_steps) * resolution;
+  // Ground-model evidence accounts for voxel rounding and 1 cm range noise,
+  // with at most one voxel of total span discrepancy. All occupied heights
+  // must be explained; a fresh floor cannot erase a wall/overhang.
+  const bool precise = preciseSurfaceExplainsColumn(stats, resolution, config.surface_height_delta_max);
+  const double height_delta = precise ? stats.surface_high - stats.surface_low :
+    static_cast<double>(span_steps) * resolution;
+  cell.precise_ground_z = precise ? static_cast<float>(stats.surface_z) :
+    std::numeric_limits<float>::quiet_NaN();
+  if (precise) {
+    cell.precise_surface_low = stats.surface_low;
+    cell.precise_surface_high = stats.surface_high;
+  }
   cell.occupied_z_min_abs = static_cast<float>(stats.occupied_z_min_abs);
   cell.occupied_z_max_abs = static_cast<float>(stats.occupied_z_max_abs);
   cell.height_delta = static_cast<float>(height_delta);
@@ -175,6 +199,68 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const
       if (!thinGround(center)) {
         continue;
       }
+
+      // Require repeated waves on three neighboring measured profiles. Unknown
+      // columns and collision barriers never supply support evidence. Only the
+      // semantic label changes; collision masks retain their existing authority.
+      bool undulating = false;
+      constexpr int axes[4][2] = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
+      for (const auto & axis : axes) {
+        // Cheap local reversal gate keeps flat ground and monotonic ramps out
+        // of the longer three-profile check.
+        double low = center.ground_reference_z, high = low, previous = low;
+        int last_sign = 0, measured = 0;
+        bool reversal = false, valid = true;
+        for (int i = -2; i <= 2; ++i) {
+          const int nx = x + i * axis[0], ny = y + i * axis[1];
+          if (nx < 0 || ny < 0 || nx >= width_ || ny >= height_) { valid = false; break; }
+          const auto & sample = cells_[static_cast<size_t>(ny) * width_ + nx];
+          if (sample.type == CellType::OCCUPIED || sample.height_discontinuity) { valid = false; break; }
+          if (!thinGround(sample)) continue;
+          const double z = sample.ground_reference_z;
+          low = std::min(low, z); high = std::max(high, z);
+          if (measured > 0) {
+            const double delta = z - previous;
+            const int sign = delta > .01 ? 1 : delta < -.01 ? -1 : 0;
+            if (sign && last_sign && sign != last_sign) reversal = true;
+            if (sign) last_sign = sign;
+          }
+          previous = z;
+          ++measured;
+        }
+        if (!valid || measured < 3 || !reversal || high - low < .035) continue;
+        bool supported = true;
+        for (int strip = -1; strip <= 1 && supported; ++strip) {
+          std::array<double, 17> profile;
+          profile.fill(std::numeric_limits<double>::quiet_NaN());
+          for (int i = -8; i <= 8; ++i) {
+            const int nx = x + i * axis[0] - strip * axis[1];
+            const int ny = y + i * axis[1] + strip * axis[0];
+            if (nx < 0 || ny < 0 || nx >= width_ || ny >= height_) {
+              supported = false; break;
+            }
+            const auto & sample = cells_[static_cast<size_t>(ny) * width_ + nx];
+            if (sample.type == CellType::OCCUPIED || sample.height_discontinuity) {
+              supported = false; break;
+            }
+            if (thinGround(sample)) profile[i + 8] = sample.ground_reference_z;
+          }
+          if (supported) {
+            const double spacing=resolution_*std::hypot(axis[0],axis[1]);
+            bool wave=isUndulatingProfile(profile,spacing);
+            // A one-cycle near-entry observation can trigger preparation before
+            // the chassis enters. Still require all three neighboring profiles.
+            for(int offset : {0,4}) {
+              std::array<double,13> near;
+              std::copy_n(profile.begin()+offset,13,near.begin());
+              wave=wave||isUndulatingProfile(near,spacing);
+            }
+            supported=wave;
+          }
+        }
+        if (supported) { undulating = true; break; }
+      }
+      if (undulating) { labels[index] = 7U; continue; }
 
       // Fit z = ax + by + c to neighboring thin ground observations. The
       // within-column height span is not a slope measurement.
@@ -601,7 +687,54 @@ void ProjectionLayer::updateOneCell(
   cell.ground_reference_z = previous.ground_reference_z;
   cell.last_hit_time = static_cast<float>(stats.last_hit_time);
   cell.last_update_time = static_cast<float>(stats.last_update_time);
-  const CellType raw_type = classifyCell(stats, cell, config, resolution_);
+  auto measured = stats;
+  // Retain a verified model through sparse revisits and voxel flicker only if
+  // it still explains EVERY occupied height. Contradictory raw evidence and
+  // any obstacle beyond that measured envelope invalidate the model.
+  if (!preciseSurfaceExplainsColumn(stats, resolution_, config.surface_height_delta_max) &&
+      !stats.surface_conflict && stats.occupied_count > 0 &&
+      std::isfinite(previous.precise_ground_z)) {
+    auto retained=stats;
+    retained.surface_valid=true;
+    retained.surface_z=std::clamp(static_cast<double>(previous.precise_ground_z),
+      previous.precise_surface_low,previous.precise_surface_high);
+    retained.surface_low=previous.precise_surface_low;
+    retained.surface_high=previous.precise_surface_high;
+    if (preciseSurfaceExplainsColumn(retained, resolution_, config.surface_height_delta_max))
+      measured=retained;
+  }
+  const CellType raw_type = classifyCell(measured, cell, config, resolution_);
+  // Ground height and whole-column collision geometry have different jobs.
+  // A verified raw ground model can locate the support plane while a stale
+  // lower voxel still keeps the column occupied. Do not change height_delta,
+  // raw_type or the collision decision here; filterGround must independently
+  // validate any thick column before it becomes passable.
+  if (stats.occupied_count > 0 && stats.observed_count >= std::max(1, config.min_observed_voxels) &&
+      stats.surface_valid && !stats.surface_conflict &&
+      std::isfinite(stats.surface_z) && std::isfinite(stats.surface_low) &&
+      std::isfinite(stats.surface_high) && stats.surface_low <= stats.surface_z &&
+      stats.surface_z <= stats.surface_high &&
+      stats.surface_high-stats.surface_low <= config.surface_height_delta_max) {
+    cell.precise_ground_z = static_cast<float>(stats.surface_z);
+    cell.precise_surface_low = stats.surface_low;
+    cell.precise_surface_high = stats.surface_high;
+  }
+  // Ray clearing can temporarily remove the occupied voxel while its measured
+  // support height is retained. Refresh that existing height from direct raw
+  // returns too, rather than comparing a stale rounded low point to a refined
+  // neighboring crest. This neither creates ground in ray-only cells nor
+  // changes the occupancy classification.
+  if (raw_type == CellType::FREE && std::isfinite(previous.ground_reference_z) &&
+      stats.surface_valid && !stats.surface_conflict &&
+      std::isfinite(stats.surface_z) && std::isfinite(stats.surface_low) &&
+      std::isfinite(stats.surface_high) && stats.surface_low <= stats.surface_z &&
+      stats.surface_z <= stats.surface_high &&
+      stats.surface_high-stats.surface_low <= config.surface_height_delta_max) {
+    cell.precise_ground_z = static_cast<float>(stats.surface_z);
+    cell.precise_surface_low = stats.surface_low;
+    cell.precise_surface_high = stats.surface_high;
+    cell.ground_reference_z = cell.precise_ground_z;
+  }
   cell.raw_type = raw_type;
   cell.base_type = previous.base_type;
   cell.pending_type = previous.pending_type;
@@ -753,7 +886,8 @@ void ProjectionLayer::filterMask(
       if (std::isfinite(cell.occupied_z_min_abs) &&
           (cell.base_type == CellType::PASSABLE ||
            cell.base_type == CellType::OCCUPIED))
-        cell.ground_reference_z = cell.occupied_z_min_abs;
+        cell.ground_reference_z = std::isfinite(cell.precise_ground_z) ?
+          cell.precise_ground_z : cell.occupied_z_min_abs;
       cell.height_discontinuity = false;
       cell.height_discontinuity_measured = false;
     }

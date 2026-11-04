@@ -317,6 +317,149 @@ TEST(OnlineGlobalMap, SparseEnclosingGroundCorrectsRememberedGapButStepsAndOneSi
   }
 }
 
+TEST(OnlineGlobalMap, VerifiedNonplanarGroundClearsOldQuantizationEdgeButNotStepsOrOneSidedReturns)
+{
+  constexpr int size=31,center=15;constexpr double res=.05;
+  for(int scenario=0;scenario<6;++scenario) {
+    OnlineGlobalMapConfig cfg;cfg.resolution=res;OnlineGlobalMap map(cfg,"odom");
+    auto edge=source(1,0,0,1,size,size,res);edge.raw_types=edge.types;
+    edge.height_discontinuities.assign(size*size,0U);
+    const size_t target=center*size+center;
+    edge.types[target]=3;edge.values[target]=254;edge.height_discontinuities[target]=1;
+    ASSERT_EQ(map.update(edge),Result::UPDATED);
+    auto floor=source(2,0,0,1,size,size,res);floor.raw_types=floor.types;
+    floor.ground_heights.assign(size*size,std::numeric_limits<float>::quiet_NaN());
+    floor.height_discontinuities.assign(size*size,0U);
+    floor.ground_precise.assign(size*size,0U);
+    for(int dy=-3;dy<=3;++dy) for(int dx=-3;dx<=3;++dx) {
+      if((dx==1&&dy==1)||(scenario==2&&dx>0)) continue;
+      const size_t i=(center+dy)*size+center+dx;
+      floor.types[i]=floor.raw_types[i]=scenario>=4?1:2;
+      floor.ground_heights[i]=scenario==1?(dx>=0?.1F:0.F):
+        static_cast<float>(.035*std::sin(2*3.14159265358979323846*dx*res/.24+1.5));
+      floor.ground_precise[i]=1;
+    }
+    if(scenario==3 || scenario==5) floor.ground_precise.clear();
+    ASSERT_EQ(map.update(floor),Result::UPDATED);
+    EXPECT_EQ(valueAt(map.snapshot(),.775,.775),254U);
+    floor.sequence=3;floor.stamp=3;
+    ASSERT_EQ(map.update(floor),Result::UPDATED);
+    EXPECT_EQ(valueAt(map.snapshot(),.775,.775),(scenario==0 || scenario==4)?0U:254U) << scenario;
+  }
+}
+
+TEST(OnlineGlobalMap, PersistentQuantizedEdgeOnMeasuredWaveClearsButStepsAndWallsDoNot)
+{
+  constexpr int size = 41, center = 20;
+  constexpr double res = .05;
+  for (int scenario = 0; scenario < 4; ++scenario) {
+    OnlineGlobalMapConfig config;
+    config.resolution = res;
+    OnlineGlobalMap map(config, "odom");
+    const auto snapshot = [&](uint64_t sequence) {
+      auto s = source(sequence, 0, 0, 2, size, size, res);
+      s.raw_types = s.types;
+      s.ground_heights.assign(size * size, std::numeric_limits<float>::quiet_NaN());
+      s.ground_precise.assign(size * size, 0U);
+      s.height_discontinuities.assign(size * size, 0U);
+      s.max_step_height = .08;
+      for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
+        const size_t i = static_cast<size_t>(y) * size + x;
+        double z = .04 + .035 * (1 - std::cos(2 * 3.14159265358979323846 * x * res / .24));
+        if (scenario == 1) z = x < center ? 0.0 : .10;
+        if (scenario == 2 && x < center) continue;  // one-sided support
+        s.ground_heights[i] = static_cast<float>(z);
+        s.ground_precise[i] = 1U;
+      }
+      const size_t target = static_cast<size_t>(center) * size + center;
+      s.ground_heights[target] = .025F;  // stale rounded low column
+      s.ground_precise[target] = 0U;
+      s.types[target] = 3U; s.values[target] = 254U;
+      s.raw_types[target] = scenario == 3 ? 3U : 1U;
+      s.height_discontinuities[target] = 1U;
+      return s;
+    };
+    ASSERT_EQ(map.update(snapshot(1)), Result::UPDATED);
+    // Establish the remembered edge without height evidence, matching a
+    // barrier left by an earlier sparse/quantized observation.
+    auto barrier = snapshot(1);
+    barrier.ground_precise.clear();
+    barrier.sequence = 2; barrier.stamp = 2;
+    ASSERT_EQ(map.update(barrier), Result::UPDATED);
+    EXPECT_EQ(valueAt(map.snapshot(), 1.025, 1.025), 254U);
+    ASSERT_EQ(map.update(snapshot(3)), Result::UPDATED);
+    ASSERT_EQ(map.update(snapshot(4)), Result::UPDATED);
+    ASSERT_EQ(map.update(snapshot(5)), Result::UPDATED);
+    EXPECT_EQ(valueAt(map.snapshot(), 1.025, 1.025), scenario == 0 ? 0U : 254U)
+      << scenario;
+  }
+}
+
+TEST(OnlineGlobalMap, ConfirmedWaveLabelClearsRememberedQuantizationEdgeWithoutPreciseHeights)
+{
+  constexpr int size = 41, center = 20;
+  constexpr double res = .05;
+  const auto snapshot = [&](uint64_t sequence, bool labelled) {
+    auto s = source(sequence, 0, 0, 2, size, size, res);
+    s.raw_types = s.types;
+    s.ground_heights.assign(size * size, std::numeric_limits<float>::quiet_NaN());
+    s.height_discontinuities.assign(size * size, 0U);
+    s.max_step_height = .08;
+    for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
+      const size_t i = static_cast<size_t>(y) * size + x;
+      s.ground_heights[i] = static_cast<float>(
+        .04 + .035 * (1 - std::cos(2 * 3.14159265358979323846 * x * res / .24)));
+    }
+    const size_t target = static_cast<size_t>(center) * size + center;
+    s.ground_heights[target] = .025F;
+    s.types[target] = 3U; s.values[target] = 254U; s.raw_types[target] = 1U;
+    s.height_discontinuities[target] = 1U;
+    if (labelled) {
+      s.terrain_labels.assign(size * size, 0U);
+      s.uphill_x.assign(size * size, 0.0F);
+      s.uphill_y.assign(size * size, 0.0F);
+      for (size_t i = 0; i < s.terrain_labels.size(); ++i) s.terrain_labels[i] = 7U;
+    }
+    return s;
+  };
+  OnlineGlobalMapConfig config;
+  config.resolution = res;
+  OnlineGlobalMap map(config, "odom");
+  ASSERT_EQ(map.update(snapshot(1, false)), Result::UPDATED);
+  EXPECT_EQ(valueAt(map.snapshot(), 1.025, 1.025), 254U);
+  ASSERT_EQ(map.update(snapshot(2, true)), Result::UPDATED);
+  ASSERT_EQ(map.update(snapshot(3, true)), Result::UPDATED);
+  ASSERT_EQ(map.update(snapshot(4, true)), Result::UPDATED);
+  EXPECT_EQ(valueAt(map.snapshot(), 1.025, 1.025), 0U);
+}
+
+TEST(OnlineGlobalMap, ConfirmedWaveStripLatchesFixedLengthCorridorForSparseFrames)
+{
+  constexpr int size = 81;
+  constexpr double res = .05;
+  OnlineGlobalMap map(immediateConfig(), "odom");
+  auto first = source(1, 0, 0, 2, size, size, res);
+  first.terrain_labels.assign(size * size, 0U);
+  first.uphill_x.assign(size * size, 0.0F);
+  first.uphill_y.assign(size * size, 0.0F);
+  for (int y = 0; y < size; ++y) for (int x = 20; x <= 22; ++x)
+    first.terrain_labels[static_cast<size_t>(y) * size + x] = 7U;
+  map.setWaveTravelDirection({1.0, 0.0});
+  ASSERT_EQ(map.update(first), Result::UPDATED);
+  ASSERT_TRUE(map.snapshot());
+  EXPECT_TRUE(map.snapshot()->nearWave(0.5, 2.0, 0.0));
+  EXPECT_TRUE(map.snapshot()->nearWave(2.5, 2.0, 0.0));
+
+  // The next frames contain no label 7 at all; the fixed corridor must stay.
+  auto later = source(2, 0, 0, 2, size, size, res);
+  later.terrain_labels.assign(size * size, 0U);
+  later.uphill_x.assign(size * size, 0.0F);
+  later.uphill_y.assign(size * size, 0.0F);
+  ASSERT_EQ(map.update(later), Result::UPDATED);
+  EXPECT_TRUE(map.snapshot()->nearWave(2.5, 2.0, 0.0));
+  EXPECT_FALSE(map.snapshot()->nearWave(8.0, 2.0, 0.0));
+}
+
 TEST(OnlineGlobalMap, MirroredPlatformsUseOnlyTheirContinuousCornerRampInBothDirections)
 {
   constexpr int size = 61;

@@ -10,3 +10,7 @@ uint8 mode
 float32 small_yaw_ref
 # Request follow-gimbal mode: true=enter/hold following, false=no request.
 bool follow_gimbal
+
+# Simulation-only: interpret small_yaw_ref as an absolute odom-frame heading.
+# The maintained lower board keeps the relative semantics above.
+bool absolute_yaw_ref

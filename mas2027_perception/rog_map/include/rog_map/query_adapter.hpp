@@ -36,6 +36,8 @@ struct MapSnapshot
   // Observed support heights and height-jump barriers are geometric evidence,
   // unlike morphology-filled obstacles. Keep their provenance for history.
   std::vector<float> ground_heights;
+  // Optional provenance: height verified by the raw sub-voxel ground model.
+  std::vector<uint8_t> ground_precise;
   // 0 none, 1 measured adjacent jump, 2 inferred inside a bridged FREE gap.
   std::vector<uint8_t> height_discontinuities;
   double max_step_height{0.08};

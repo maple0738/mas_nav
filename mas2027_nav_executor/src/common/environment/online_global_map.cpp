@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <cstring>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <utility>
 
 #include <opencv2/imgproc.hpp>
 #include <Eigen/LU>
+#include <Eigen/Eigenvalues>
 #include "rclcpp/time.hpp"
 #include "rog_map/query_adapter.hpp"
 #include "mas2027_nav_executor/common/environment/terrain_semantics.hpp"
@@ -46,6 +48,73 @@ std::shared_ptr<const std::vector<double>> buildField(const nav_msgs::msg::Occup
     (*distances)[i] = std::clamp(distance, kMinDistance, kMaxDistance);
   }
   return distances;
+}
+
+// A quantized 50 mm column can sit one voxel below its true surface, so two
+// neighboring columns may differ by more than the step threshold even on a
+// continuous grade. Around a direct height edge, test the independently
+// measured precise ground on BOTH sides with a local plane. Repeated waves
+// fit a plane within a few centimetres; a real step or one-sided return does
+// not. The edge cell itself is excluded: its height is exactly what is under
+// suspicion. This never uses ray-only support or the semantic terrain label.
+bool smoothMeasuredGround(const rog_map::MapSnapshot & source, int sx, int sy,
+  const std::function<bool(int, int)> & fresh_ground)
+{
+  if (source.ground_heights.empty()) return false;
+  constexpr int radius = 4;  // 0.2 m at the 50 mm input resolution.
+  constexpr double max_gap = 0.030;
+  constexpr double max_range = 0.090;
+  constexpr double max_slope = 0.70;
+  Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
+  Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
+  std::vector<double> heights;
+  std::vector<double> bearings;
+  double low = std::numeric_limits<double>::infinity();
+  double high = -low;
+  int count = 0;
+  for (int dy = -radius; dy <= radius; ++dy) {
+    for (int dx = -radius; dx <= radius; ++dx) {
+      const int x = sx + dx, y = sy + dy;
+      if (x < 0 || y < 0 || x >= source.width || y >= source.height) continue;
+      const size_t i = static_cast<size_t>(y) * source.width + x;
+      const uint8_t raw = source.raw_types.empty() ? source.types[i] : source.raw_types[i];
+      // Enclosure may use rounded free/ground columns, but never a real
+      // obstacle column or a ray-only unknown cell.
+      if (raw != 3U && std::isfinite(source.ground_heights[i]) && (dx || dy))
+        bearings.push_back(std::atan2(dy, dx));
+      if (!fresh_ground(x, y)) continue;
+      if (!source.height_discontinuities.empty() && source.height_discontinuities[i] != 0U) continue;
+      if (source.ground_precise.empty() || source.ground_precise[i] != 1U) continue;
+      const double z = source.ground_heights[i];
+      if (!std::isfinite(z)) continue;
+      const Eigen::Vector3d row(dx * source.resolution, dy * source.resolution, 1.0);
+      normal.noalias() += row * row.transpose();
+      rhs.noalias() += row * z;
+      heights.push_back(z);
+      low = std::min(low, z); high = std::max(high, z);
+      ++count;
+    }
+  }
+  if (count < 8 || bearings.size() < 8) return false;
+  // Reject a one-sided scan: support must surround the cell, not just form a
+  // line or half-plane whose two levels could masquerade as a grade.
+  std::sort(bearings.begin(), bearings.end());
+  constexpr double pi = 3.14159265358979323846;
+  double angular_gap = bearings.front() + 2 * pi - bearings.back();
+  for (size_t i = 1; i < bearings.size(); ++i)
+    angular_gap = std::max(angular_gap, bearings[i] - bearings[i - 1]);
+  if (angular_gap >= pi - 1e-6) return false;
+  // A continuous grade spans its heights densely. A real step leaves a wide
+  // empty interval between the two levels; excluding the suspect edge column
+  // prevents its stale rounded value from filling that interval.
+  std::sort(heights.begin(), heights.end());
+  double largest_gap = 0.0;
+  for (size_t i = 1; i < heights.size(); ++i)
+    largest_gap = std::max(largest_gap, heights[i] - heights[i - 1]);
+  if (largest_gap > max_gap || high - low > max_range) return false;
+  if (std::abs(normal.determinant()) < 1e-9) return false;
+  const Eigen::Vector3d plane = normal.fullPivLu().solve(rhs);
+  return plane.allFinite() && plane.head<2>().norm() <= max_slope;
 }
 
 }  // namespace
@@ -97,17 +166,49 @@ nav_msgs::msg::OccupancyGrid OnlineGlobalMapSnapshot::heightGrid() const
   return result;
 }
 
+bool OnlineGlobalMapSnapshot::nearWave(double x, double y, double radius) const
+{
+  if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(radius) || radius < 0.0)
+    return false;
+  // A confirmed wave fixes a corridor for the rest of its known length. This
+  // is the map-side counterpart of the region controller's alignment latch:
+  // later sparse or missing labels must not re-open height barriers.
+  if (wave_latch_ && wave_latch_length_ > 0.0 && wave_latch_half_width_ > 0.0) {
+    const Eigen::Vector2d delta(x - wave_latch_start_.x(), y - wave_latch_start_.y());
+    const double along = delta.dot(wave_latch_dir_);
+    const double lateral = std::abs(delta.x() * wave_latch_dir_.y() -
+      delta.y() * wave_latch_dir_.x());
+    if (along >= -0.2 && along <= wave_latch_length_ && lateral <= wave_latch_half_width_)
+      return true;
+  }
+  if (terrain_labels_.empty()) return false;
+  unsigned int mx = 0, my = 0;
+  if (!worldToMap(x, y, mx, my)) return false;
+  const int cells = std::max(1, static_cast<int>(std::ceil(radius / resolution_)));
+  for (int dy = -cells; dy <= cells; ++dy) for (int dx = -cells; dx <= cells; ++dx) {
+    const int nx = static_cast<int>(mx) + dx, ny = static_cast<int>(my) + dy;
+    if (nx < 0 || ny < 0 || nx >= static_cast<int>(sizeX()) || ny >= static_cast<int>(sizeY()))
+      continue;
+    if (terrain_labels_[static_cast<size_t>(ny) * sizeX() + nx] == 7U) return true;
+  }
+  return false;
+}
+
 bool OnlineGlobalMapSnapshot::terrainTransition(double from_x, double from_y,
   double to_x, double to_y, double height_clearance,
   std::optional<Eigen::Vector2d> clearance_origin) const
 {
   if (!terrainSideTransitionAllowed(static_cast<int>(sizeX()),
     static_cast<int>(sizeY()), resolution_, originX(), originY(), slope_side_mask_,
-    from_x, from_y, to_x, to_y, false) ||
-    !terrainSideTransitionAllowed(static_cast<int>(sizeX()),
+    from_x, from_y, to_x, to_y, false)) return false;
+  // A confirmed repeated-wave patch carries continuous thin ground. Its
+  // quantized height jumps are not steps; keep the occupancy and slope-side
+  // masks authoritative and skip only height-discontinuity evidence here.
+  const bool wave = nearWave(from_x, from_y, 0.80) && nearWave(to_x, to_y, 0.80);
+  if (!wave && !terrainSideTransitionAllowed(static_cast<int>(sizeX()),
       static_cast<int>(sizeY()), resolution_, originX(), originY(), height_discontinuity_mask_,
       from_x, from_y, to_x, to_y, false)) return false;
-  if (height_clearance <= 0.0) return true;
+  if (wave || height_clearance <= 0.0) return true;
   const auto initial = clearance_origin ? queryHeight(
     {clearance_origin->x(), clearance_origin->y(), 0.0}) : rog_map::QueryResult{};
   // Reuse the existing near-field rule when new observations find the robot
@@ -234,6 +335,14 @@ std::shared_ptr<OnlineGlobalMapSnapshot> OnlineGlobalMap::snapshot() const
   return snapshot_;
 }
 
+void OnlineGlobalMap::setWaveTravelDirection(const Eigen::Vector2d & direction)
+{
+  if (!direction.allFinite() || direction.norm() < 1e-9) return;
+  std::lock_guard<std::mutex> lock(wave_direction_mutex_);
+  wave_travel_direction_ = direction.normalized();
+  wave_travel_direction_valid_ = true;
+}
+
 OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot & source)
 {
   if (source.width <= 0 || source.height <= 0 || !std::isfinite(source.resolution) ||
@@ -248,6 +357,8 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
     (!source.raw_types.empty() && source.raw_types.size() != source_count) ||
     (!source.height_deltas.empty() && source.height_deltas.size() != source_count) ||
     (!source.ground_heights.empty() && source.ground_heights.size() != source_count) ||
+    (!source.ground_precise.empty() &&
+      (source.ground_precise.size() != source_count || source.ground_heights.empty())) ||
     (!source.height_discontinuities.empty() && source.height_discontinuities.size() != source_count) ||
     ((!source.ground_heights.empty() || !source.height_discontinuities.empty()) &&
       (!std::isfinite(source.max_step_height) || source.max_step_height <= 0.0)) ||
@@ -288,6 +399,12 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
     // Occupied for a reason other than a gap-inferred height barrier.
     bool occupied_not_inferred{false};
     unsigned int continuous_ground_count{0};
+    unsigned int measured_edges{0};
+    unsigned int inferred_edges{0};
+    unsigned int thick_edges{0};
+    unsigned int real_occupied{0};
+    unsigned int soft_occupied{0};
+    bool clear_wave_barrier{false};
   };
   std::vector<Observation> observations(static_cast<size_t>(ow) * oh);
   const auto ground_history = snapshot();
@@ -296,9 +413,12 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
       x >= source.width || y >= source.height) return false;
     const size_t i = static_cast<size_t>(y) * source.width + x;
     const uint8_t raw = source.raw_types.empty() ? source.types[i] : source.raw_types[i];
-    return raw == 2U && source.types[i] != 3U && source.values[i] < 253U &&
+    const bool measured_support = raw == 2U ||
+      (raw == 1U && !source.ground_precise.empty() && source.ground_precise[i] == 1U);
+    return measured_support && source.types[i] != 3U && source.values[i] < 253U &&
       std::isfinite(source.ground_heights[i]) &&
-      (source.height_deltas.empty() || (std::isfinite(source.height_deltas[i]) &&
+      ((!source.ground_precise.empty() && source.ground_precise[i] == 1U) ||
+       source.height_deltas.empty() || (std::isfinite(source.height_deltas[i]) &&
         source.height_deltas[i] <= source.max_step_height));
   };
   const auto continuous_ground = [&source, &fresh_ground, &ground_history](int x, int y) {
@@ -318,6 +438,31 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
         source.origin_y + (y + 0.5) * source.resolution, hx, hy) ||
       !ground_history->heightDiscontinuityMask()[static_cast<size_t>(hy) * ground_history->sizeX() + hx])
       return false;
+    // A bounded, measured non-planar patch can disprove a quantization edge.
+    // Require a verified center and enclosing verified returns; semantic label
+    // 7 alone never clears a barrier, and one-sided/unknown support cannot do so.
+    const size_t center=static_cast<size_t>(y)*source.width+x;
+    if (!source.ground_precise.empty() && source.ground_precise[center]==1U && fresh_ground(x,y)) {
+      double low=source.ground_heights[center],high=low;
+      int count=0;bool blocked=false;std::vector<double> bearings;
+      for(int dy=-3;dy<=3;++dy) for(int dx=-3;dx<=3;++dx) {
+        const int nx=x+dx,ny=y+dy;
+        if(nx<0||ny<0||nx>=source.width||ny>=source.height) continue;
+        const size_t i=static_cast<size_t>(ny)*source.width+nx;
+        if(source.values[i]>=253U && source.types[i]==3U) blocked=true;
+        if(source.ground_precise[i]!=1U || !fresh_ground(nx,ny)) continue;
+        low=std::min(low,static_cast<double>(source.ground_heights[i]));
+        high=std::max(high,static_cast<double>(source.ground_heights[i]));
+        ++count;if(dx||dy) bearings.push_back(std::atan2(dy,dx));
+      }
+      if(!blocked && count>=6 && bearings.size()>=3 && high-low<=source.max_step_height+1e-6) {
+        std::sort(bearings.begin(),bearings.end());
+        constexpr double pi=3.14159265358979323846;
+        double gap=bearings.front()+2*pi-bearings.back();
+        for(size_t i=1;i<bearings.size();++i) gap=std::max(gap,bearings[i]-bearings[i-1]);
+        if(gap<pi-1e-6) return true;
+      }
+    }
     // Lidar rings and the body blind spot need not produce a dense 3x3
     // return. Correct a remembered gap only with an enclosing, measured local
     // plane. One-sided support or the two levels of a step cannot clear it.
@@ -352,6 +497,7 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
     for (int x = 0; x < source.width; ++x) {
       const size_t i = static_cast<size_t>(y) * source.width + x;
       const uint8_t type = source.types[i];
+      if (!source.ground_precise.empty() && source.ground_precise[i]>1U) return UpdateResult::INVALID_INPUT;
       if (type > 3U) return UpdateResult::INVALID_INPUT;
       if (!source.height_discontinuities.empty() && source.height_discontinuities[i] > 2U)
         return UpdateResult::INVALID_INPUT;
@@ -376,6 +522,11 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
       observation.height_discontinuity = observation.height_discontinuity || height_edge;
       observation.height_measured = observation.height_measured ||
         (height_edge && source.height_discontinuities[i] == 1U);
+      if (height_edge) {
+        if (source.height_discontinuities[i] == 1U) ++observation.measured_edges;
+        else ++observation.inferred_edges;
+        if (raw_type == 3U) ++observation.thick_edges;
+      }
       if (!height_edge && continuous_ground(x, y)) ++observation.continuous_ground_count;
       if (!source.terrain_labels.empty() &&
           (source.terrain_labels[i] == 5U || source.terrain_labels[i] == 6U ||
@@ -399,6 +550,10 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
       }
       if (type == 3U || source.values[i] >= 253U) {
         observation.occupied = true;
+        if (!height_edge) {
+          if (raw_type == 3U) ++observation.real_occupied;
+          else ++observation.soft_occupied;
+        }
         const bool inferred_only = height_edge && source.height_discontinuities[i] == 2U &&
           raw_type != 3U;
         observation.occupied_not_inferred = observation.occupied_not_inferred || !inferred_only;
@@ -414,11 +569,162 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
     }
   }
   const auto free_coverage = static_cast<unsigned int>(std::round(ratio) * std::round(ratio));
+  // A direct edge between two rounded columns, or a barrier left by one, is
+  // only kept after independently measured precise ground around it has been
+  // checked. Repeated waves are smooth; a step, wall, or one-sided scan is not.
+  // Collision occupancy stays authoritative: thick/real obstacles and inferred
+  // gap edges are never eligible, and only thin measured ground is considered.
+  for (int y = 0; y < oh; ++y) {
+    for (int x = 0; x < ow; ++x) {
+      auto & o = observations[static_cast<size_t>(y) * ow + x];
+      if (o.thick_edges != 0 || o.real_occupied != 0 || o.inferred_edges != 0) continue;
+      if (!o.height_discontinuity && o.soft_occupied == 0 &&
+        o.free_count + o.measured_edges < free_coverage) continue;
+      const double wx = (bx + x + 0.5) * config_.resolution;
+      const double wy = (by + y + 0.5) * config_.resolution;
+      bool remembered = false;
+      if (ground_history) {
+        unsigned int hx = 0, hy = 0;
+        remembered = ground_history->worldToMap(wx, wy, hx, hy) &&
+          ground_history->heightDiscontinuityMask()[
+            static_cast<size_t>(hy) * ground_history->sizeX() + hx] != 0U;
+      }
+      if (!o.height_discontinuity && !remembered) continue;
+      const int sx = static_cast<int>(std::floor((wx - source.origin_x) / source.resolution));
+      const int sy = static_cast<int>(std::floor((wy - source.origin_y) / source.resolution));
+      // The repeated-wave detector is a second, independent witness. It only
+      // covers verified alternating profiles, so a single step or wall cannot
+      // acquire it. Check the current scan and the confirmed history labels.
+      bool wave_support = false;
+      if (!source.terrain_labels.empty()) {
+        for (int dy = -8; dy <= 8 && !wave_support; ++dy) {
+          for (int dx = -8; dx <= 8; ++dx) {
+            const int nx = sx + dx, ny = sy + dy;
+            if (nx < 0 || ny < 0 || nx >= source.width || ny >= source.height) continue;
+            if (source.terrain_labels[static_cast<size_t>(ny) * source.width + nx] == 7U) {
+              wave_support = true;
+              break;
+            }
+          }
+        }
+      }
+      if (!wave_support && ground_history) {
+        for (int dy = -4; dy <= 4 && !wave_support; ++dy) {
+          for (int dx = -4; dx <= 4; ++dx) {
+            unsigned int hx = 0, hy = 0;
+            if (!ground_history->worldToMap(wx + dx * config_.resolution,
+                wy + dy * config_.resolution, hx, hy)) continue;
+            if (ground_history->terrainLabel(hx, hy) == 7U) {
+              wave_support = true;
+              break;
+            }
+          }
+        }
+      }
+      if (!wave_support && !smoothMeasuredGround(source, sx, sy, fresh_ground)) continue;
+      o.clear_wave_barrier = wave_support;
+      if (o.height_discontinuity) {
+        o.height_discontinuity = false;
+        o.height_measured = false;
+        o.measured_edges = 0;
+        o.occupied = false;
+      }
+      // A rounded type-3 cell without a measured height edge is likely mask
+      // inflation from a neighboring obstacle. Clear only its stale height
+      // barrier; keep its occupancy so collision safety is unchanged.
+      if (!o.occupied) {
+        o.continuous_ground_count = std::max(o.continuous_ground_count, free_coverage);
+        o.free_count = std::max(o.free_count, free_coverage);
+      }
+    }
+  }
+  // Confirm once, latch a world-fixed corridor for the known segment length.
+  // The field's undulating strip is fixed length; requiring a label on every
+  // cell made the last metres depend on sensor view and reopened old barriers.
+  if (!source.terrain_labels.empty()) {
+    std::vector<Eigen::Vector2d> wave_points;
+    for (int y = 0; y < source.height; ++y) for (int x = 0; x < source.width; ++x) {
+      if (source.terrain_labels[static_cast<size_t>(y) * source.width + x] != 7U) continue;
+      wave_points.emplace_back(source.origin_x + (x + 0.5) * source.resolution,
+        source.origin_y + (y + 0.5) * source.resolution);
+    }
+    if (wave_points.size() >= 3) {
+      Eigen::Vector2d mean = Eigen::Vector2d::Zero();
+      for (const auto & point : wave_points) mean += point;
+      mean /= static_cast<double>(wave_points.size());
+      Eigen::Vector2d direction = Eigen::Vector2d::UnitX();
+      bool directed = false;
+      {
+        std::lock_guard<std::mutex> lock(wave_direction_mutex_);
+        if (wave_travel_direction_valid_) {
+          direction = wave_travel_direction_;
+          directed = true;
+        }
+      }
+      bool direction_ready = directed;
+      if (!direction_ready) {
+        Eigen::Matrix2d covariance = Eigen::Matrix2d::Zero();
+        for (const auto & point : wave_points) {
+          const Eigen::Vector2d delta = point - mean;
+          covariance.noalias() += delta * delta.transpose();
+        }
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> solver(covariance);
+        if (solver.info() == Eigen::Success) {
+          direction = solver.eigenvectors().col(1);
+          if (direction.allFinite() && direction.norm() > 1e-9) {
+            direction.normalize();
+            direction_ready = true;
+          }
+        }
+      }
+      if (direction_ready) {
+        double low = std::numeric_limits<double>::infinity();
+        double high = -low, half_width = 0.0;
+        for (const auto & point : wave_points) {
+          const Eigen::Vector2d delta = point - mean;
+          const double along = delta.dot(direction);
+          const double lateral = std::abs(delta.x() * direction.y() -
+            delta.y() * direction.x());
+          low = std::min(low, along); high = std::max(high, along);
+          half_width = std::max(half_width, lateral);
+        }
+        if (directed || high - low >= 0.40) {
+          // The field's strip has a known length. Once any part is confirmed,
+          // extend forward from its entry by the traversal allowance rather
+          // than waiting for labels at every metre.
+          constexpr double kBackwardExtension = 1.0;
+          constexpr double kForwardExtension = 3.8;
+          wave_latch_active_ = true;
+          wave_latch_start_ = mean + (low - kBackwardExtension) * direction;
+          wave_latch_dir_ = direction;
+          wave_latch_length_ = (high - low) + kBackwardExtension + kForwardExtension;
+          wave_latch_half_width_ = std::min(0.75, std::max(0.55, half_width + 0.15));
+          wave_latch_stamp_ = source.stamp;
+        }
+      }
+    } else if (wave_latch_active_ && source.stamp - wave_latch_stamp_ > 30.0) {
+      wave_latch_active_ = false;
+    }
+  } else if (wave_latch_active_ && source.stamp - wave_latch_stamp_ > 30.0) {
+    wave_latch_active_ = false;
+  }
+  const auto in_wave_corridor = [this](double x, double y) {
+    if (!wave_latch_active_ || wave_latch_length_ <= 0.0 || wave_latch_half_width_ <= 0.0)
+      return false;
+    const Eigen::Vector2d delta(x - wave_latch_start_.x(), y - wave_latch_start_.y());
+    const double along = delta.dot(wave_latch_dir_);
+    const double lateral = std::abs(delta.x() * wave_latch_dir_.y() -
+      delta.y() * wave_latch_dir_.x());
+    return along >= -0.2 && along <= wave_latch_length_ && lateral <= wave_latch_half_width_;
+  };
   int min_x = ex + 1, min_y = ey + 1, max_x = bx - 1, max_y = by - 1;
   for (int y = 0; y < oh; ++y) {
     for (int x = 0; x < ow; ++x) {
       const auto & o = observations[static_cast<size_t>(y) * ow + x];
-      if (!o.occupied && o.free_count < free_coverage && o.terrain_label == 255U) continue;
+      const bool corridor = in_wave_corridor((bx + x + 0.5) * config_.resolution,
+        (by + y + 0.5) * config_.resolution);
+      if (!corridor && !o.occupied && o.free_count < free_coverage &&
+        o.terrain_label == 255U) continue;
       min_x = std::min(min_x, bx + x); min_y = std::min(min_y, by + y);
       max_x = std::max(max_x, bx + x); max_y = std::max(max_y, by + y);
     }
@@ -445,9 +751,27 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
   }
   for (int y = 0; y < oh; ++y) {
     for (int x = 0; x < ow; ++x) {
-      const auto & o = observations[static_cast<size_t>(y) * ow + x];
-      if (!o.occupied && o.free_count < free_coverage && o.terrain_label == 255U) continue;
+      auto & o = observations[static_cast<size_t>(y) * ow + x];
+      const bool corridor = in_wave_corridor((bx + x + 0.5) * config_.resolution,
+        (by + y + 0.5) * config_.resolution);
+      if (!corridor && !o.occupied && o.free_count < free_coverage &&
+        o.terrain_label == 255U) continue;
       auto & cell = next_cells[static_cast<size_t>(by + y - ny) * width + bx + x - nx];
+      // The latched corridor is a confirmed fixed-length wave. Clear only its
+      // height-jump evidence; real obstacle columns and their occupancy stay.
+      if (corridor && o.thick_edges == 0 && o.real_occupied == 0) {
+        // The latched strip is known drivable ground. Keep raw type-3 measured
+        // obstacles, but a quantized/filled/inferred column must not push the
+        // path toward the wave edge.
+        cell.height_discontinuity = false;
+        cell.height_clear_hits = 0;
+        cell.last_height_clear_stamp = 0.0;
+        o.height_discontinuity = false;
+        o.height_measured = false;
+        o.occupied = false;
+        o.free_count = std::max(o.free_count, free_coverage);
+        o.continuous_ground_count = std::max(o.continuous_ground_count, free_coverage);
+      }
       // A measured drop is not a transient filled/held obstacle. Preserve it
       // through sliding and free rays; clear only after fresh, fully covered
       // continuous ground has been observed on consecutive snapshots.
@@ -457,7 +781,14 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
       // span closed narrow landings: their interior is repainted every frame,
       // so it can never be re-observed as continuous ground and cleared.
       const bool inferred_only = o.height_discontinuity && !o.height_measured;
-      if (inferred_only) {
+      if (o.clear_wave_barrier) {
+        // The repeated-wave witness covers a whole local patch; waiting for
+        // two consecutive frames would let a single spurious edge re-latch the
+        // barrier. Collision occupancy is still handled independently.
+        cell.height_discontinuity = false;
+        cell.height_clear_hits = 0;
+        cell.last_height_clear_stamp = 0.0;
+      } else if (inferred_only) {
         // History and its clearing progress are intentionally unchanged.
       } else if (o.height_discontinuity) {
         cell.height_discontinuity = true;
@@ -551,6 +882,11 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
   auto next = std::make_shared<OnlineGlobalMapSnapshot>();
   next->revision_ = previous ? previous->revision_ + 1 : 1;
   next->resolution_ = config_.resolution; next->stamp_ = source.stamp;
+  next->wave_latch_ = wave_latch_active_;
+  next->wave_latch_start_ = wave_latch_start_;
+  next->wave_latch_dir_ = wave_latch_dir_;
+  next->wave_latch_length_ = wave_latch_length_;
+  next->wave_latch_half_width_ = wave_latch_half_width_;
   auto & grid = next->grid_;
   grid.header.frame_id = frame_;
   grid.header.stamp = rclcpp::Time(static_cast<int64_t>(source.stamp * 1e9));

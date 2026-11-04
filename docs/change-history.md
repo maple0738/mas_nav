@@ -2,6 +2,38 @@
 
 本文件记录由开发任务产生的代码、配置、脚本、资源和文档变更。新记录追加在最上方，不改写旧记录。
 
+## 2026-11-04 — 起伏路实车交付：锁存默认启用，爬行接管默认关闭
+
+- 保持“识别到 label 7 后按定长 3.2 m 锁存 mode 7 + 路径切线对齐”的实车默认行为；`region_control.undulating.crawl_enable` 默认 false，实车继续走正常全局/局部规划，不使用仿真里的低速中心线接管。
+- `crawl_speed=0.30` 与 `absolute_yaw_ref` 保留为仿真/台架可选路径；`MAS_NAV_SIM_KINEMATIC=1` 仅用于导航链路验收（无接触/无重力），不代表轮胎或实车通过性。
+- 验证：在线地图 28、在线导航 38、区域优先级 13、区域对齐 30 项通过；`run-0aw` 运动学模式到达终点并穿越 12 个波纹格段。实车测试前需重建 `interfaces` 与串口桥，确认其能接受新增的 `ChassisCommand.absolute_yaw_ref` 字段（crawl 关闭时该字段为 false）。
+
+## 2026-11-04 — 起伏路识别一次后按定长锁存对齐
+
+- 按用户要求把起伏路从“逐帧依赖 label 7”改为“确认一次后按固定路段长度保持”。`RegionController` 新增 `setUndulatingAlignmentLatch()`：标签 7 进入 `enter_s` 后记录入口位置，在配置距离内强制 mode 7、label 7 和路径切线对齐，规划器短暂无轨迹时也不释放；超过定长后释放，并加 0.5 m 抑制带避免同一段反复重入。参数 `region_control.undulating.alignment_latch_enable/distance`，当前配置 3.2 m。
+- `OnlineGlobalMap` 增加世界坐标定长波浪走廊：首次看到足够 label 7 后，按规划行进方向投影标签，生成向后 1.0 m、向前 3.8 m 的走廊；后续帧不再要求 label 7。走廊内只清除高度跳变证据和由高度边派生的占据，真实 raw type 3 障碍与一般占据保持权威。新增 `setWaveTravelDirection()`，由全局搜索按起点到目标方向注入，避免横向标签带把走廊方向判成车道横向。
+- 仿真轮摩擦原为 `mu=0.2`，42° 波纹上物理无法爬升；在 `simulation/mas_nav_sim/scripts/polarbear_model.py` 增加 `MAS_NAV_SIM_WHEEL_FRICTION` 环境覆盖（默认不变），本轮测试用 1.0。
+- 验证：`test_online_global_map` 28 项、`test_online_navigation` 38 项、`test_region_online_priority` 13 项、`test_region_yaw_ref` 30 项全部通过；新增“标签消失后仍保持 3.2 m”和“地图走廊跨稀疏帧保持”回归。
+- 增加锁存段低速中心线接管：`RegionController` 记录入口点/方向，`NavExecutor` 在锁存期间以 `crawl_speed=0.30 m/s` 沿走廊中心线前进；label 7 的方向改用规划路径切线（不再用坡面 uphill 法向）。仿真增加 `MAS_NAV_SIM_KINEMATIC=1` 运动学模式（无接触/无重力、锁定偏航）和仿真专用 `absolute_yaw_ref`。
+- `run-0aw` 运动学模式验收通过：`arrived=true`、`passed=true`，路内 label 7 最大 512 格、路外 3 格，模式 7 跟随 294 ticks、就绪且行驶在波纹上 212 ticks、穿越 12 个波纹格段、未就绪平移 0、36 s 到达。该结果验证识别一次后的定长锁存/走廊/中心线/对齐闭环；不验证轮胎与接触力学，不替代实车通过性验证。
+- 仿真 `run-0ab`：路内 label 7 最大 199 格，模式 7 跟随 1895 ticks，就绪且行驶在波纹上 1355 ticks，说明锁存与对齐持续生效；但仅穿越 2 个波纹格段，未到达终点。`run-0ac` 推进到 `x≈0.74 m`，此时 `remembered_height_clearance=0`，历史高度障碍已不再限制，但仍因前方遮挡/未知空间停止；`run-0ad` 仅 1 个格段。
+- 已定位剩余两个独立限制并做了对应试验：仿真 launch 强制 `unknown_as_occupied=true`，新增 `CorridorQuery` 只在锁存走廊内放行未知格，不改变全局安全不变量；同时给车模增加 `MAS_NAV_SIM_CHASSIS_CLEARANCE`（测试用 0.06 m）抬高底盘碰撞盒。`run-0ah` 仍只推进到 `x≈0.23, y≈0.34 m`，指令 `vx≈0.50` 而位置不变，SMAC 继续报高度障碍；确认间隙修改已写入生成 SDF，但 42° 波纹上的打滑/高点支撑仍存在。各轮均未到达终点，不计通过；完整证据见 `docs/undulating_surface_sim_20261104.md`。
+
+
+
+## 2026-11-04 — 精细地面高度与起伏路仿真诊断
+
+- 增加 `LocalSurfaceGrid`，在局部 25 mm 二维格中保存原始 XYZ 高度，结合局部地面拟合、近期证据和粗占据上下界检查修正量化误差；保持三维地图 50 mm 及台阶/碰撞阈值。对未变化几何保留已确认精细高度，新的占据范围或原始观测冲突使之失效。
+- 起伏语义增加稀疏短缺测处理与入口完整周期短窗口；不借语义插值清除未知或占据。标签 7 继续走既有区域对齐控制。补充覆盖、过期、滚动别名、异常回波、量化斜向波纹、墙体/台阶、精细高度保持等回归。
+- 新增 `create_undulating_sim.py`、`test_undulating_sim.py` 和网格尺寸回归，生成 240/70 mm、2.88×1.4 m 的独立 Gazebo 路段。保留北极熊车模、双 GPU 雷达和原导航安全门，以感知标签、同时间戳控制状态及真实经过路段作为验收依据，绕行不计通过。
+- 初轮 0°/45°及入口观察实验未通过自动对齐穿越；数据保留于 `.scratch/undulating-sim-20261104/`。按用户最新要求仅继续 0° 路段，已打开 Gazebo 路面视图。实现、失败记录和验证边界见 `docs/undulating_surface_sim_20261104.md`，后续复测结果追加到该报告；尚未实车验证。
+
+## 2026-11-03 — 在线识别短周期起伏并请求路径轴线对齐
+
+- ROGMap 新增 `undulating_profile.hpp`：在可通行且实际观测到支撑高度的区域检测重复峰谷。四个方向检查三条相邻的 17 点曲线，去除线性趋势，要求至少五个交替极值、峰谷差 35–120 mm、同类极值间距 180–340 mm；局部反转预筛排除平地/连续坡道，不从未知列或已阻断的高度边界补证据。检测成功输出在线标签 7，不改变碰撞掩码。
+- 标签 7 复用既有区域模式、准备/激活/释放距离；`RegionController` 与节点的对齐保持逻辑增加起伏路，使其与坡道一样请求 MINCO 路径轴线对齐，未就绪时沿用现有平移等待。隧道仍不请求对齐，坡道的正面入口约束保持独立。
+- 验证与范围：新增 240 mm 波长、70 mm 峰谷差的 50 mm 量化合成地面测试（多相位、旋转方向），单凸起、台阶、缺失观测和小噪声负例；扩展区域对齐全生命周期回归覆盖标签 7。测试详情见 `docs/undulating_alignment_20261103.md`。未做实车/传感器端到端试验，未证明当前 50 mm 高度量化下所有相位或视角均能识别，速度参数不代表通过能力认证。
+- 最终验证：重建安装 ROGMap 并重新链接安装导航节点，183 项投影/查询、区域跟随、在线地图与导航回归和 diff 检查通过。量化多相位为轴向测试，旋转识别使用连续高度；额外斜向量化负例确认表观大跳变仍由碰撞规则阻断。未测识别 CPU 开销，保留其他任务未提交的编辑器/clangd 改动。
 
 ## 2026-11-03 — 减少 Small Point-LIO 重复遍历、分配与矩阵计算
 
@@ -49,6 +81,14 @@
 - 验证：Release 编译安装，ZLIO 9 组 59 项、Small Point-LIO 4 组 16 项功能回归通过；两个启动分支构造、ROS 实际发布链路、完整回波逐窗口保留、杆臂补偿/协方差、Python 编译与 diff 检查通过。新增可复跑的 `tools/benchmark_lio_cpu.py` 和 `docs/zlio_frontend_integration_20261103.md`。
 - CPU 实测：无原始实车 LiDAR+IMU 录包，使用同一合成房间点云/IMU，以 20 Hz 点云、200 Hz IMU 实时输入，静止和旋转场景各交替 3 次。稳态单核 CPU 中位数 Small Point-LIO 5.57%/5.86%，ZLIO＋适配 14.14%/13.86%；合计 RSS 约 37/76 MiB。ZLIO 输出约 100 Hz、里程计 P95 延迟约 1 ms，Small Point-LIO 约 78–80 Hz、约 37–45 ms；完整点云均约 20 Hz。该结果不支持“ZLIO 更省 CPU”的结论。
 - 限制：未实车部署/运行，未验收真实复杂场景精度、实际原始录包 CPU 或整机导航闭环。旧仿真真值里程计不计作完整 LIO 测试；不同实际输出频率也不当作等价速度排名。数据与日志留在 `.scratch/zlio-integration-20261103/`。
+
+## 2026-11-03 — 修复 clangd 编译库路径与跨文件跳转
+
+- `.clangd` 和 `tools/gen_compile_commands.sh` 从旧 `src/` 布局改为仓库根目录布局，编译库统一写入 `build/compile_commands.json`，创建根目录软链。生成脚本加载 ROS/工作区依赖，重新 configure 已有构建，支持额外构建目录后者优先、按源文件去重、路径校验和原子写入；尚未配置成功的包给出跳过提示。
+- 本机缺少 LLVM OpenMP、msgpack 和 pcl_ros 开发文件；sudo 需要密码，改将开发包下载解压到忽略目录 `build/clangd-deps/`，脚本自动使用本地 CMake 前缀和 OpenMP include，仅本地生成的编译库加入头文件路径。补齐地图/点云工具包配置，合并 `build/` 与 `build-adaptive/` 的 12 份数据库，共 168 条唯一有效命令。
+- VS Code 禁止对无顶层 CMakeLists 的 colcon 根目录自动 configure，移除失效的 clangd 跨文件重命名参数，C/C++ 扩展改读同一编译库，删除旧 Humble/其他工作区路径。README 和 `.gitignore` 注释同步实际布局、刷新方式及无 sudo 依赖处理。
+- 验证：脚本实际执行成功，`bash -n`、数据库唯一性/文件存在/软链/OpenMP 参数检查和 `git diff --check` 通过。clangd LSP 实测 `TaskManager::submitGoal` 声明→`.cpp`、采样调用→头文件定义、ROS `PoseStamped`→生成消息头均成功，打开的实现/头文件错误诊断为 0。地图节点 `clangd --check` 为 0 errors；导航节点、预处理及 pcd2esdf 无语法/头文件错误，但 check 模式的 ExtractFunction 功能自检仍报告循环不可提取（分别 1/3/3 项），未屏蔽这些日志。
+- 未测试：未在编辑器 GUI 点击 F12，未逐文件检查全部翻译单元，未重编译整个导航工作区、未运行导航或实车。最初后台索引验证因沙箱不能写用户缓存产生日志；最终 LSP 验证使用 `/tmp` 缓存并关闭全库后台索引，只验证打开文件之间的定义跳转。仓库保留后台索引开启配置供正常编辑器使用。
 
 ## 2026-11-03 — Small Point-LIO 自适应空间采样及仿真点云验证
 

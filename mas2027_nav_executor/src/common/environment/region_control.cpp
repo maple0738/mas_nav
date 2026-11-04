@@ -329,7 +329,60 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom,
 {
   alignment_segment_.reset();
   retained_alignment_active_ = false;
-  if (!plan_ || plan_->positions_odom.size() < 2 || !position_odom.allFinite()) return mode_;
+  const auto hold_undulating_latch = [this]() {
+    if (!undulating_latch_) return false;
+    mode_ = undulating_latch_->mode;
+    label_ = undulating_latch_->label;
+    phase_ = RegionPhase::INSIDE;
+    target_speed_limit_ = undulating_latch_->max_speed;
+    target_acceleration_limit_ = undulating_latch_->max_acceleration;
+    retained_alignment_active_ = true;
+    return true;
+  };
+  if (undulating_latch_ && position_odom.allFinite()) {
+    const double travelled = (position_odom - undulating_latch_->start_position).norm();
+    if (travelled >= undulating_latch_->distance) {
+      undulating_released_progress_ = progress_;
+      undulating_latch_.reset();
+      held_segment_.reset();
+      alignment_memory_.reset();
+    }
+  }
+  if (!plan_ || plan_->positions_odom.size() < 2 || !position_odom.allFinite()) {
+    // Keep the fixed-length alignment even through a short planner gap; the
+    // heading request resumes as soon as a new path is available.
+    hold_undulating_latch();
+    return mode_;
+  }
+  const auto start_undulating_latch = [this, &position_odom](const RegionSegment & segment) {
+    if (!undulating_latch_enable_ || undulating_latch_ || segment.label != 7U ||
+      segment.mode != 7U || !position_odom.allFinite()) return;
+    // entry_axis describes the uphill normal for slopes, not the road tangent
+    // for repeated waves. Undulating must follow the planned path tangent.
+    Eigen::Vector2d direction = segment.label == 5U ? segment.entry_axis :
+      Eigen::Vector2d::Zero();
+    if (direction.norm() < 0.5 && plan_ &&
+      plan_->positions_odom.size() == plan_->arc_lengths.size()) {
+      for (size_t i = 1; i < plan_->positions_odom.size(); ++i) {
+        if (plan_->arc_lengths[i] <= segment.enter_s + 1e-6) continue;
+        direction = plan_->positions_odom[i] - plan_->positions_odom[i - 1];
+        break;
+      }
+      if (direction.norm() < 0.5) {
+        for (size_t i = plan_->positions_odom.size(); i > 1; --i) {
+          direction = plan_->positions_odom[i - 1] - plan_->positions_odom[i - 2];
+          if (direction.norm() > 1e-9) break;
+        }
+      }
+    }
+    if (!direction.allFinite() || direction.norm() < 1e-9) return;
+    direction.normalize();
+    Eigen::Vector2d origin = segment.entry_position;
+    if (!origin.allFinite() || origin.squaredNorm() < 1e-12) origin = position_odom;
+    undulating_latch_ = UndulatingLatch{position_odom, undulating_latch_distance_,
+      segment.label, segment.mode, segment.max_speed, segment.max_acceleration,
+      origin, direction};
+  };
   const auto remember_alignment = [this, &position_odom](const RegionSegment & segment) {
     const double extent = segment.release_s - segment.exit_s;
     const double release = std::isfinite(extent) ? extent : segment.release_distance;
@@ -346,6 +399,9 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom,
   progress_ = std::max(progress_, projectProgress(*plan_, position_odom,
     std::max(0.0, progress_ - 0.05), maximum_s));
   last_position_odom_ = position_odom;
+  if (undulating_released_progress_ && progress_ >= *undulating_released_progress_ + 0.5)
+    undulating_released_progress_.reset();
+  if (hold_undulating_latch()) return mode_;
   if (held_segment_) {
     const auto & held = plan_->segments[*held_segment_];
     if (progress_ < held.release_s) {
@@ -357,6 +413,8 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom,
       phase_ = progress_ < held.commit_s ? RegionPhase::ARMED :
         progress_ < held.enter_s ? RegionPhase::COMMITTED :
         progress_ < held.exit_s ? RegionPhase::INSIDE : RegionPhase::RELEASING;
+      if (held.label == 7U && held.mode == 7U && progress_ >= held.enter_s)
+        start_undulating_latch(held);
       remember_alignment(held);
       return mode_;
     }
@@ -387,6 +445,8 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom,
       return mode_;
     }
     if (progress_ < segment.release_s) {
+      if (segment.label == 7U && undulating_released_progress_ &&
+          progress_ < *undulating_released_progress_ + 0.5) continue;
       alignment_segment_ = i;
       held_segment_ = i;
       mode_ = segment.mode;
@@ -396,6 +456,8 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom,
       phase_ = progress_ < segment.commit_s ? RegionPhase::ARMED :
         progress_ < segment.enter_s ? RegionPhase::COMMITTED :
         progress_ < segment.exit_s ? RegionPhase::INSIDE : RegionPhase::RELEASING;
+      if (segment.label == 7U && segment.mode == 7U && progress_ >= segment.enter_s)
+        start_undulating_latch(segment);
       remember_alignment(segment);
       return mode_;
     }
@@ -442,13 +504,12 @@ std::optional<double> RegionController::distanceToSlopeAlignment() const
 
 std::optional<double> RegionController::trajectoryHeadingErrorDegrees(double lio_yaw_rad) const
 {
-  // Only a slope requests heading alignment. Other region labels retain their
-  // mode and speed profiles without changing the lower board's free spin.
-  if (label_ != 5U || !plan_ || !std::isfinite(lio_yaw_rad) ||
+  // Slopes and repeated undulations request path-axis alignment.
+  if ((label_ != 5U && label_ != 7U) || !plan_ || !std::isfinite(lio_yaw_rad) ||
     (!retained_alignment_active_ &&
       (!alignment_segment_ || *alignment_segment_ >= plan_->segments.size())) ||
     plan_->positions_odom.size() != plan_->arc_lengths.size()) return std::nullopt;
-  if (front_entry_enable_ && alignment_segment_) {
+  if (label_ == 5U && front_entry_enable_ && alignment_segment_) {
     const auto & segment = plan_->segments[*alignment_segment_];
     if (progress_ < segment.enter_s && segment.entry_axis.norm() >= 0.5) {
       const double offset = std::atan2(segment.entry_axis.y(),segment.entry_axis.x())-lio_yaw_rad;

@@ -22,6 +22,7 @@
 */
 
 #pragma once
+#include <rog_map/local_surface_grid.hpp>
 
 #include <limits>
 
@@ -128,6 +129,7 @@ namespace rog_map {
     protected:
 
         std::shared_ptr<ProjectionLayer> layer_;
+        LocalSurfaceGrid local_surface_;
         std::shared_ptr<DynamicLayer> field_;
         std::shared_ptr<QueryAdapter> query_;
         std::unique_ptr<PerformanceMonitor> performance_monitor_;

@@ -58,9 +58,56 @@ TEST(RegionYawRef, StartsBeforeActivationAndPersistsThroughReleaseWindow)
   }
 }
 
+
+TEST(RegionYawRef, UndulatingLatchHoldsFixedDistanceAfterLabelsDisappear)
+{
+  auto undulating = std::make_shared<RegionPlan>();
+  undulating->trajectory_id = 1;
+  undulating->positions_odom = {{0, 0}, {6, 0}};
+  undulating->arc_lengths = {0, 6};
+  undulating->segments.push_back({7, 7, 1, 2, 0.5, 0.8, 0.9, 1.0, 2.8, 3.0});
+  RegionController controller(4, 3, 4, 2, 4);
+  controller.setUndulatingAlignmentLatch(true, 3.2);
+  controller.setPlan(undulating);
+  controller.update({0, 0});
+  controller.update({0.6, 0});
+  controller.update({1.0, 0});
+  ASSERT_EQ(controller.mode(), 7);
+  ASSERT_TRUE(controller.label());
+  EXPECT_EQ(*controller.label(), 7);
+  EXPECT_TRUE(controller.alignmentActive());
+  ASSERT_TRUE(controller.trajectoryHeadingErrorDegrees(0));
+  EXPECT_NEAR(*controller.trajectoryHeadingErrorDegrees(0), 0.0, 1e-8);
+
+  // A planner gap must not release the fixed-length alignment.
+  controller.setPlan(nullptr);
+  controller.update({1.2, 0});
+  EXPECT_EQ(controller.mode(), 7);
+  EXPECT_TRUE(controller.label());
+  EXPECT_TRUE(controller.alignmentActive());
+  EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
+
+  // A fresh flat plan has no label 7, but the latch still holds for 3.2 m.
+  auto flat = std::make_shared<RegionPlan>();
+  flat->trajectory_id = 2;
+  flat->positions_odom = {{0, 0}, {8, 0}};
+  flat->arc_lengths = {0, 8};
+  controller.setPlan(flat);
+  controller.update({2.0, 0});
+  EXPECT_EQ(controller.mode(), 7);
+  ASSERT_TRUE(controller.label());
+  EXPECT_EQ(*controller.label(), 7);
+  ASSERT_TRUE(controller.trajectoryHeadingErrorDegrees(0));
+  controller.update({4.1, 0});  // 3.1 m from the entry
+  EXPECT_EQ(controller.mode(), 7);
+  controller.update({4.3, 0});  // 3.3 m, past the latch
+  EXPECT_EQ(controller.mode(), 4);
+  EXPECT_FALSE(controller.label());
+}
+
 TEST(RegionYawRef, NonSlopeRegionsKeepTheirModesWithoutRequestingAlignment)
 {
-  for (const uint8_t label : {6, 7}) {
+  for (const uint8_t label : {6}) {
     RegionController controller(4, 3, 4, 2, 4);
     GimbalFollowAdapter adapter(GimbalFollowParams{});
     controller.setPlan(makePlan(label));

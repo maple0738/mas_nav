@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include <Eigen/Core>
+
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "sensor_msgs/msg/image.hpp"
 #include "rog_map/map_query_interface.hpp"
@@ -39,10 +41,18 @@ public:
   const nav_msgs::msg::OccupancyGrid & grid() const { return grid_; }
   nav_msgs::msg::OccupancyGrid terrainGrid() const;
   nav_msgs::msg::OccupancyGrid heightGrid() const;
+  uint8_t terrainLabel(unsigned int mx, unsigned int my) const
+  {
+    if (mx >= sizeX() || my >= sizeY()) return 255U;
+    return terrain_labels_[static_cast<size_t>(my) * sizeX() + mx];
+  }
   sensor_msgs::msg::Image uphillImage() const;
   bool terrainTransition(double from_x, double from_y, double to_x, double to_y,
     double height_clearance = 0.0,
     std::optional<Eigen::Vector2d> clearance_origin = std::nullopt) const;
+  // True when a confirmed repeated-wave label is within radius of the point.
+  // Used to exempt only height-discontinuity evidence, never occupancy.
+  bool nearWave(double x, double y, double radius) const;
   rog_map::QueryResult queryHeight(const Eigen::Vector3d & position) const;
   const std::vector<uint8_t> & slopeSideMask() const { return slope_side_mask_; }
   const std::vector<uint8_t> & heightDiscontinuityMask() const { return height_discontinuity_mask_; }
@@ -74,6 +84,11 @@ private:
   std::vector<float> uphill_y_;
   std::vector<uint8_t> slope_side_mask_;
   std::vector<uint8_t> height_discontinuity_mask_;
+  bool wave_latch_{false};
+  Eigen::Vector2d wave_latch_start_{Eigen::Vector2d::Zero()};
+  Eigen::Vector2d wave_latch_dir_{Eigen::Vector2d::UnitX()};
+  double wave_latch_length_{0.0};
+  double wave_latch_half_width_{0.0};
   std::shared_ptr<const std::vector<double>> distances_;
   std::shared_ptr<const std::vector<double>> height_distances_;
   uint64_t revision_{0};
@@ -92,6 +107,10 @@ public:
   explicit OnlineGlobalMap(const OnlineGlobalMapConfig & config, std::string frame);
   UpdateResult update(const rog_map::MapSnapshot & source);
   std::shared_ptr<OnlineGlobalMapSnapshot> snapshot() const;
+  // Travel direction used to project a newly confirmed wave label into a
+  // fixed-length corridor. Without it a cross-road label strip would be
+  // interpreted as a corridor along its short axis.
+  void setWaveTravelDirection(const Eigen::Vector2d & direction);
 
 private:
   struct Cell {
@@ -119,6 +138,15 @@ private:
   int origin_y_{0};
   int width_{0};
   int height_{0};
+  mutable std::mutex wave_direction_mutex_;
+  Eigen::Vector2d wave_travel_direction_{Eigen::Vector2d::UnitX()};
+  bool wave_travel_direction_valid_{false};
+  bool wave_latch_active_{false};
+  Eigen::Vector2d wave_latch_start_{Eigen::Vector2d::Zero()};
+  Eigen::Vector2d wave_latch_dir_{Eigen::Vector2d::UnitX()};
+  double wave_latch_length_{0.0};
+  double wave_latch_half_width_{0.0};
+  double wave_latch_stamp_{0.0};
   uint64_t last_source_sequence_{0};
   double last_source_stamp_{0.0};
   std::shared_ptr<OnlineGlobalMapSnapshot> snapshot_;

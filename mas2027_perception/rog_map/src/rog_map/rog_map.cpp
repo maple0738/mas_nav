@@ -28,6 +28,9 @@
 #include <cmath>
 #include <limits>
 #include <thread>
+#include <fstream>
+#include <cstdlib>
+#include <cstdio>
 
 #include <rog_map/map_registry.hpp>
 #include <rog_map/body_return_filter.hpp>
@@ -54,6 +57,7 @@ InterpolationMode parseInterpolationMode(const std::string & mode)
 
 void ROGMap::init()
 {
+  local_surface_ = LocalSurfaceGrid{};
   initProbMap();
 
   layer_ = std::make_shared<ProjectionLayer>();
@@ -343,6 +347,25 @@ void ROGMap::updateMapInternal(const PointCloud & cloud, const Pose & pose)
   } else {
     updateProbMap(cloud, sensor_pose, map_center_pos);
   }
+  // Retain local raw heights before querying the quantized occupancy columns.
+  // Only actual returns within the configured scan band can supply support.
+  local_surface_.begin(sensor_pose.first.x(), sensor_pose.first.y(), now);
+  const BodyReturnFilter surface_body_filter(sensor_pose, cfg_.body_exclusion_radius);
+  const double surface_z_min = cfg_.scan_z_relative_to_robot ?
+    sensor_pose.first.z() + cfg_.scan_z_min_abs : cfg_.scan_z_min_abs;
+  const double surface_z_max = cfg_.scan_z_relative_to_robot ?
+    sensor_pose.first.z() + cfg_.scan_z_max_abs : cfg_.scan_z_max_abs;
+  for (const auto & point : cloud) {
+    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z) ||
+        std::abs(point.x - sensor_pose.first.x()) > 2.49 ||
+        std::abs(point.y - sensor_pose.first.y()) > 2.49 ||
+        surface_body_filter.contains(point.x, point.y) ||
+        point.z < surface_z_min || point.z > surface_z_max) continue;
+    Vec3i id;
+    posToGlobalIndex(Vec3f(point.x, point.y, point.z), id);
+    if (!insideLocalMap(id)) continue;
+    if (local_surface_.add(point.x, point.y, point.z)) markDirtyColumn(id);
+  }
   runtime_stats_.stamp = update_stamp;
   runtime_stats_.update_seq = static_cast<double>(this_update_sequence);
   runtime_stats_.update_robot_state_time = update_robot_state_ms;
@@ -519,7 +542,7 @@ void ROGMap::refreshLayers()
     }
   }
 
-  auto scanner = [this, min_id, z_min, z_max, z_range_valid, &z_positions, &z_hash_deltas](
+  auto scanner = [this, min_id, z_min, z_max, z_range_valid, &z_positions, &z_hash_deltas, &layer_cfg](
     int mx, int my) {
     ColumnStats stats;
     if (!z_range_valid) {
@@ -565,6 +588,34 @@ void ROGMap::refreshLayers()
         stats.last_hit_time = std::max(stats.last_hit_time, last_hit_time_[hash_id]);
       } else if (seen_occupied && gt == GridType::KNOWN_FREE) {
         ++free_since_occupied;
+      }
+    }
+    if (stats.observed_count > 0) {
+      Vec3f position;
+      globalIndexToPos(column_start, position);
+      const auto applySurface = [&](const LocalSurfaceGrid::Surface & surface) {
+        stats.surface_valid = surface.valid;
+        stats.surface_conflict = surface.conflict;
+        stats.surface_z = surface.height;
+        stats.surface_low = surface.low;
+        stats.surface_high = surface.high;
+      };
+      auto surface = local_surface_.surface(position.x(), position.y(), getResolution(), current_update_time_, false);
+      applySurface(surface);
+      if ((!surface.valid || (stats.occupied_count > 0 &&
+           !preciseSurfaceExplainsColumn(stats, getResolution(), layer_cfg.surface_height_delta_max))) &&
+          getResolution() <= .05+1e-6) {
+        const auto enclosing = local_surface_.surface(position.x(), position.y(),
+          2*getResolution(), current_update_time_, false, true);
+        auto candidate=stats;
+        candidate.surface_valid=enclosing.valid;candidate.surface_conflict=enclosing.conflict;
+        candidate.surface_z=enclosing.height;
+        candidate.surface_low=enclosing.low;candidate.surface_high=enclosing.high;
+        if (enclosing.valid && (stats.occupied_count==0 ||
+            preciseSurfaceExplainsColumn(candidate, getResolution(), layer_cfg.surface_height_delta_max)))
+          surface=enclosing;
+        else surface.conflict=surface.conflict || enclosing.conflict;
+        applySurface(surface);
       }
     }
     return stats;
@@ -901,6 +952,7 @@ void ROGMap::refreshQuery()
   snapshot->raw_types.resize(layer_->cells().size(), 0U);
   snapshot->height_deltas.resize(layer_->cells().size(), 0.0f);
   snapshot->ground_heights.resize(layer_->cells().size());
+  snapshot->ground_precise.resize(layer_->cells().size(),0U);
   snapshot->height_discontinuities.resize(layer_->cells().size(), 0U);
   snapshot->max_step_height = cfg_.max_step_height;
   snapshot->confidence.resize(layer_->cells().size(), 0.0f);
@@ -909,6 +961,9 @@ void ROGMap::refreshQuery()
     snapshot->raw_types[i] = static_cast<uint8_t>(layer_->cells()[i].raw_type);
     snapshot->height_deltas[i] = layer_->cells()[i].height_delta;
     snapshot->ground_heights[i] = layer_->cells()[i].ground_reference_z;
+    const auto & cell=layer_->cells()[i];
+    snapshot->ground_precise[i] = std::isfinite(cell.precise_ground_z) &&
+      cell.precise_surface_high-cell.precise_surface_low <= cfg_.max_step_height ? 1U : 0U;
     // 1 = measured adjacent jump, 2 = inferred across a bridged FREE gap.
     snapshot->height_discontinuities[i] = !layer_->cells()[i].height_discontinuity ? 0U :
       (layer_->cells()[i].height_discontinuity_measured ? 1U : 2U);
@@ -952,6 +1007,27 @@ void ROGMap::refreshQuery()
       snapshot->field_min_distance = field_->minDistance();
       snapshot->field_clamp_distance = field_->clampDistanceEnabled();
       snapshot->interpolation = field_->interpolationMode();
+    }
+  }
+  // Explicit one-shot field diagnostic. Disabled unless an output path and a
+  // sibling .request file are supplied by a diagnostic run; never a control input.
+  if (const char * output=std::getenv("MAS_NAV_SURFACE_DIAGNOSTIC")) {
+    const std::string request=std::string(output)+".request";
+    if (std::ifstream(request).good()) {
+      std::ofstream csv(output);
+      csv << "x,y,type,raw_type,value,ground,precise,span,zmin,zmax,edge,measured,label\n";
+      for (int y=0;y<snapshot->height;++y) for(int x=0;x<snapshot->width;++x) {
+        const size_t i=static_cast<size_t>(y)*snapshot->width+x;
+        const auto & cell=layer_->cells()[i];
+        csv << snapshot->origin_x+(x+.5)*snapshot->resolution << ','
+          << snapshot->origin_y+(y+.5)*snapshot->resolution << ','
+          << int(cell.type) << ',' << int(cell.raw_type) << ',' << int(cell.value) << ','
+          << cell.ground_reference_z << ',' << cell.precise_ground_z << ',' << cell.height_delta << ','
+          << cell.occupied_z_min_abs << ',' << cell.occupied_z_max_abs << ','
+          << cell.height_discontinuity << ',' << cell.height_discontinuity_measured << ','
+          << int(snapshot->terrain_labels[i]) << '\n';
+      }
+      if (csv.good()) std::remove(request.c_str());
     }
   }
   query_->update(snapshot, field_);

@@ -23,6 +23,79 @@ constexpr double kDeadEndMemoryS = 120.0;
 constexpr double kRecoveryTimeoutS = 60.0;
 constexpr double kRecoveryReachedDistance = 1.0;
 
+// The fixed undulating segment is known drivable after one confirmation, but
+// the live projection still treats cells hidden behind a crest as unknown.
+// Open only unknown cells inside the latched corridor; occupied cells and all
+// other geometry keep their original authority.
+class CorridorQuery final : public rog_map::MapQueryInterface
+{
+public:
+  CorridorQuery(std::shared_ptr<rog_map::MapQueryInterface> base,
+    std::shared_ptr<const mas2027_nav_executor::OnlineGlobalMapSnapshot> corridor)
+  : base_(std::move(base)), corridor_(std::move(corridor)) {}
+
+  bool worldToMap(double x, double y, unsigned int & mx, unsigned int & my) const override
+  { return base_->worldToMap(x, y, mx, my); }
+  void mapToWorld(unsigned int mx, unsigned int my, double & x, double & y) const override
+  { base_->mapToWorld(mx, my, x, y); }
+  unsigned int sizeX() const override { return base_->sizeX(); }
+  unsigned int sizeY() const override { return base_->sizeY(); }
+  double resolution() const override { return base_->resolution(); }
+  double originX() const override { return base_->originX(); }
+  double originY() const override { return base_->originY(); }
+  double snapshotStampSeconds() const override { return base_->snapshotStampSeconds(); }
+  bool isValid(unsigned int mx, unsigned int my) const override
+  { return base_->isValid(mx, my); }
+  uint8_t value(unsigned int mx, unsigned int my) const override
+  {
+    const uint8_t raw = base_->value(mx, my);
+    return raw == 255U && openUnknown(mx, my) ? 0U : raw;
+  }
+  bool isFree(unsigned int mx, unsigned int my) const override
+  { return value(mx, my) == 0U; }
+  const unsigned char * values() const override { return base_->values(); }
+  bool copyValues(std::vector<unsigned char> & out) const override
+  {
+    if (!base_->copyValues(out)) return false;
+    if (!corridor_) return true;
+    for (unsigned int my = 0; my < sizeY(); ++my) for (unsigned int mx = 0; mx < sizeX(); ++mx) {
+      const size_t i = static_cast<size_t>(my) * sizeX() + mx;
+      if (i < out.size() && out[i] == 255U && openUnknown(mx, my)) out[i] = 0U;
+    }
+    return true;
+  }
+  rog_map::QueryResult query(const Eigen::Vector3d & position) const override
+  {
+    auto result = base_->query(position);
+    if (corridor_ && corridor_->nearWave(position.x(), position.y(), 0.0) &&
+      (!result.ok || result.distance < 0.0)) {
+      result.ok = true;
+      result.status = rog_map::QueryStatus::OK;
+      result.distance = 3.0;
+      result.gradient.setZero();
+    }
+    return result;
+  }
+  bool evaluate(const Eigen::Vector3d & position, double & distance,
+    Eigen::Vector3d & gradient) const override
+  {
+    const auto result = query(position);
+    distance = result.distance; gradient = result.gradient;
+    return result.ok;
+  }
+
+private:
+  bool openUnknown(unsigned int mx, unsigned int my) const
+  {
+    if (!corridor_) return false;
+    double x = 0.0, y = 0.0;
+    base_->mapToWorld(mx, my, x, y);
+    return corridor_->nearWave(x, y, 0.0);
+  }
+  std::shared_ptr<rog_map::MapQueryInterface> base_;
+  std::shared_ptr<const mas2027_nav_executor::OnlineGlobalMapSnapshot> corridor_;
+};
+
 bool projectStartToFreeCell(
   const std::shared_ptr<rog_map::MapQueryInterface> & map, unsigned int & mx, unsigned int & my)
 {
@@ -618,7 +691,11 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
   last_goal_invalid_ = false;
   last_goal_blocked_retryable_ = false;
   last_goal_shifted_ = false;
-  const auto query = mode_context.globalQuery();
+  const auto live_query = mode_context.globalQuery();
+  const auto wave_history = online_terrain_ ? online_terrain_->snapshot() : nullptr;
+  const std::shared_ptr<rog_map::MapQueryInterface> query =
+    (live_query && wave_history) ? std::make_shared<CorridorQuery>(live_query, wave_history) :
+    live_query;
   if (!astar_ || !query) {
     RCLCPP_ERROR(logger_, "[MincoPlanner] ROGMap global search query is unavailable.");
     return false;
@@ -714,9 +791,15 @@ bool GlobalPathSearcher::planExploration(const geometry_msgs::msg::PoseStamped &
   }
 
   // Online-only mode searches the rolling ROGMap and advances using observed subgoals.
-  const auto adapter = std::dynamic_pointer_cast<rog_map::QueryAdapter>(query);
+  const auto adapter = std::dynamic_pointer_cast<rog_map::QueryAdapter>(live_query);
   const auto semantic = adapter ? adapter->snapshot() : nullptr;
-  const auto remembered = online_terrain_ ? online_terrain_->snapshot() : nullptr;
+  if (online_terrain_) {
+    const Eigen::Vector2d travel(goal_rog.pose.position.x - start_rog.pose.position.x,
+      goal_rog.pose.position.y - start_rog.pose.position.y);
+    if (travel.allFinite() && travel.norm() > 1e-9)
+      online_terrain_->setWaveTravelDirection(travel.normalized());
+  }
+  const auto remembered = wave_history;
   const auto live_direction = semantic ? mas2027_nav_executor::makeDirectedTerrainSampler(
     semantic->width,semantic->height,semantic->resolution,semantic->origin_x,semantic->origin_y,
     [semantic](double x,double y) { return semantic->sampleTerrain(x,y); },directed_terrain_) :

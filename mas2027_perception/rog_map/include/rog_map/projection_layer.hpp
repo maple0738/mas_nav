@@ -46,6 +46,9 @@ struct CellData
   // not disprove that floor or a drop at its boundary. Sliding resets it;
   // a fresh thin-surface observation replaces it.
   float ground_reference_z{std::numeric_limits<float>::quiet_NaN()};
+  float precise_ground_z{std::numeric_limits<float>::quiet_NaN()};
+  double precise_surface_low{std::numeric_limits<double>::quiet_NaN()};
+  double precise_surface_high{std::numeric_limits<double>::quiet_NaN()};
   float height_delta{0.0f};
   float vertical_occupancy_ratio{0.0f};
   float free_gap_ratio{0.0f};
@@ -89,6 +92,10 @@ struct ProjectionLayerConfig
 
 struct ColumnStats
 {
+  // Raw height evidence from multiple measured 25 mm tiles; never ray-only support.
+  bool surface_valid{false};
+  bool surface_conflict{false};
+  double surface_z{0}, surface_low{0}, surface_high{0};
   int observed_count{0};
   int occupied_count{0};
   int free_between_occupied_count{0};
@@ -99,6 +106,9 @@ struct ColumnStats
   double last_hit_time{0.0};
   double last_update_time{0.0};
 };
+
+// The same raw-evidence test is used when selecting and applying a height model.
+bool preciseSurfaceExplainsColumn(const ColumnStats & stats, double resolution, double max_span);
 
 struct ProjectionUpdateStats
 {
@@ -182,8 +192,8 @@ public:
   const std::vector<CellData> & cells() const { return cells_; }
   const std::vector<uint8_t> & values() const { return values_; }
   const std::vector<uint8_t> & mask() const { return mask_; }
-  // Diagnostic labels: 0=flat/ordinary, 5=slope, 6=tunnel candidate, 255=unknown.
-  // These labels do not change the collision mask or chassis mode.
+  // Labels: 0=ordinary, 5=slope, 6=tunnel, 7=undulating, 255=unknown.
+  // The executor consumes these labels; classification never relaxes collision masks.
   std::vector<uint8_t> terrainLabels() const;
   TerrainGeometry terrainGeometry() const;
   bool empty() const { return values_.empty(); }
