@@ -61,7 +61,3 @@
         # mode 7 and path-axis alignment for this distance without re-detecting.
         alignment_latch_enable: true
         alignment_latch_distance: 3.2
-        # Opt-in simulation/bench crawl takeover. Keep false on the vehicle:
-        # real testing uses the normal planner plus the fixed-length latch.
-        crawl_enable: false
-        crawl_speed: 0.30

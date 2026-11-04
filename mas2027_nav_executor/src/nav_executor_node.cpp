@@ -312,14 +312,6 @@ public:
     const double undulating_latch_distance = declare_parameter<double>(
       "region_control.undulating.alignment_latch_distance", 3.2);
     region_controller_->setUndulatingAlignmentLatch(undulating_latch, undulating_latch_distance);
-    undulating_crawl_enable_ = declare_parameter<bool>(
-      "region_control.undulating.crawl_enable", false);
-    undulating_crawl_speed_ = declare_parameter<double>(
-      "region_control.undulating.crawl_speed", 0.18);
-    if (!std::isfinite(undulating_crawl_speed_) || undulating_crawl_speed_ <= 0.0 ||
-      undulating_crawl_speed_ > 0.5)
-      throw std::invalid_argument(
-        "region_control.undulating.crawl_speed must be in (0, 0.5]");
 
 
     if (executor_params.narrow_passage_enable &&
@@ -863,15 +855,9 @@ private:
       (region_controller_->label() == 5U || region_controller_->label() == 7U) &&
       region_controller_->alignmentActive() &&
       odom_pose_current && path_planner_->hasActiveGoal();
-    auto follow = hold_gimbal_alignment ?
+    const auto follow = hold_gimbal_alignment ?
       gimbal_follow_adapter_->hold() :
       gimbal_follow_adapter_->updateHeading(heading_error, 1.0 / control_rate_hz_);
-    const bool wave_crawl = undulating_crawl_enable_ &&
-      region_controller_->undulatingLatchActive();
-    if (wave_crawl && !crawl_was_active_) crawl_reset_cycles_ = 2;
-    crawl_was_active_ = wave_crawl;
-    double crawl_heading_error = 0.0;
-    double crawl_ref_deg = 0.0;
     input.follow_gimbal = follow.follow_gimbal;
     input.reverse_follow_heading = follow.reverse_heading;
     // Wait for measured heading in the slope's prepare/inside/release window.
@@ -882,42 +868,6 @@ private:
         follow.heading_error_deg * (3.14159265358979323846 / 180.0);
     }
     ExecutorOutput output = path_executor_->computeCommand(input);
-    if (wave_crawl && input.odom && crawl_reset_cycles_ > 0) {
-      // One follow=false cycle lets the lower board recapture auto_yaw_offset.
-      --crawl_reset_cycles_;
-      follow.follow_gimbal = false;
-      follow.heading_ready = false;
-      follow.reverse_heading = false;
-      follow.heading_error_deg = 0.0;
-      output.command.linear.x = 0.0;
-      output.command.linear.y = 0.0;
-      output.command.angular.z = 0.0;
-      input.hold_translation = false;
-    } else if (wave_crawl && input.odom) {
-      const auto & pose = input.odom->pose.pose;
-      const auto origin = region_controller_->undulatingLatchOrigin();
-      const auto direction = region_controller_->undulatingLatchDirection();
-      const double yaw = tf2::getYaw(pose.orientation);
-      const double path_yaw = std::atan2(direction.y(), direction.x());
-      const double lateral = (pose.position.x - origin.x()) * direction.y() -
-        (pose.position.y - origin.y()) * direction.x();
-      // Hold the latched centerline. While the heading is far off, rotate in
-      // place; only then crawl forward. `small_yaw_ref` is the lower board's
-      // relative angle target, so it must stay within +/-180 deg.
-      const double target_yaw = path_yaw + std::clamp(-1.2 * lateral, -0.45, 0.45);
-      crawl_heading_error = std::remainder(target_yaw - yaw,
-        2.0 * 3.14159265358979323846);
-      crawl_ref_deg = path_yaw * (180.0 / 3.14159265358979323846);
-      follow.follow_gimbal = true;
-      follow.reverse_heading = false;
-      follow.heading_error_deg = crawl_ref_deg;
-      follow.heading_ready = std::abs(crawl_heading_error) <= 0.17;
-      output.command.linear.x = follow.heading_ready ?
-        undulating_crawl_speed_ * std::max(0.0, std::cos(crawl_heading_error)) : 0.0;
-      output.command.linear.y = 0.0;
-      output.command.angular.z = 0.0;
-      input.hold_translation = false;
-    }
     if (output.secondary_reference_applied) {
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
         "Secondary MPC reference: max_angle=%.1f deg min_scale=%.2f narrow=%s solve=%s %.2f ms",
@@ -941,22 +891,21 @@ private:
         output.clearance_braking_allowed_speed);
     }
     const double mpc_omega = output.status == ExecutorStatus::PUBLISHED ? output.command.angular.z : 0.0;
-    double ref_angle_deg = hold_gimbal_alignment ?
+    const double ref_angle_deg = hold_gimbal_alignment ?
       gimbal_follow_adapter_->commandDegrees() :
       gimbal_follow_adapter_->integrateMpcYawRate(mpc_omega, 1.0 / control_rate_hz_);
-    if (wave_crawl) ref_angle_deg = crawl_ref_deg;
-    if (!wave_crawl && input.hold_translation) {
+    if (input.hold_translation) {
       output.command.linear.x = 0.0;
       output.command.linear.y = 0.0;
     }
     // When following (or holding the last alignment), the lower PID owns
     // rotation; otherwise publish +2 rad/s for observation only. The bridge
     // does not receive a yaw rate.
-    if (!wave_crawl && hold_gimbal_alignment) {
+    if (hold_gimbal_alignment) {
       output.command.linear.x = 0.0;
       output.command.linear.y = 0.0;
       output.command.angular.z = 0.0;
-    } else if (!wave_crawl && !follow.follow_gimbal) {
+    } else if (!follow.follow_gimbal) {
       output.command.angular.z = kNonFollowYawRateRadS;
     }
     command_pub_->publish(output.command);
@@ -968,7 +917,6 @@ private:
     chassis_command.mode = region_controller_->mode();
     chassis_command.small_yaw_ref = static_cast<float>(ref_angle_deg);
     chassis_command.follow_gimbal = follow.follow_gimbal;
-    chassis_command.absolute_yaw_ref = wave_crawl;
     if (!has_follow_gimbal_state_ || chassis_command.follow_gimbal != last_follow_gimbal_) {
       RCLCPP_INFO(get_logger(),
         "Chassis alignment transition: follow=%s slope=%s "
@@ -1055,10 +1003,6 @@ private:
   GoalApproachParams alignment_braking_;
   /// 目标接近减速带用的实测刹车能力（<=0 表示关闭），仅用于节流日志。
   double goal_approach_deceleration_{0.0};
-  bool undulating_crawl_enable_{false};
-  double undulating_crawl_speed_{0.18};
-  bool crawl_was_active_{false};
-  int crawl_reset_cycles_{0};
   std::shared_ptr<const RegionPlan> region_plan_;
   double online_label_timeout_s_{0.8};
   bool online_plan_active_{false};

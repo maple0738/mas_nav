@@ -113,13 +113,6 @@ public:
   }
   bool alignmentActive() const
   { return alignment_segment_.has_value() || retained_alignment_active_; }
-  bool undulatingLatchActive() const { return undulating_latch_.has_value(); }
-  Eigen::Vector2d undulatingLatchOrigin() const
-  { return undulating_latch_ ? undulating_latch_->origin : Eigen::Vector2d::Zero(); }
-  Eigen::Vector2d undulatingLatchDirection() const
-  { return undulating_latch_ ? undulating_latch_->direction : Eigen::Vector2d::UnitX(); }
-  double undulatingLatchDistance() const
-  { return undulating_latch_ ? undulating_latch_->distance : 0.0; }
   // Remaining path length to the next slope's alignment window, while still
   // spinning. The executor can brake toward it without requesting follow yet.
   std::optional<double> distanceToSlopeAlignment() const;
@@ -173,8 +166,6 @@ private:
     uint8_t mode{7};
     double max_speed{};
     double max_acceleration{};
-    Eigen::Vector2d origin{Eigen::Vector2d::Zero()};
-    Eigen::Vector2d direction{Eigen::Vector2d::UnitX()};
   };
   std::optional<UndulatingLatch> undulating_latch_;
   std::optional<double> undulating_released_progress_;

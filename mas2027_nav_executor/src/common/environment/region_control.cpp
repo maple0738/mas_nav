@@ -357,31 +357,8 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom,
   const auto start_undulating_latch = [this, &position_odom](const RegionSegment & segment) {
     if (!undulating_latch_enable_ || undulating_latch_ || segment.label != 7U ||
       segment.mode != 7U || !position_odom.allFinite()) return;
-    // entry_axis describes the uphill normal for slopes, not the road tangent
-    // for repeated waves. Undulating must follow the planned path tangent.
-    Eigen::Vector2d direction = segment.label == 5U ? segment.entry_axis :
-      Eigen::Vector2d::Zero();
-    if (direction.norm() < 0.5 && plan_ &&
-      plan_->positions_odom.size() == plan_->arc_lengths.size()) {
-      for (size_t i = 1; i < plan_->positions_odom.size(); ++i) {
-        if (plan_->arc_lengths[i] <= segment.enter_s + 1e-6) continue;
-        direction = plan_->positions_odom[i] - plan_->positions_odom[i - 1];
-        break;
-      }
-      if (direction.norm() < 0.5) {
-        for (size_t i = plan_->positions_odom.size(); i > 1; --i) {
-          direction = plan_->positions_odom[i - 1] - plan_->positions_odom[i - 2];
-          if (direction.norm() > 1e-9) break;
-        }
-      }
-    }
-    if (!direction.allFinite() || direction.norm() < 1e-9) return;
-    direction.normalize();
-    Eigen::Vector2d origin = segment.entry_position;
-    if (!origin.allFinite() || origin.squaredNorm() < 1e-12) origin = position_odom;
     undulating_latch_ = UndulatingLatch{position_odom, undulating_latch_distance_,
-      segment.label, segment.mode, segment.max_speed, segment.max_acceleration,
-      origin, direction};
+      segment.label, segment.mode, segment.max_speed, segment.max_acceleration};
   };
   const auto remember_alignment = [this, &position_odom](const RegionSegment & segment) {
     const double extent = segment.release_s - segment.exit_s;

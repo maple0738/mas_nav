@@ -141,3 +141,7 @@ planner.rog_map.projection.unknown_as_occupied: true
 ```
 
 验收条件全部满足：到达终点、路内 label 7、≥10 个波纹格段、就绪模式 7 在波纹上行驶、无未就绪平移。该结果证明“识别一次 → 定长锁存 → 走廊 → 低速中心线 → 模式 7 对齐”的导航链路在仿真中闭环；**不证明**当前力驱动/轮胎模型能通过 42° 波纹，也不替代实车验证。`absolute_yaw_ref` 与 kinematic 模式均为仿真专用。
+
+## 仿真专用代码已移除
+
+实车测试前已删除 `absolute_yaw_ref`、NavExecutor 低速中心线接管、`crawl_enable/crawl_speed`，并回退 sim 仓库中的运动学模式、轮摩擦/底盘抬高/碰撞移除和驱动 PID 修改。上述 `run-0aw` 通过记录仅作为运动学导航链路的历史证据保留，当前代码不再包含该仿真通路。

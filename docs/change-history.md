@@ -2,11 +2,12 @@
 
 本文件记录由开发任务产生的代码、配置、脚本、资源和文档变更。新记录追加在最上方，不改写旧记录。
 
-## 2026-11-04 — 起伏路实车交付：锁存默认启用，爬行接管默认关闭
+## 2026-11-04 — 移除仿真专用爬行接管与绝对航向
 
-- 保持“识别到 label 7 后按定长 3.2 m 锁存 mode 7 + 路径切线对齐”的实车默认行为；`region_control.undulating.crawl_enable` 默认 false，实车继续走正常全局/局部规划，不使用仿真里的低速中心线接管。
-- `crawl_speed=0.30` 与 `absolute_yaw_ref` 保留为仿真/台架可选路径；`MAS_NAV_SIM_KINEMATIC=1` 仅用于导航链路验收（无接触/无重力），不代表轮胎或实车通过性。
-- 验证：在线地图 28、在线导航 38、区域优先级 13、区域对齐 30 项通过；`run-0aw` 运动学模式到达终点并穿越 12 个波纹格段。实车测试前需重建 `interfaces` 与串口桥，确认其能接受新增的 `ChassisCommand.absolute_yaw_ref` 字段（crawl 关闭时该字段为 false）。
+- 删除 `crawl_enable`/`crawl_speed`、NavExecutor 的低速中心线接管、`ChassisCommand.absolute_yaw_ref` 字段，以及 RegionController 为爬行新增的 latch 方向/accessor。
+- 保留实车需要的 label 7 定长锁存（3.2 m）、mode 7/路径切线对齐、就绪门控；保留地图侧定长走廊、`CorridorQuery` 未知格放行和高度伪障碍清理。
+- 实车默认恢复为“正常全局/局部规划 + 定长对齐锁存”，不再有绕过规划器的速度接管。仿真仓库中的运动学模式、轮摩擦/底盘抬高/碰撞移除、驱动 PID 提高也已回退。
+- 验证：在线地图 28、在线导航 38、区域优先级 13、区域对齐 30 项通过；`git diff --check` 通过。此前的运动学仿真通过记录保留在 `docs/undulating_surface_sim_20261104.md`，但相关代码已移除。
 
 ## 2026-11-04 — 起伏路识别一次后按定长锁存对齐
 
