@@ -77,6 +77,11 @@ TEST(RegionOnlinePriority, OnlineSpecialLabelOverridesStatic)
   ASSERT_TRUE(plan);
   ASSERT_EQ(plan->segments.size(), 1U);
   EXPECT_EQ(plan->segments.front().label, 6U);
+  RegionController controller(4,3.,4.,2.,4.);
+  controller.setPlan(std::make_shared<RegionPlan>(*plan));controller.update({.25,.25});
+  EXPECT_EQ(controller.mode(),6U);
+  ASSERT_TRUE(controller.trajectoryHeadingErrorDegrees(std::acos(-1.)/2));
+  EXPECT_NEAR(*controller.trajectoryHeadingErrorDegrees(std::acos(-1.)/2),-90.,1e-8);
 }
 
 TEST(RegionOnlinePriority, RememberedUndulatingLabelIsApplied)

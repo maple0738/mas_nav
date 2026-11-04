@@ -481,8 +481,8 @@ std::optional<double> RegionController::distanceToSlopeAlignment() const
 
 std::optional<double> RegionController::trajectoryHeadingErrorDegrees(double lio_yaw_rad) const
 {
-  // Slopes and repeated undulations request path-axis alignment.
-  if ((label_ != 5U && label_ != 7U) || !plan_ || !std::isfinite(lio_yaw_rad) ||
+  // Slope, tunnel and undulating semantics request path-axis alignment.
+  if (!requiresPathAlignment(label_) || !plan_ || !std::isfinite(lio_yaw_rad) ||
     (!retained_alignment_active_ &&
       (!alignment_segment_ || *alignment_segment_ >= plan_->segments.size())) ||
     plan_->positions_odom.size() != plan_->arc_lengths.size()) return std::nullopt;

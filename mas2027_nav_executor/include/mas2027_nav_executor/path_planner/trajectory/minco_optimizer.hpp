@@ -136,6 +136,14 @@ public:
 private:
   // === Internal Types ===
   // --- Optimization Runtime Variables ---
+  struct RunupBasis
+  {
+    int piece;
+    double alpha, fraction;
+    Vec6f p, v, a;
+    Vec3f vel, acc, jer;
+  };
+
   struct OptVars
   {
     mas2027_nav_executor::RunupConfig runup;
@@ -174,6 +182,15 @@ private:
     VecDf times;
     Mat3Df points;
     VecDf x;
+
+    // Reused L-BFGS evaluation workspace, separate from the accepted/initial
+    // trajectory so failed evaluations cannot overwrite warm-start state.
+    VecDf evaluation_times;
+    Mat3Df evaluation_points;
+    std::vector<RunupBasis> runup_basis;
+    std::vector<mas2027_nav_executor::RunupSample> runup_samples;
+    std::vector<mas2027_nav_executor::RunupGradient> runup_gradient;
+    mas2027_nav_executor::RunupCostWorkspace runup_workspace;
 
     // Gradient cache.
     Mat3Df gradByPoints;

@@ -195,8 +195,6 @@ public:
     const double corridor_radius = declare_parameter<double>("planner.corridor.robot_radius", 0.28);
     const double swept_radius = declare_parameter<double>("planner.corridor.swept_radius", 0.302);
     const double rotation_margin = declare_parameter<double>("planner.corridor.extra_margin", 0.05);
-    executor_params.swept_radius = swept_radius;
-    executor_params.rotation_margin = rotation_margin;
     const bool allow_undersized_clearance = declare_parameter<bool>(
       "planner.corridor.allow_undersized_clearance", false);
     executor_params.narrow_passage_enable =
@@ -843,16 +841,16 @@ private:
         std::isfinite(input.odom->pose.pose.position.x) &&
         std::isfinite(input.odom->pose.pose.position.y);
     }
-    // A planner retry gap inside a slope must not restore free spin.
+    // A planner retry gap inside aligned terrain must not restore free spin.
     // The lower board keeps the gimbal target relative to auto_yaw_offset; if we
     // clear follow and ref=0 between trajectories, the chassis spins while the
     // next trajectory is searched and the next translation command can end up in
     // the opposite direction. Hold the last valid angle with zero translation
-    // while the same active goal remains in the slope's region window.
+    // while the same active goal remains in the semantic region window.
     const bool hold_gimbal_alignment = !heading_error &&
       gimbal_follow_adapter_->hasCommand() &&
       gimbal_hold_enabled_ && input.trajectory &&
-      (region_controller_->label() == 5U || region_controller_->label() == 7U) &&
+      requiresPathAlignment(region_controller_->label()) &&
       region_controller_->alignmentActive() &&
       odom_pose_current && path_planner_->hasActiveGoal();
     const auto follow = hold_gimbal_alignment ?
@@ -860,7 +858,7 @@ private:
       gimbal_follow_adapter_->updateHeading(heading_error, 1.0 / control_rate_hz_);
     input.follow_gimbal = follow.follow_gimbal;
     input.reverse_follow_heading = follow.reverse_heading;
-    // Wait for measured heading in the slope's prepare/inside/release window.
+    // Wait for measured heading in the semantic prepare/inside/release window.
     input.hold_translation = follow.follow_gimbal && !follow.heading_ready &&
       semantic_alignment;
     if (heading_error) {
@@ -920,14 +918,15 @@ private:
     if (!has_follow_gimbal_state_ || chassis_command.follow_gimbal != last_follow_gimbal_) {
       RCLCPP_INFO(get_logger(),
         "Chassis alignment transition: follow=%s slope=%s "
-        "hold=%s heading=%s allow_motion=%s active_goal=%s odom_current=%s",
+        "hold=%s heading=%s allow_motion=%s active_goal=%s odom_current=%s label=%u",
         chassis_command.follow_gimbal ? "true" : "false",
         region_controller_->label() == 5U ? "true" : "false",
         hold_gimbal_alignment ? "true" : "false",
         heading_error ? "true" : "false",
         input.allow_motion ? "true" : "false",
         path_planner_->hasActiveGoal() ? "true" : "false",
-        odom_pose_current ? "true" : "false");
+        odom_pose_current ? "true" : "false",
+        static_cast<unsigned>(region_controller_->label().value_or(255U)));
       last_follow_gimbal_ = chassis_command.follow_gimbal;
       has_follow_gimbal_state_ = true;
     }

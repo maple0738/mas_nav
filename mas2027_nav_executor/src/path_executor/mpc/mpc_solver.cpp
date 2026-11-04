@@ -19,18 +19,6 @@ void MpcSolver::setConfig(const MPCConfig & config)
   config_ = config;
 }
 
-void MpcSolver::buildStepModel(
-  double /*yaw_ref*/, Eigen::Matrix3d & A, Eigen::Matrix<double, 3, 3> & B) const
-{
-  A.setIdentity();
-
-  B.setZero();
-  // 纯全局坐标系控制，解耦 X, Y, Yaw
-  B(0, 0) = config_.dt;
-  B(1, 1) = config_.dt;
-  B(2, 2) = config_.dt;
-}
-
 bool MpcSolver::buildCondensedQP(const State & curr,
   const std::vector<ReferencePoint> & ref_traj,
   Eigen::MatrixXd & H,
@@ -53,105 +41,50 @@ bool MpcSolver::buildCondensedQP(const State & curr,
     return false;
   }
 
-  // 构建堆叠模型 X = A_hat x0 + B_hat U
-  // 其中nx，nu 分别为单步状态与控制量维度，nX，nU 为堆叠后维度
-  const int nx = 3;
-  const int nu = 3;
-  const int nU = nu * N;
-  const int nX = nx * N;
-
-  // 堆叠状态：X = [x1..xN, y1..yN, yaw1..yawN]
-  // X = [x1,y1,yaw1, x2,y2,yaw2, ..., xN,yN,yawN]^T
-  // X = A_hat * x0 + B_hat * U
-  Eigen::MatrixXd A_hat = Eigen::MatrixXd::Zero(nX, nx);
-  Eigen::MatrixXd B_hat = Eigen::MatrixXd::Zero(nX, nU);
-
-  Eigen::Matrix3d A = Eigen::Matrix3d::Identity();
-
-  for (int i = 0; i < N; ++i) {
-    Eigen::Matrix<double, 3, 3> Bi;
-    buildStepModel(ref_traj[i].yaw, A, Bi);
-
-    // A_hat block: A^{i+1}
-    Eigen::Matrix3d A_power = Eigen::Matrix3d::Identity();
-    for (int p = 0; p < i + 1; ++p) {
-      A_power = A * A_power;
-    }
-    A_hat.block<3, 3>(i * nx, 0) = A_power;
-
-    // B_hat: 影响 x_{i+1} 的所有 u_0..u_i
-    for (int j = 0; j <= i; ++j) {
-      // 由于 A=I，这里仍按通用形式写：A^{i-j} * B_j
-      Eigen::Matrix3d A_ij = Eigen::Matrix3d::Identity();
-      for (int p = 0; p < i - j; ++p) {
-        A_ij = A * A_ij;
-      }
-
-      Eigen::Matrix<double, 3, 3> Bj;
-      buildStepModel(ref_traj[j].yaw, A, Bj);
-
-      B_hat.block<3, 3>(i * nx, j * nu) = A_ij * Bj;
-    }
-  }
-
-  // 参考状态堆叠 X_ref
-  Eigen::VectorXd X_ref = Eigen::VectorXd::Zero(nX);
+  // For the global velocity integrator, A=I and B=dt*I. Therefore
+  // H_ij = 2*dt^2*sum_{k>=max(i,j)} Q_k + 2*delta_ij*R + eps*I,
+  // g_i  = 2*dt*sum_{k>=i} Q_k*(x0-xref_k) - 2*R*uref_i.
+  // Suffix sums avoid generic matrix powers and cubic dense products while
+  // retaining the same rotated along/cross cost and yaw branch handling.
+  const int nU = 3 * N;
+  reference_errors_.resize(3, N);
+  state_weights_.resize(N);
   double previous_yaw = curr.yaw;
   for (int i = 0; i < N; ++i) {
-    X_ref(i * nx + 0) = ref_traj[i].pos.x();
-    X_ref(i * nx + 1) = ref_traj[i].pos.y();
-    // Keep the heading reference continuous through the -pi/pi branch cut.
     previous_yaw += std::atan2(
       std::sin(ref_traj[i].yaw - previous_yaw),
       std::cos(ref_traj[i].yaw - previous_yaw));
-    X_ref(i * nx + 2) = previous_yaw;
-  }
-
-  // 参考控制堆叠 U_ref (直接使用全局速度)
-  Eigen::VectorXd U_ref = Eigen::VectorXd::Zero(nU);
-  for (int i = 0; i < N; ++i) {
-    U_ref(i * nu + 0) = ref_traj[i].vel.x();
-    U_ref(i * nu + 1) = ref_traj[i].vel.y();
-    U_ref(i * nu + 2) = ref_traj[i].yaw_rate;
-  }
-
-  // Q_bar / R_bar (对角块)
-  // Rotate Q into the trajectory tangent frame. Chassis yaw can differ from
-  // travel direction during ordinary spin or reverse gimbal following.
-  Eigen::MatrixXd Q_bar = Eigen::MatrixXd::Zero(nX, nX);
-  Eigen::MatrixXd R_bar = Eigen::MatrixXd::Zero(nU, nU);
-  for (int i = 0; i < N; ++i) {
+    reference_errors_.col(i) = Eigen::Vector3d(
+      curr.x - ref_traj[i].pos.x(), curr.y - ref_traj[i].pos.y(), curr.yaw - previous_yaw);
     const Eigen::Vector2d tangent = ref_traj[i].vel;
     const double tangent_norm = tangent.norm();
-    // Below ~2 cm/s the reference direction is mostly numerical noise; rotating
-    // the tracking cost with it would make the along/cross axes chatter at stops.
     const bool has_useful_tangent = std::isfinite(tangent_norm) && tangent_norm > 0.02;
     const double c = has_useful_tangent ? tangent.x() / tangent_norm : std::cos(ref_traj[i].yaw);
     const double s = has_useful_tangent ? tangent.y() / tangent_norm : std::sin(ref_traj[i].yaw);
-    // Q_xy = R * diag(q_along, q_cross) * R^T for R=[c,-s; s,c].
-    const double qa = config_.q_along;
-    const double qc = config_.q_cross;
-    Q_bar(i * nx + 0, i * nx + 0) = qa * c * c + qc * s * s;
-    Q_bar(i * nx + 0, i * nx + 1) = (qa - qc) * c * s;
-    Q_bar(i * nx + 1, i * nx + 0) = (qa - qc) * c * s;
-    Q_bar(i * nx + 1, i * nx + 1) = qa * s * s + qc * c * c;
-    Q_bar(i * nx + 2, i * nx + 2) = config_.Q.z();  // yaw weight unchanged
-
-    R_bar.block<3, 3>(i * nu, i * nu) = config_.R.asDiagonal();
+    auto & Q = state_weights_[i];
+    Q.setZero();
+    Q(0, 0) = config_.q_along * c * c + config_.q_cross * s * s;
+    Q(0, 1) = Q(1, 0) = (config_.q_along - config_.q_cross) * c * s;
+    Q(1, 1) = config_.q_along * s * s + config_.q_cross * c * c;
+    Q(2, 2) = config_.Q.z();
   }
-
-  // d = A_hat * x0 - X_ref
-  Eigen::Vector3d x0(curr.x, curr.y, curr.yaw);
-  const Eigen::VectorXd d = A_hat * x0 - X_ref;
-
-  // H = 2*(B^T Q B + R)
-  H = 2.0 * (B_hat.transpose() * Q_bar * B_hat + R_bar);
-
-  // 数值正则（避免 Hessian 奇异）
-  H += config_.eps_regularization * Eigen::MatrixXd::Identity(nU, nU);
-
-  // g = 2*(B^T Q d - R U_ref)
-  g = 2.0 * (B_hat.transpose() * Q_bar * d - R_bar * U_ref);
+  H.resize(nU, nU);
+  g.resize(nU);
+  Eigen::Matrix3d suffix_weight = Eigen::Matrix3d::Zero();
+  Eigen::Vector3d suffix_error = Eigen::Vector3d::Zero();
+  for (int i = N - 1; i >= 0; --i) {
+    suffix_weight += state_weights_[i];
+    suffix_error.noalias() += state_weights_[i] * reference_errors_.col(i);
+    const Eigen::Matrix3d block = (2.0 * config_.dt * config_.dt) * suffix_weight;
+    for (int j = 0; j <= i; ++j) {
+      H.block<3, 3>(3 * i, 3 * j) = block;
+      if (j != i) H.block<3, 3>(3 * j, 3 * i) = block.transpose();
+    }
+    H.block<3, 3>(3 * i, 3 * i).diagonal().array() +=
+      2.0 * config_.R.array() + config_.eps_regularization;
+    const Eigen::Vector3d command(ref_traj[i].vel.x(), ref_traj[i].vel.y(), ref_traj[i].yaw_rate);
+    g.segment<3>(3 * i) = 2.0 * (config_.dt * suffix_error - config_.R.cwiseProduct(command));
+  }
 
   // 变量边界（速度约束，map/global 系）
   // Use -1e12 instead of -inf: qpOASES defines INFTY=1e20 internally.
@@ -159,12 +92,12 @@ bool MpcSolver::buildCondensedQP(const State & curr,
   lb = Eigen::VectorXd::Constant(nU, -1.0e12);
   ub = Eigen::VectorXd::Constant(nU, 1.0e12);
   for (int i = 0; i < N; ++i) {
-    lb(i * nu + 0) = config_.vx_min;
-    ub(i * nu + 0) = config_.vx_max;
-    lb(i * nu + 1) = config_.vy_min;
-    ub(i * nu + 1) = config_.vy_max;
-    lb(i * nu + 2) = config_.omega_min;
-    ub(i * nu + 2) = config_.omega_max;
+    lb(i * 3 + 0) = config_.vx_min;
+    ub(i * 3 + 0) = config_.vx_max;
+    lb(i * 3 + 1) = config_.vy_min;
+    ub(i * 3 + 1) = config_.vy_max;
+    lb(i * 3 + 2) = config_.omega_min;
+    ub(i * 3 + 2) = config_.omega_max;
   }
 
   // 加速度约束（可选）：a_min <= (v_k - v_{k-1})/dt <= a_max
@@ -230,13 +163,13 @@ bool MpcSolver::solve(const State & curr,
     return false;
   }
 
-  Eigen::MatrixXd H;
-  Eigen::VectorXd g;
-  Eigen::VectorXd lb;
-  Eigen::VectorXd ub;
-  Eigen::MatrixXd A_con;
-  Eigen::VectorXd lbA;
-  Eigen::VectorXd ubA;
+  auto & H = hessian_;
+  auto & g = gradient_;
+  auto & lb = lower_;
+  auto & ub = upper_;
+  auto & A_con = constraints_;
+  auto & lbA = constraint_lower_;
+  auto & ubA = constraint_upper_;
 
   if (!buildCondensedQP(curr, ref_traj, H, g, lb, ub, A_con, lbA, ubA)) {
     return false;
@@ -245,7 +178,8 @@ bool MpcSolver::solve(const State & curr,
   const int nV = static_cast<int>(g.size());
   const int nC = static_cast<int>(lbA.size());
 
-  std::vector<qpOASES::real_t> H_qp(static_cast<size_t>(nV) * static_cast<size_t>(nV), 0.0);
+  auto & H_qp = qp_hessian_;
+  H_qp.resize(static_cast<size_t>(nV) * static_cast<size_t>(nV));
   for (int i = 0; i < nV; ++i) {
     for (int j = 0; j < nV; ++j) {
       H_qp[static_cast<size_t>(i) * static_cast<size_t>(nV) + static_cast<size_t>(j)] =
@@ -253,25 +187,28 @@ bool MpcSolver::solve(const State & curr,
     }
   }
 
-  std::vector<qpOASES::real_t> g_qp(static_cast<size_t>(nV), 0.0);
-  std::vector<qpOASES::real_t> lb_qp(static_cast<size_t>(nV), 0.0);
-  std::vector<qpOASES::real_t> ub_qp(static_cast<size_t>(nV), 0.0);
+  auto & g_qp = qp_gradient_;
+  g_qp.resize(static_cast<size_t>(nV));
+  auto & lb_qp = qp_lower_;
+  lb_qp.resize(static_cast<size_t>(nV));
+  auto & ub_qp = qp_upper_;
+  ub_qp.resize(static_cast<size_t>(nV));
   for (int i = 0; i < nV; ++i) {
     g_qp[static_cast<size_t>(i)] = static_cast<qpOASES::real_t>(g(i));
     lb_qp[static_cast<size_t>(i)] = static_cast<qpOASES::real_t>(lb(i));
     ub_qp[static_cast<size_t>(i)] = static_cast<qpOASES::real_t>(ub(i));
   }
 
-  std::vector<qpOASES::real_t> A_qp;
-  std::vector<qpOASES::real_t> lbA_qp;
-  std::vector<qpOASES::real_t> ubA_qp;
+  auto & A_qp = qp_constraints_;
+  auto & lbA_qp = qp_constraint_lower_;
+  auto & ubA_qp = qp_constraint_upper_;
 
   const qpOASES::real_t * A_ptr = nullptr;
   const qpOASES::real_t * lbA_ptr = nullptr;
   const qpOASES::real_t * ubA_ptr = nullptr;
 
   if (nC > 0) {
-    A_qp.assign(static_cast<size_t>(nC) * static_cast<size_t>(nV), 0.0);
+    A_qp.resize(static_cast<size_t>(nC) * static_cast<size_t>(nV));
     for (int i = 0; i < nC; ++i) {
       for (int j = 0; j < nV; ++j) {
         A_qp[static_cast<size_t>(i) * static_cast<size_t>(nV) + static_cast<size_t>(j)] =
@@ -279,8 +216,8 @@ bool MpcSolver::solve(const State & curr,
       }
     }
 
-    lbA_qp.assign(static_cast<size_t>(nC), 0.0);
-    ubA_qp.assign(static_cast<size_t>(nC), 0.0);
+    lbA_qp.resize(static_cast<size_t>(nC));
+    ubA_qp.resize(static_cast<size_t>(nC));
     for (int i = 0; i < nC; ++i) {
       lbA_qp[static_cast<size_t>(i)] = static_cast<qpOASES::real_t>(lbA(i));
       ubA_qp[static_cast<size_t>(i)] = static_cast<qpOASES::real_t>(ubA(i));
@@ -313,7 +250,8 @@ bool MpcSolver::solve(const State & curr,
     return false;
   }
 
-  std::vector<qpOASES::real_t> xOpt(static_cast<size_t>(nV), 0.0);
+  auto & xOpt = qp_solution_;
+  xOpt.assign(static_cast<size_t>(nV), 0.0);
   qp.getPrimalSolution(xOpt.data());
 
   // 如果需要输出预测轨迹
@@ -323,24 +261,15 @@ bool MpcSolver::solve(const State & curr,
     out_pred->push_back(curr);
 
     State s = curr;
-    Eigen::Matrix3d A;  // Identity inside buildStepModel
-    Eigen::Matrix<double, 3, 3> B;
-
     for (int i = 0; i < N; ++i) {
       const double ux = static_cast<double>(xOpt[static_cast<size_t>(3 * i + 0)]);
       const double uy = static_cast<double>(xOpt[static_cast<size_t>(3 * i + 1)]);
       const double uw = static_cast<double>(xOpt[static_cast<size_t>(3 * i + 2)]);
 
-      // 使用 QP 构建时的线性化点 (reference yaw) 进行推演
-      buildStepModel(ref_traj[i].yaw, A, B);
-
-      double dx = B(0, 0) * ux + B(0, 1) * uy + B(0, 2) * uw;
-      double dy = B(1, 0) * ux + B(1, 1) * uy + B(1, 2) * uw;
-      double dyaw = B(2, 0) * ux + B(2, 1) * uy + B(2, 2) * uw;
-
-      s.x += dx;
-      s.y += dy;
-      s.yaw += dyaw;
+      // Same global integrator used by the condensed objective above.
+      s.x += config_.dt * ux;
+      s.y += config_.dt * uy;
+      s.yaw += config_.dt * uw;
       out_pred->push_back(s);
     }
   }

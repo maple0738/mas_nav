@@ -204,10 +204,10 @@ double MincoOptimizer::costFunctional(void * ptr, const VecDf & x, VecDf & g)
   Eigen::Map<VecDf> grad_points(g.data() + dim_t, dim_p);
 
   // 2. Map tau -> segment times
-  VecDf times;
+  auto & times = opt_vars_.evaluation_times;
   gcopter::forwardMapTauToT(tau, times);
 
-  Mat3Df points;
+  auto & points = opt_vars_.evaluation_points;
   if (dim_p > 0) {
     points = Eigen::Map<const Eigen::Matrix<double, 3, Eigen::Dynamic>>(xi.data(), 3, dim_p / 3);
   } else {
@@ -219,8 +219,8 @@ double MincoOptimizer::costFunctional(void * ptr, const VecDf & x, VecDf & g)
 
   // 4. Energy term (MINCO internal objective)
   double cost = 0.0;
-  MatD3f partialGradByCoeffs(6 * times.size(), 3);
-  VecDf partialGradByTimes(times.size());
+  auto & partialGradByCoeffs = opt_vars_.partialGradByCoeffs;
+  auto & partialGradByTimes = opt_vars_.partialGradByTimes;
   partialGradByCoeffs.setZero();
   partialGradByTimes.setZero();
   minco_solver_->getEnergy(cost);
@@ -247,9 +247,10 @@ double MincoOptimizer::costFunctional(void * ptr, const VecDf & x, VecDf & g)
     opt_vars_.query_failure_count);
 
   if (opt_vars_.runup.enable && !opt_vars_.terrain_samplers.empty()) {
-    struct Basis { int piece; double alpha, fraction; Vec6f p,v,a; Vec3f vel,acc,jer; };
-    std::vector<Basis> basis;
-    std::vector<mas2027_nav_executor::RunupSample> samples;
+    auto & basis = opt_vars_.runup_basis;
+    auto & samples = opt_vars_.runup_samples;
+    basis.clear();
+    samples.clear();
     const auto & coeffs = minco_solver_->getCoeffs();
     for (int i = 0; i < times.size(); ++i) {
       const Mat63f c = coeffs.block<6,3>(6*i,0);
@@ -274,8 +275,8 @@ double MincoOptimizer::costFunctional(void * ptr, const VecDf & x, VecDf & g)
     }
     for (const auto & sampler : opt_vars_.terrain_samplers) {
       if (!sampler) continue;
-      std::vector<mas2027_nav_executor::RunupGradient> gradient;
-      cost += mas2027_nav_executor::runupCost(samples,sampler,opt_vars_.runup,gradient);
+      auto & gradient = opt_vars_.runup_gradient;
+      cost += mas2027_nav_executor::runupCost(samples,sampler,opt_vars_.runup,gradient,&opt_vars_.runup_workspace);
       for (size_t i = 0; i < basis.size(); ++i) {
         const auto & b = basis[i]; const auto & g = gradient[i];
         Vec3f gp(g.position.x(),g.position.y(),0), gv(g.velocity.x(),g.velocity.y(),0);
@@ -289,8 +290,8 @@ double MincoOptimizer::costFunctional(void * ptr, const VecDf & x, VecDf & g)
   }
 
   // 6. Propagate gradients to points and times
-  Mat3Df gradByPoints;
-  VecDf gradByTimes;
+  auto & gradByPoints = opt_vars_.gradByPoints;
+  auto & gradByTimes = opt_vars_.gradByTimes;
   minco_solver_->propogateGrad(partialGradByCoeffs, partialGradByTimes, gradByPoints, gradByTimes);
 
   // 7. Time regularization
@@ -412,8 +413,7 @@ void MincoOptimizer::constraintsFunctional(const VecDf & T,
   const auto & piece_num = T.size();
 
   // 2. Setup piece-wise sampling
-  VecDf max_pena(4);
-  max_pena.setZero();
+  Eigen::Vector4d max_pena = Eigen::Vector4d::Zero();
 
   // 3. Loop over pieces and samples
   for (int i = 0; i < piece_num; i++) {
@@ -598,6 +598,8 @@ bool MincoOptimizer::setupProblemAndCheck(const std::vector<Eigen::Vector3d> & w
   opt_vars_.gradByTimes.resize(N);
   opt_vars_.partialGradByCoeffs.resize(6 * N, 3);
   opt_vars_.partialGradByTimes.resize(N);
+  opt_vars_.evaluation_times.resize(N);
+  opt_vars_.evaluation_points.resize(3, N - 1);
 
   // 5. Initialize time and point guesses
   DefaultInit();

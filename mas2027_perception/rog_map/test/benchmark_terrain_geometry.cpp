@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <vector>
@@ -14,7 +13,7 @@ int main()
   constexpr int size = 201;
   constexpr double resolution = .05;
   std::cout << "scene,median_ms,p95_ms,geometry_hash\n";
-  for (int scene = 0; scene < 6; ++scene) {
+  for (int scene = 0; scene < 7; ++scene) {
     rog_map::ProjectionLayer layer;
     rog_map::ProjectionLayerConfig config;
     config.hysteresis_en = false;
@@ -36,6 +35,12 @@ int main()
         stats.occupied_count = 1;
         stats.occupied_z_index_min = stats.occupied_z_index_max = std::lround(z / resolution);
         stats.occupied_z_min_abs = stats.occupied_z_max_abs = z;
+        if (scene == 6) {
+          stats.occupied_count = 2;
+          stats.occupied_z_index_max += 7;
+          stats.occupied_z_max_abs += .35;
+          stats.free_between_occupied_count = 6;
+        }
         stats.surface_valid = true;
         stats.surface_z = stats.surface_low = stats.surface_high = z;
         return stats;
@@ -59,7 +64,7 @@ int main()
       if (iteration >= 3) times.push_back(ms);
     }
     std::sort(times.begin(), times.end());
-    const char * names[] = {"flat", "slope", "waves", "step", "sparse", "mixed"};
+    const char * names[] = {"flat", "slope", "waves", "step", "sparse", "mixed", "tunnel"};
     std::cout << names[scene] << ',' << std::fixed << std::setprecision(3)
               << (times[9] + times[10]) / 2 << ',' << times[18] << ',' << expected_hash << '\n';
   }

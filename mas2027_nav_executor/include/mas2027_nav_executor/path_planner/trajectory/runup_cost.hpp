@@ -30,20 +30,36 @@ struct RunupGradient {
   double time_measure{};
 };
 
+// Scratch memory only; every call resets sampled terrain and all adjoints.
+struct RunupCostWorkspace {
+  struct State {
+    rog_map::TerrainDirectionSample terrain;
+    Eigen::Vector2d tangent{Eigen::Vector2d::Zero()};
+    Eigen::Vector2d g_tangent{Eigen::Vector2d::Zero()}, g_axis{Eigen::Vector2d::Zero()};
+    double speed{}, arc{}, curvature{}, g_arc{}, g_body{}, g_curvature{};
+  };
+  struct ExposureTerm {
+    double gate, derivative, axis_cross;
+  };
+  std::vector<ExposureTerm> exposure_terms;
+  std::vector<State> state;
+  std::vector<double> range;
+};
+
 // Forward arc exposure, including its nonlocal adjoint. Unlike a position
 // penalty this discourages turning along the approach AND through the ramp.
 // Both directions share the same axis cost; no speed cap or clearance changes.
 inline double runupCost(const std::vector<RunupSample>& samples, const TerrainSampler& sampler,
-                        const RunupConfig& cfg, std::vector<RunupGradient>& gradient) {
+                        const RunupConfig& cfg, std::vector<RunupGradient>& gradient,
+                        RunupCostWorkspace *workspace = nullptr) {
   const size_t n = samples.size();
   gradient.assign(n, {});
   if (!cfg.enable || !sampler || cfg.saturation_length <= 0) return 0.0;
-  struct State {
-    rog_map::TerrainDirectionSample terrain;
-    Eigen::Vector2d tangent, g_tangent{Eigen::Vector2d::Zero()}, g_axis{Eigen::Vector2d::Zero()};
-    double speed{}, arc{}, curvature{}, g_arc{}, g_body{}, g_curvature{};
-  };
-  std::vector<State> state(n);
+  RunupCostWorkspace local_workspace;
+  auto &scratch = workspace ? *workspace : local_workspace;
+  using State = RunupCostWorkspace::State;
+  auto &state = scratch.state;
+  state.assign(n, {});
   for (size_t i = 0; i < n; ++i) {
     const auto& s = samples[i];
     auto& v = state[i];
@@ -64,7 +80,12 @@ inline double runupCost(const std::vector<RunupSample>& samples, const TerrainSa
     source.g_axis += scale * Eigen::Vector2d(-current.tangent.y(), current.tangent.x());
   };
   // Range differences accumulate the derivative of the arc between i and j.
-  std::vector<double> range(n + 1, 0.0);
+  auto &range = scratch.range;
+  range.assign(n + 1, 0.0);
+  // Geometry in the forward exposure pass is unchanged during the adjoint
+  // pass. Keep only one current window, avoiding duplicate gates/cross products.
+  auto &terms = scratch.exposure_terms;
+  terms.resize(n);
   double cost = 0.0;
   for (size_t i = 0; i < n; ++i) {
     auto& current = state[i];
@@ -73,8 +94,10 @@ inline double runupCost(const std::vector<RunupSample>& samples, const TerrainSa
     for (size_t j = i; j < n; ++j) {
       const auto& source = state[j];
       if (distance >= cfg.distance + cfg.transition && j != i) break;
-      const double gate = runup_distance_gate(distance, cfg.distance, cfg.transition).first;
+      const auto gate_pair = runup_distance_gate(distance, cfg.distance, cfg.transition);
+      const double gate = gate_pair.first;
       const double c = cross(current.tangent, source.terrain.uphill);
+      terms[j - i] = {gate, gate_pair.second, c};
       const double w = source.terrain.body * gate * source.arc;
       exposure += w;
       crossed_exposure += w * c * c;
@@ -117,20 +140,18 @@ inline double runupCost(const std::vector<RunupSample>& samples, const TerrainSa
     const double g_exposure = current.arc * (curve * (1 - body) * exponential / saturation +
                                              align * (1 - body) * dh * crossed_exposure);
     const double g_crossed = current.arc * align * (1 - body) * h;
-    distance = 0.0;
     for (size_t j = i; j < end; ++j) {
       auto& source = state[j];
-      const auto gate_pair = runup_distance_gate(distance, cfg.distance, cfg.transition);
-      const double c_future = cross(current.tangent, source.terrain.uphill);
+      const auto &term = terms[j - i];
+      const double c_future = term.axis_cross;
       const double g_weight = g_exposure + g_crossed * c_future * c_future;
-      source.g_body += g_weight * gate_pair.first * source.arc;
-      source.g_arc += g_weight * source.terrain.body * gate_pair.first;
-      const double g_distance = g_weight * source.terrain.body * source.arc * gate_pair.second;
+      source.g_body += g_weight * term.gate * source.arc;
+      source.g_arc += g_weight * source.terrain.body * term.gate;
+      const double g_distance = g_weight * source.terrain.body * source.arc * term.derivative;
       range[i] += g_distance;
       range[j] -= g_distance;
       add_cross(current, source,
-                2 * g_crossed * c_future * source.terrain.body * gate_pair.first * source.arc);
-      distance += source.arc;
+                2 * g_crossed * c_future * source.terrain.body * term.gate * source.arc);
     }
   }
   double g_distance = 0.0;

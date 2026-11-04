@@ -314,4 +314,31 @@ TEST(DirectedRamp, FutureRampPenalizesApproachTurnButNotOrdinaryGround) {
   cfg.enable = false;
   EXPECT_EQ(runupCost(samples, terrain, cfg, gradient), 0);
 }
+TEST(DirectedRamp, ReusedExposureWorkspaceClearsAdjointsWhenSamplesOrTerrainChange) {
+  RunupConfig cfg; cfg.enable = true;
+  RunupCostWorkspace workspace;
+  std::vector<RunupGradient> cached_gradient;
+  for (int n : {18, 5, 27, 0, 9}) {
+    std::vector<RunupSample> samples;
+    for (int i = 0; i < n; ++i)
+      samples.push_back({{.05*i,.01*i},{1.,.2},{.1,-.2},.05});
+    for (bool ramp : {true, false}) {
+      TerrainSampler sampler = [ramp](double x,double) {
+        rog_map::TerrainDirectionSample s;
+        if (ramp) { s.body=.5+.1*std::sin(x);s.body_gradient={.1*std::cos(x),0.};s.uphill={1.,0.}; }
+        return s;
+      };
+      std::vector<RunupGradient> fresh;
+      const double expected = runupCost(samples,sampler,cfg,fresh);
+      EXPECT_DOUBLE_EQ(runupCost(samples,sampler,cfg,cached_gradient,&workspace),expected);
+      ASSERT_EQ(cached_gradient.size(),fresh.size());
+      for (size_t i=0;i<fresh.size();++i) {
+        EXPECT_TRUE(cached_gradient[i].position.isApprox(fresh[i].position,1e-14));
+        EXPECT_TRUE(cached_gradient[i].velocity.isApprox(fresh[i].velocity,1e-14));
+        EXPECT_TRUE(cached_gradient[i].acceleration.isApprox(fresh[i].acceleration,1e-14));
+        EXPECT_DOUBLE_EQ(cached_gradient[i].time_measure,fresh[i].time_measure);
+      }
+    }
+  }
+}
 }  // namespace

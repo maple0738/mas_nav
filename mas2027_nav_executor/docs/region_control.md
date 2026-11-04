@@ -28,7 +28,7 @@ terrain msgpack → map_server: /cost_map + /terrain_label_map
 | 0 | `FLAT` | 普通地面 |
 | 1 | `OBSTACLE` | 障碍 |
 | 5 | `SLOPE` | 上坡速度约束；导航内部 mode 5 |
-| 6 | `TUNNEL` | 隧道速度约束；导航内部 mode 6 |
+| 6 | `TUNNEL` | 隧道速度约束与路径轴线对齐；导航内部 mode 6 |
 | 7 | `UNDULATING` | 起伏路速度约束；导航内部 mode 7 |
 
 有效标签仅有表中五个值；2～4 和 8 不再接受。terrain msgpack 只保存标签通道；`map_server` 从中生成 `mono8` 的 `/terrain_label_map`。静态占据图与在线 ROGMap 仍负责障碍安全判断。
@@ -109,11 +109,11 @@ MINCO 在稀疏路径上读取原始区域标签，为坡道影响窗提供更�
 
 PathExecutor 仍使用同一个 MPC 求解 vx/vy/omega。健康连续控制沿用上一拍 MPC 命令作为加速度差分约束起点，不再每个跟随周期都用滞后的实测速度重置；过期输入、参考/求解失败或安全门拒绝仍停车并锚回实测速度。原角速度 ±2 rad/s、角加速度 ±4 rad/s²、控制周期 0.05 s 保留，普通路段平移上限仍为 3 m/s。
 
-### 坡道跟随
+### 特殊地形跟随
 
-只有 `SLOPE=5` 请求航向对齐。几何窄道入口已从执行节点移除；隧道 `6` 和起伏路 `7` 保留原有 mode、速度与加速度约束，但不请求 `follow_gimbal`。普通窄处继续使用原有净空、限速和制动门，不因等待几何航向就绪而清零平移。
+`SLOPE=5`、`TUNNEL=6` 和 `UNDULATING=7` 请求当前 MINCO 路径轴线对齐。隧道从准备窗开始请求对齐，未就绪时零平移，退出释放窗后恢复普通模式。几何窄道对齐入口、切线锁存和里程保持已删除；普通窄处只使用原有净空、限速和制动门。
 
-坡道在 PREPARING、ARMED、COMMITTED、INSIDE、RELEASING 阶段持续请求 follow_gimbal=1；进度达到 release_s 后切回 NORMAL 并清除请求。所选轴线误差需在 5° 内持续 0.3 s 才放行平移，超过 8° 重新等待；等待时 MPC 位置参考固定当前点、平移前馈为零。无有效轨迹/许可但同一目标仍在规划/重试、已有上一有效角度时，保持 `follow_gimbal=1` 和最后 `small_yaw_ref`、平移清零；目标结束、输入过期或姿态无效时才清除。地形、TF、ROGMap 时效和净空安全门保留。
+特殊地形在 PREPARING、ARMED、COMMITTED、INSIDE、RELEASING 阶段持续请求 follow_gimbal=1；进度达到 release_s 后切回 NORMAL 并清除请求。所选轴线误差需在 5° 内持续 0.3 s 才放行平移，超过 8° 重新等待；等待时 MPC 位置参考固定当前点、平移前馈为零。无有效轨迹/许可但同一目标仍在规划/重试、已有上一有效角度时，保持 `follow_gimbal=1` 和最后 `small_yaw_ref`、平移清零；目标结束、输入过期或姿态无效时才清除。地形、TF、ROGMap 时效和净空安全门保留。
 
 新轨迹或在线语义刷新暂时不再命中当前区域时，在已配置 `release_distance` 的里程计位置邻域内
 保留最近的准备/区域模式及速度约束。准备态保留 PREPARING，已激活区域进入 RELEASING；
@@ -129,7 +129,7 @@ PathExecutor 仍使用同一个 MPC 求解 vx/vy/omega。健康连续控制沿�
 
 ### 规划间隙保持对齐
 
-坡道区域内规划器短暂失败时，若此前已有有效跟随角度，节点继续发送 `follow_gimbal=1`、保持最后 `small_yaw_ref`，同时把 `vx/vy` 清零；新轨迹到达后从保持角度继续积分。该保持由 `gimbal_follow.hold_last_alignment` 控制，需要区域标签仍为 `5`、同一目标仍有效且里程计姿态有效。离开坡道释放窗、任务结束或输入无效后清除跟随。几何窄道不再锁存角度，也不再跨目标保持窄道对齐。控制日志中的 `Chassis alignment transition` 记录 `follow`、`slope` 和 `hold`。
+坡道、隧道或起伏路区域内规划器短暂失败时，若此前已有有效跟随角度，节点继续发送 `follow_gimbal=1`、保持最后 `small_yaw_ref`，同时把 `vx/vy` 清零；新轨迹到达后从保持角度继续积分。该保持由 `gimbal_follow.hold_last_alignment` 控制，需要区域标签仍为 `5/6/7`、同一目标仍有效且里程计姿态有效。离开区域释放窗、任务结束或输入无效后清除跟随。几何窄道不再锁存角度，也不再跨目标保持窄道对齐。控制日志中的 `Chassis alignment transition` 记录 `follow`、`slope` 和 `hold`。
 
 ### 角度输出和观察
 

@@ -97,6 +97,8 @@ map_files:
 
 平地误报起伏路时，先检查精细高度、峰谷差和邻条带一致性，再逐项调整阈值。已经记忆的标签受 `planner.online_global_map.terrain_clear_confirmations` 影响；起伏对齐保持距离在 `region_control.undulating.alignment_latch_distance`，调识别阈值不会立即解除已有锁存。需要重新评估一次识别时重启进程清空本次累计状态。
 
+隧道标签 `6` 从准备窗开始请求沿当前 MINCO 路径轴线对齐，达到激活窗后进入 mode 6；未就绪时平移保持为零。准备、激活、释放距离在 `region_control.tunnel` 调整，航向容差和稳定时间在 `gimbal_follow` 调整。规划短暂无有效航向时，已有对齐角度按 `hold_last_alignment` 保持并停车；退出区域或任务结束后解除。普通几何窄处不再触发对齐，仍保留净空、限速和制动判定；坡面 `5`、起伏路 `7` 沿用语义对齐。
+
 ## 查看状态
 
 ```bash

@@ -23,9 +23,10 @@ std::shared_ptr<RegionPlan> makePlan(uint8_t label = 5)
 
 TEST(RegionYawRef, StartsBeforeActivationAndPersistsThroughReleaseWindow)
 {
-  for (const uint8_t label : {5}) {
+  for (const uint8_t label : {5, 6, 7}) {
     RegionController controller(4, 3, 4, 2, 4);
     GimbalFollowAdapter adapter(GimbalFollowParams{});
+    controller.setUndulatingAlignmentLatch(false, 3.2);
     controller.setPlan(makePlan(label));
     controller.update({0, 0});
     EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
@@ -105,20 +106,16 @@ TEST(RegionYawRef, UndulatingLatchHoldsFixedDistanceAfterLabelsDisappear)
   EXPECT_FALSE(controller.label());
 }
 
-TEST(RegionYawRef, NonSlopeRegionsKeepTheirModesWithoutRequestingAlignment)
+TEST(RegionYawRef, OrdinaryPlanNeverRequestsAlignment)
 {
-  for (const uint8_t label : {6}) {
-    RegionController controller(4, 3, 4, 2, 4);
-    GimbalFollowAdapter adapter(GimbalFollowParams{});
-    controller.setPlan(makePlan(label));
-    for (const auto & position : std::vector<Eigen::Vector2d>{
-        {0, 0}, {1.1, 0}, {1.6, 0}, {1.9, 0}, {2, 1}, {2.2, 2}, {2.6, 2}}) {
-      controller.update(position);
-      const auto heading = controller.trajectoryHeadingErrorDegrees(kPi / 4);
-      EXPECT_FALSE(heading) << "label=" << static_cast<int>(label);
-      EXPECT_FALSE(adapter.updateHeading(heading, 0.05).follow_gimbal);
-      if (controller.phase() == RegionPhase::INSIDE) EXPECT_EQ(controller.mode(), label);
-    }
+  RegionController controller(4,3,4,2,4);
+  GimbalFollowAdapter adapter(GimbalFollowParams{});
+  auto ordinary=makePlan();ordinary->segments.clear();controller.setPlan(ordinary);
+  for(const auto &position:ordinary->positions_odom) {
+    controller.update(position);
+    EXPECT_EQ(controller.mode(),4U);
+    EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
+    EXPECT_FALSE(adapter.updateHeading(controller.trajectoryHeadingErrorDegrees(0),.05).follow_gimbal);
   }
 }
 
@@ -647,5 +644,39 @@ TEST(GimbalFollowAdapter, FasterHeadingTrimKeepsTheRateAndReadinessLimits)
     return 10.0;
   };
   EXPECT_LT(settle(2.0), 0.7 * settle(1.0));
+}
+}  // namespace mas2027_nav_executor
+
+namespace mas2027_nav_executor {
+TEST(RegionYawRef, TunnelWaitsForHeadingReadinessAndTracksTheCurrentPath)
+{
+  RegionController controller(4,3,4,2,4);
+  GimbalFollowAdapter adapter(GimbalFollowParams{});
+  controller.setPlan(makePlan(6));controller.update({0,0});controller.update({1.1,0});
+  ASSERT_EQ(controller.label(),6U);
+  ASSERT_TRUE(requiresPathAlignment(controller.label()));
+  auto follow=adapter.updateHeading(controller.trajectoryHeadingErrorDegrees(kPi/2),.1);
+  EXPECT_TRUE(follow.follow_gimbal);EXPECT_FALSE(follow.heading_ready);
+  for(int i=0;i<4;++i)follow=adapter.updateHeading(controller.trajectoryHeadingErrorDegrees(0),.1);
+  EXPECT_TRUE(follow.follow_gimbal);EXPECT_TRUE(follow.heading_ready);
+  controller.update({1.6,0});EXPECT_EQ(controller.mode(),6U);
+  controller.update({2,1});
+  follow=adapter.updateHeading(controller.trajectoryHeadingErrorDegrees(0),.1);
+  EXPECT_TRUE(follow.follow_gimbal);EXPECT_FALSE(follow.heading_ready);
+  EXPECT_NEAR(*controller.trajectoryHeadingErrorDegrees(0),90.,1e-8);
+}
+TEST(RegionYawRef, TunnelSemanticGapRetainsAlignmentOnlyWithinReleaseDistance)
+{
+  RegionController controller(4,3,4,2,4);
+  controller.setPlan(makePlan(6));controller.update({0,0});controller.update({1.6,0});
+  ASSERT_EQ(controller.mode(),6U);
+  auto gap=makePlan(6);gap->trajectory_id=2;gap->segments.clear();
+  controller.setPlan(gap);controller.update({1.7,0});
+  EXPECT_EQ(controller.mode(),6U);EXPECT_TRUE(controller.alignmentActive());
+  EXPECT_TRUE(requiresPathAlignment(controller.label()));
+  ASSERT_TRUE(controller.trajectoryHeadingErrorDegrees(0));
+  controller.update({2.2,0});
+  EXPECT_EQ(controller.mode(),4U);EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
+  EXPECT_FALSE(requiresPathAlignment(controller.label()));
 }
 }  // namespace mas2027_nav_executor

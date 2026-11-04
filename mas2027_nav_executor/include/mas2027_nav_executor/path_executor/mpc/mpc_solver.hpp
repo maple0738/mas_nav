@@ -3,6 +3,7 @@
 #include <vector>
 
 #include <Eigen/Core>
+#include <qpOASES.hpp>
 
 #include "mas2027_nav_executor/path_executor/mpc/mpc_types.hpp"
 
@@ -40,10 +41,10 @@ public:
   }
 
 private:
-  // 构建离散线性模型：x_{k+1} = A x_k + B_k u_k
-  // 状态为 [x,y,yaw]，控制变量 u_k 为 map/global 系 [vx, vy, omega]
-  void buildStepModel(double yaw_ref, Eigen::Matrix3d & A, Eigen::Matrix<double, 3, 3> & B) const;
+  friend struct MpcSolverTestAccess;
 
+  // Fixed global integrator: [x,y,yaw]_{k+1} = state_k + dt*[vx,vy,omega]_k.
+  // The condensed objective and predicted poses use this same model.
   // 组装 MPC 的 condensed QP：0.5*U^T H U + g^T U
   // 其中 U 堆叠了 horizon 个控制量 [vx, vy, omega] (map/global)
   bool buildCondensedQP(const State & curr,
@@ -58,6 +59,15 @@ private:
 
 private:
   MPCConfig config_;
+
+  // Only storage is reused. Every QP coefficient/bound is rebuilt for each
+  // reference/configuration; qpOASES still starts cold on every solve.
+  Eigen::MatrixXd hessian_, constraints_;
+  Eigen::VectorXd gradient_, lower_, upper_, constraint_lower_, constraint_upper_;
+  Eigen::Matrix<double, 3, Eigen::Dynamic> reference_errors_;
+  std::vector<Eigen::Matrix3d> state_weights_;
+  std::vector<qpOASES::real_t> qp_hessian_, qp_gradient_, qp_lower_, qp_upper_;
+  std::vector<qpOASES::real_t> qp_constraints_, qp_constraint_lower_, qp_constraint_upper_, qp_solution_;
 
   // 用于加速度约束的上一时刻 global 控制量
   Eigen::Vector3d last_u_global_{0.0, 0.0, 0.0};

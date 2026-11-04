@@ -114,6 +114,19 @@ install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_polyline_point_index test/test_polyline_point_index.cpp)
+  target_include_directories(test_polyline_point_index PRIVATE include)
+  target_link_libraries(test_polyline_point_index Eigen3::Eigen)
+  ament_add_gtest(test_mpc_condensing test/test_mpc_condensing.cpp)
+  target_link_libraries(test_mpc_condensing ${PROJECT_NAME}_mpc Eigen3::Eigen)
+  add_executable(benchmark_trajectory_processing test/benchmark_trajectory_processing.cpp
+    src/path_executor/path_executor.cpp src/path_executor/monitoring/command_safety.cpp)
+  ament_target_dependencies(benchmark_trajectory_processing
+    geometry_msgs interfaces nav_msgs rclcpp rog_map tf2 tf2_geometry_msgs tf2_ros)
+  target_link_libraries(benchmark_trajectory_processing ${PROJECT_NAME}_mpc ${PROJECT_NAME}_planner Eigen3::Eigen)
+  add_executable(benchmark_optimization test/benchmark_optimization.cpp)
+  ament_target_dependencies(benchmark_optimization rclcpp rog_map nav_msgs)
+  target_link_libraries(benchmark_optimization ${PROJECT_NAME}_mpc ${PROJECT_NAME}_planner Eigen3::Eigen)
   ament_add_gtest(test_online_global_map test/test_online_global_map.cpp)
   target_include_directories(test_online_global_map PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)

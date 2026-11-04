@@ -1,7 +1,6 @@
 #include "mas2027_nav_executor/path_executor/path_executor.hpp"
 
 #include "mas2027_nav_executor/common/environment/clearance_gate.hpp"
-#include "mas2027_nav_executor/common/environment/narrow_passage_geometry.hpp"
 #include "mas2027_nav_executor/path_executor/monitoring/command_safety.hpp"
 
 #include <algorithm>
@@ -115,12 +114,23 @@ ExecutorOutput PathExecutor::computeCommand(const ExecutorInput & input)
     return output;
   }
 
-  std::vector<ReferencePoint> reference;
-  std::vector<interfaces::msg::PositionCommand> transformed_commands;
+  auto & reference = reference_buffer_;
+  const auto & trajectory = *input.trajectory;
+  const auto & source_frame = trajectory.header.frame_id.empty() ?
+    params_.odom_frame : trajectory.header.frame_id;
+  const auto * commands = &trajectory.cmds;
+  if (source_frame != params_.odom_frame) {
+    if (!transformedCommands(trajectory, transformed_commands_buffer_)) {
+      anchor_to_measured();
+      output.status = ExecutorStatus::REFERENCE_FAILED;
+      return output;
+    }
+    commands = &transformed_commands_buffer_;
+  }
+  const auto & transformed_commands = *commands;
   size_t nearest_command_index = 0U;
-  if (!buildReference(*input.trajectory, current, reference,
-    input.follow_gimbal, input.reverse_follow_heading,
-    &nearest_command_index, &transformed_commands)) {
+  if (!buildReference(transformed_commands, current, reference,
+    input.follow_gimbal, input.reverse_follow_heading, &nearest_command_index)) {
     anchor_to_measured();
     output.status = ExecutorStatus::REFERENCE_FAILED;
     return output;
@@ -227,7 +237,7 @@ ExecutorOutput PathExecutor::computeCommand(const ExecutorInput & input)
   // solves. The provisional QP must not change the second QP's constraints.
   const Eigen::Vector3d previous_control = solver_->getLastControl();
   Control control;
-  std::vector<State> predicted;
+  auto & predicted = prediction_buffer_;
   const bool secondary_enabled = params_.secondary_reference_enable &&
     (params_.secondary_reference_angle_enable || params_.secondary_reference_narrow_enable) &&
     !(input.follow_gimbal && input.hold_translation);
@@ -237,7 +247,8 @@ ExecutorOutput PathExecutor::computeCommand(const ExecutorInput & input)
     return output;
   }
   if (secondary_enabled && predicted.size() == reference.size() + 1U) {
-    std::vector<double> time_scales(reference.size(), 1.0);
+    auto & time_scales = time_scales_buffer_;
+    time_scales.assign(reference.size(), 1.0);
     bool resample = false;
     constexpr double kRadiansToDegrees = 180.0 / 3.14159265358979323846;
     const double trigger_cos = std::cos(
@@ -275,7 +286,7 @@ ExecutorOutput PathExecutor::computeCommand(const ExecutorInput & input)
       params_.secondary_reference_narrow_enable && narrow_continuation;
     output.secondary_reference_max_angle_deg = max_angle_deg;
     if (resample) {
-      std::vector<ReferencePoint> slower_reference;
+      auto & slower_reference = slower_reference_buffer_;
       if (sampleReference(transformed_commands, nearest_command_index, time_scales,
         slower_reference, input.follow_gimbal, input.reverse_follow_heading)) {
         // 二次参考是重新采样的，必须再过一次接近减速包络，否则它会顶掉主参考的封顶。
@@ -450,247 +461,6 @@ ExecutorOutput PathExecutor::computeCommand(const ExecutorInput & input)
   return output;
 }
 
-std::optional<double> PathExecutor::narrowPassageHeadingErrorDegrees(
-  const interfaces::msg::MpcPositionCommand & trajectory,
-  double current_x, double current_y, double current_yaw)
-{
-  if (!params_.narrow_passage_alignment_enable || !rog_query_ ||
-    !std::isfinite(current_x) || !std::isfinite(current_y) || !std::isfinite(current_yaw) ||
-    !std::isfinite(params_.narrow_passage_alignment_lookahead) ||
-    params_.narrow_passage_alignment_lookahead <= 0.0 ||
-    !std::isfinite(params_.narrow_passage_alignment_hold_distance) ||
-    params_.narrow_passage_alignment_hold_distance < 0.0 ||
-    !std::isfinite(params_.narrow_passage_clearance) ||
-    params_.narrow_passage_clearance <= 0.0) {
-    resetNarrowPassageAlignment();
-    return std::nullopt;
-  }
-  updateNarrowPassageAlignmentPose(current_x, current_y);
-  std::vector<interfaces::msg::PositionCommand> commands;
-  if (!transformedCommands(trajectory, commands) || commands.empty()) {
-    if (narrow_alignment_active_) {
-      const double target_yaw = std::atan2(last_narrow_tangent_.y(), last_narrow_tangent_.x());
-      constexpr double kRadiansToDegrees = 180.0 / 3.14159265358979323846;
-      return std::atan2(std::sin(target_yaw - current_yaw), std::cos(target_yaw - current_yaw)) *
-        kRadiansToDegrees;
-    }
-    return std::nullopt;
-  }
-
-  size_t nearest = 0U;
-  double nearest_squared = std::numeric_limits<double>::infinity();
-  for (size_t i = 0U; i < commands.size(); ++i) {
-    const double dx = commands[i].position.x - current_x;
-    const double dy = commands[i].position.y - current_y;
-    const double squared = dx * dx + dy * dy;
-    if (squared < nearest_squared) {
-      nearest_squared = squared;
-      nearest = i;
-    }
-  }
-
-  const double full_clearance = effectiveClearanceThreshold(params_.rog_map_clearance);
-  const double alignment_clearance = alignedBodyClearanceRequirement();
-  // Do not align to the robot's current tight cell alone. If the route opens
-  // immediately after a wall-hugging start, rotating the chassis toward that
-  // old tangent causes unnecessary oscillation. Require a low-clearance point
-  // slightly ahead; inside a real corridor the next samples still qualify.
-  constexpr double kMinimumAlignmentAhead = 0.15;
-  // The longer lookahead keeps an active alignment aware of an upcoming
-  // section, but a distant point must not rotate the chassis while the robot
-  // is still traversing open space.
-  constexpr double kNearNarrowDistance = 0.50;
-  constexpr double kExitNarrowDistance = 0.75;
-  constexpr double kExitClearanceHysteresis = 0.03;
-  double traveled = 0.0;
-  size_t first_narrow = commands.size();
-  double nearest_narrow_distance = std::numeric_limits<double>::infinity();
-  Eigen::Vector2d first_narrow_tangent = Eigen::Vector2d::Zero();
-  const auto tangent_at = [&](size_t index) {
-    // A single MINCO segment can change direction sharply when the local
-    // route is refreshed. Use a short chord around the narrow sample so
-    // small waypoint shifts do not repeatedly cancel heading readiness.
-    constexpr double kTangentHalfWindow = 0.15;
-    size_t before = index;
-    size_t after = index;
-    double before_length = 0.0;
-    double after_length = 0.0;
-    while (before > 0U && before_length < kTangentHalfWindow) {
-      before_length += std::hypot(
-        commands[before].position.x - commands[before - 1U].position.x,
-        commands[before].position.y - commands[before - 1U].position.y);
-      --before;
-    }
-    while (after + 1U < commands.size() && after_length < kTangentHalfWindow) {
-      after_length += std::hypot(
-        commands[after + 1U].position.x - commands[after].position.x,
-        commands[after + 1U].position.y - commands[after].position.y);
-      ++after;
-    }
-    const Eigen::Vector2d smoothed(
-      commands[after].position.x - commands[before].position.x,
-      commands[after].position.y - commands[before].position.y);
-    if (smoothed.squaredNorm() > 1.0e-12) return smoothed.normalized().eval();
-    for (size_t i = index; i > 0U; --i) {
-      const Eigen::Vector2d delta(
-        commands[i].position.x - commands[i - 1U].position.x,
-        commands[i].position.y - commands[i - 1U].position.y);
-      if (delta.squaredNorm() > 1.0e-12) return delta.normalized().eval();
-    }
-    for (size_t i = index + 1U; i < commands.size(); ++i) {
-      const Eigen::Vector2d delta(
-        commands[i].position.x - commands[i - 1U].position.x,
-        commands[i].position.y - commands[i - 1U].position.y);
-      if (delta.squaredNorm() > 1.0e-12) return delta.normalized().eval();
-    }
-    return Eigen::Vector2d::Zero().eval();
-  };
-  for (size_t i = nearest; i < commands.size(); ++i) {
-    if (i > nearest) {
-      traveled += std::hypot(
-        commands[i].position.x - commands[i - 1U].position.x,
-        commands[i].position.y - commands[i - 1U].position.y);
-    }
-    if (traveled > params_.narrow_passage_alignment_lookahead) {
-      break;
-    }
-    const auto clearance = rog_query_->query(Eigen::Vector3d(
-      commands[i].position.x, commands[i].position.y, 0.0));
-    if (!clearance.ok || !std::isfinite(clearance.distance)) {
-      break;
-    }
-    if (clearance.distance >= params_.narrow_passage_clearance &&
-      clearance.distance < alignment_clearance) {
-      const Eigen::Vector2d tangent = tangent_at(i);
-      if (tangent.squaredNorm() <= 1.0e-12 || !hasOpposingSideObstacles(
-          *rog_query_, Eigen::Vector2d(commands[i].position.x, commands[i].position.y),
-          tangent, clearance.distance)) {
-        continue;
-      }
-      nearest_narrow_distance = std::min(nearest_narrow_distance, traveled);
-      if (first_narrow == commands.size() &&
-        traveled >= kMinimumAlignmentAhead && traveled <= kNearNarrowDistance) {
-        first_narrow = i;
-        first_narrow_tangent = tangent;
-      }
-    }
-  }
-
-  const auto current_clearance = rog_query_->query(Eigen::Vector3d(current_x, current_y, 0.0));
-  if (narrow_alignment_active_ &&
-    narrow_alignment_traveled_m_ >= params_.narrow_passage_alignment_hold_distance &&
-    current_clearance.ok && std::isfinite(current_clearance.distance) &&
-    current_clearance.distance >=
-      std::max(full_clearance + kExitClearanceHysteresis, rotationClearanceRequirement()) &&
-    nearest_narrow_distance > kExitNarrowDistance) {
-    releaseNarrowPassageAlignment();
-    return std::nullopt;
-  }
-  // After leaving one corridor, a narrow point still far ahead on the same
-  // route must not reactivate alignment on the very next control tick.
-  if (!narrow_alignment_active_ && narrow_alignment_rearm_near_only_) {
-    if (!std::isfinite(nearest_narrow_distance)) {
-      narrow_alignment_rearm_near_only_ = false;
-    } else if (nearest_narrow_distance > kNearNarrowDistance) {
-      return std::nullopt;
-    }
-  }
-
-  if (first_narrow_tangent.squaredNorm() > 1.0e-12 && first_narrow < commands.size()) {
-    if (!narrow_alignment_active_) {
-      last_alignment_pose_ = {current_x, current_y};
-      narrow_alignment_traveled_m_ = 0.0;
-      // A square body must keep one heading through this constrained section.
-      // Replanning can change the first narrow waypoint and its tangent even
-      // while the walls and chassis have not moved. Latch the entry tangent
-      // until the corridor has genuinely ended and free spin is safe again.
-      last_narrow_tangent_ = first_narrow_tangent;
-    } else if (last_narrow_tangent_.dot(first_narrow_tangent) < -0.5) {
-      // Returning through the same slot reverses travel direction but keeps
-      // the same body axis. Flip only the tangent sign so the adapter can
-      // select reverse travel without turning the square in place.
-      last_narrow_tangent_ = -last_narrow_tangent_;
-    }
-    narrow_alignment_active_ = true;
-    narrow_alignment_rearm_near_only_ = false;
-  }
-  if (!narrow_alignment_active_) {
-    return std::nullopt;
-  }
-  const double target_yaw = std::atan2(last_narrow_tangent_.y(), last_narrow_tangent_.x());
-  constexpr double kRadiansToDegrees = 180.0 / 3.14159265358979323846;
-  return std::atan2(std::sin(target_yaw - current_yaw), std::cos(target_yaw - current_yaw)) *
-    kRadiansToDegrees;
-}
-
-void PathExecutor::resetNarrowPassageAlignment()
-{
-  if (narrow_alignment_active_) last_alignment_release_m_ = narrow_alignment_traveled_m_;
-  narrow_alignment_active_ = false;
-  last_narrow_tangent_.setZero();
-  last_alignment_pose_.setZero();
-  narrow_alignment_traveled_m_ = 0.0;
-  narrow_alignment_rearm_near_only_ = false;
-}
-
-void PathExecutor::releaseNarrowPassageAlignment()
-{
-  resetNarrowPassageAlignment();
-  narrow_alignment_rearm_near_only_ = true;
-}
-
-bool PathExecutor::releaseNarrowPassageAlignmentAtGoal()
-{
-  if (!narrow_alignment_active_ ||
-    narrow_alignment_traveled_m_ < params_.narrow_passage_alignment_hold_distance) {
-    return false;
-  }
-  // Releasing follow_gimbal hands yaw back to the lower board's free spin.
-  // Distance traveled says nothing about room for the corners to rotate.
-  const auto clearance = rog_query_ ? rog_query_->query(Eigen::Vector3d(
-    last_alignment_pose_.x(), last_alignment_pose_.y(), 0.0)) : rog_map::QueryResult{};
-  if (!clearance.ok || !std::isfinite(clearance.distance) ||
-    clearance.distance < rotationClearanceRequirement()) {
-    return false;
-  }
-  releaseNarrowPassageAlignment();
-  return true;
-}
-
-double PathExecutor::rotationClearanceRequirement() const
-{
-  // EDT measures occupied cell centers; include the half diagonal of a cell.
-  const double resolution = rog_query_ ? rog_query_->resolution() : 0.0;
-  return params_.swept_radius + params_.rotation_margin +
-    (std::isfinite(resolution) && resolution > 0.0 ?
-      resolution / std::sqrt(2.0) : 0.0);
-}
-
-double PathExecutor::alignedBodyClearanceRequirement() const
-{
-  // For a square body, corner radius / sqrt(2) is the half width while it
-  // travels aligned with the corridor. EDT measures occupied cell centers;
-  // retain the map-cell uncertainty and the configured clearance margin.
-  const double resolution = rog_query_ ? rog_query_->resolution() : 0.0;
-  return params_.swept_radius / std::sqrt(2.0) + params_.rotation_margin +
-    (std::isfinite(resolution) && resolution > 0.0 ?
-      resolution / std::sqrt(2.0) : 0.0);
-}
-
-void PathExecutor::updateNarrowPassageAlignmentPose(double x, double y)
-{
-  if (!narrow_alignment_active_ || !std::isfinite(x) || !std::isfinite(y)) return;
-  const Eigen::Vector2d pose(x, y);
-  const double step = (pose - last_alignment_pose_).norm();
-  if (step > 0.50) {
-    // A localization jump is not distance driven by the chassis.
-    last_alignment_pose_ = pose;
-  } else if (step >= 0.005) {
-    narrow_alignment_traveled_m_ += step;
-    last_alignment_pose_ = pose;
-  }
-}
-
 bool PathExecutor::transformedCommands(
   const interfaces::msg::MpcPositionCommand & trajectory,
   std::vector<interfaces::msg::PositionCommand> & commands) const
@@ -787,14 +557,8 @@ bool PathExecutor::applyGoalApproachCap(
     return false;
   }
 
-  // 沿控制点累计弧长；参考点按最近控制点换算"到轨迹终点的剩余弧长"。
-  std::vector<double> arc(commands.size(), 0.0);
-  for (size_t index = 1; index < commands.size(); ++index) {
-    const auto & previous = commands[index - 1U].position;
-    const auto & current = commands[index].position;
-    const double length = std::hypot(current.x - previous.x, current.y - previous.y);
-    arc[index] = arc[index - 1U] + (std::isfinite(length) ? length : 0.0);
-  }
+  // Geometry is shared by the primary and secondary references this tick.
+  const auto & arc = command_arc_;
   const double total = arc.back();
   if (!(std::isfinite(total) && total > 1e-6)) {
     // 原地转向 / 纯对齐轨迹没有可减速的行程。
@@ -806,21 +570,13 @@ bool PathExecutor::applyGoalApproachCap(
   // 多少米、此刻允许多快"，而不是预测窗末尾那个必然为 0 的剩余距离。
   double current_remaining = std::numeric_limits<double>::quiet_NaN();
   double current_allowed = std::numeric_limits<double>::quiet_NaN();
+  size_t hint = nearest_hint_;
   for (auto & point : reference) {
     if (!point.pos.allFinite() || !point.vel.allFinite()) {
       continue;
     }
-    size_t nearest = 0U;
-    double best_squared = std::numeric_limits<double>::infinity();
-    for (size_t index = 0; index < commands.size(); ++index) {
-      const double dx = commands[index].position.x - point.pos.x();
-      const double dy = commands[index].position.y - point.pos.y();
-      const double squared = dx * dx + dy * dy;
-      if (squared < best_squared) {
-        best_squared = squared;
-        nearest = index;
-      }
-    }
+    const size_t nearest = command_index_.nearest(point.pos.x(), point.pos.y(), hint).index;
+    hint = nearest;
     const double remaining = std::max(0.0, total - arc[nearest]);
     const double allowed = goalApproachSpeedLimit(remaining, params_.goal_approach);
     if (!std::isfinite(allowed)) {
@@ -847,32 +603,28 @@ bool PathExecutor::applyGoalApproachCap(
 }
 
 bool PathExecutor::buildReference(
-  const interfaces::msg::MpcPositionCommand & trajectory,
+  const std::vector<interfaces::msg::PositionCommand> & commands,
   const State & current,
   std::vector<ReferencePoint> & reference, bool follow_gimbal, bool reverse_heading,
-  size_t * nearest_index, std::vector<interfaces::msg::PositionCommand> * transformed) const
+  size_t * nearest_index)
 {
-  std::vector<interfaces::msg::PositionCommand> commands;
-  if (!transformedCommands(trajectory, commands) || commands.empty()) return false;
-
-  size_t nearest = 0;
-  double best_distance_squared = std::numeric_limits<double>::infinity();
-  for (size_t index = 0; index < commands.size(); ++index) {
-    const double dx = commands[index].position.x - current.x;
-    const double dy = commands[index].position.y - current.y;
-    const double distance_squared = dx * dx + dy * dy;
-    if (distance_squared < best_distance_squared) {
-      best_distance_squared = distance_squared;
-      nearest = index;
+  if (commands.empty()) return false;
+  command_index_.build(commands.size(), [&](size_t i) {
+    return Eigen::Vector2d(commands[i].position.x, commands[i].position.y);
+  });
+  if (params_.goal_approach.valid() && commands.size() >= 2U) {
+    command_arc_.resize(commands.size());
+    command_arc_[0] = 0.0;
+    for (size_t i = 1; i < commands.size(); ++i) {
+      const auto & previous = commands[i - 1U].position;
+      const auto & point = commands[i].position;
+      const double length = std::hypot(point.x - previous.x, point.y - previous.y);
+      command_arc_[i] = command_arc_[i - 1U] + (std::isfinite(length) ? length : 0.0);
     }
-  }
-  if (nearest_index != nullptr) {
-    *nearest_index = nearest;
-  }
-  if (transformed != nullptr) {
-    *transformed = commands;
-  }
-
+  } else command_arc_.clear();
+  const size_t nearest = command_index_.nearest(current.x, current.y, nearest_hint_).index;
+  nearest_hint_ = nearest;
+  if (nearest_index != nullptr) *nearest_index = nearest;
   return sampleReference(commands, nearest, {}, reference, follow_gimbal, reverse_heading);
 }
 

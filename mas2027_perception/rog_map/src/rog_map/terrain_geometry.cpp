@@ -72,6 +72,33 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
     return thinGround(cell) && std::isfinite(cell.precise_ground_z) &&
            !cell.height_discontinuity;
   };
+  const auto &tunnel_config = current_config_;
+  const auto tunnelCandidate = [&tunnel_config](const CellData &cell) {
+    // Keep the semantic label tied to the same passability decision as the
+    // projection layer. A tall occupied column is not a tunnel merely because
+    // its sparse returns happen to have a large vertical gap.
+    const double height_delta = static_cast<double>(cell.height_delta);
+    return tunnel_config.terrain.tunnel.enable &&
+           cell.type == CellType::PASSABLE &&
+           cell.raw_reason == ProjectionClassReason::HOLLOW_TUNNEL &&
+           std::isfinite(cell.occupied_z_min_abs) &&
+           std::isfinite(cell.occupied_z_max_abs) &&
+           height_delta >= tunnel_config.tunnel_height_delta_min &&
+           height_delta <= tunnel_config.tunnel_height_delta_max &&
+           static_cast<double>(cell.vertical_occupancy_ratio) <=
+               tunnel_config.tunnel_occupancy_ratio_max &&
+           cell.free_gap_ratio >=
+               static_cast<float>(
+                   tunnel_config.terrain.tunnel.min_free_gap_ratio);
+  };
+
+  // Neighbor windows need only heights and a few evidence bits. Extract them
+  // once so repeated scans do not walk the much larger CellData records.
+  constexpr uint8_t kGround = 1U, kWaveGround = 2U, kBarrier = 4U,
+                    kTunnelCandidate = 8U, kObserved = 16U;
+  std::vector<uint8_t> evidence(count, 0U);
+  std::vector<float> ground_heights(count);
+  std::vector<float> wave_heights(count);
   // A union of intersecting tiles encloses every 11x11 fit window. Its height
   // range is an upper bound on the exact range, so rejecting a range below
   // 6 cm cannot discard any slope accepted by the original fit. This avoids
@@ -89,8 +116,20 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
   for (int y = 0; y < height_; ++y) {
     for (int x = 0; x < width_; ++x) {
       const auto &cell = cells_[static_cast<size_t>(y) * width_ + x];
+      const size_t id = static_cast<size_t>(y) * width_ + x;
+      if (cell.type != CellType::UNKNOWN)
+        evidence[id] |= kObserved;
+      ground_heights[id] = cell.ground_reference_z;
+      wave_heights[id] = cell.precise_ground_z;
+      if (cell.type == CellType::OCCUPIED || cell.height_discontinuity)
+        evidence[id] |= kBarrier;
+      if (tunnelCandidate(cell))
+        evidence[id] |= kTunnelCandidate;
+      if (measuredWaveGround(cell))
+        evidence[id] |= kWaveGround;
       if (!thinGround(cell))
         continue;
+      evidence[id] |= kGround;
       auto &range =
           height_ranges[static_cast<size_t>(y / kTileSize) * tile_width +
                         x / kTileSize];
@@ -123,33 +162,15 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
                        flat_tiles[static_cast<size_t>(ty) * tile_width + tx];
     }
   }
-  const auto &tunnel_config = current_config_;
-  const auto tunnelCandidate = [&tunnel_config](const CellData &cell) {
-    // Keep the semantic label tied to the same passability decision as the
-    // projection layer. A tall occupied column is not a tunnel merely because
-    // its sparse returns happen to have a large vertical gap.
-    const double height_delta = static_cast<double>(cell.height_delta);
-    return tunnel_config.terrain.tunnel.enable &&
-           cell.type == CellType::PASSABLE &&
-           cell.raw_reason == ProjectionClassReason::HOLLOW_TUNNEL &&
-           std::isfinite(cell.occupied_z_min_abs) &&
-           std::isfinite(cell.occupied_z_max_abs) &&
-           height_delta >= tunnel_config.tunnel_height_delta_min &&
-           height_delta <= tunnel_config.tunnel_height_delta_max &&
-           static_cast<double>(cell.vertical_occupancy_ratio) <=
-               tunnel_config.tunnel_occupancy_ratio_max &&
-           cell.free_gap_ratio >=
-               static_cast<float>(
-                   tunnel_config.terrain.tunnel.min_free_gap_ratio);
-  };
 
   struct PlaneSample {
     double x;
     double y;
     double z;
   };
-  std::vector<PlaneSample> plane_samples;
-  plane_samples.reserve((2 * kRadius + 1) * (2 * kRadius + 1));
+  // The fit window bounds sample count. Fill reusable slots directly rather
+  // than checking vector capacity on every sample in every neighboring fit.
+  std::vector<PlaneSample> plane_samples((2 * kRadius + 1) * (2 * kRadius + 1));
 
   // Lazily allocated per direction; discarded after this snapshot, so height,
   // collision and parameter changes never reuse stale detection results.
@@ -157,27 +178,26 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
   for (int y = 0; y < height_; ++y) {
     for (int x = 0; x < width_; ++x) {
       const size_t index = static_cast<size_t>(y) * width_ + x;
-      const auto &center = cells_[index];
-      if (center.type == CellType::UNKNOWN) {
+      if (!(evidence[index] & kObserved)) {
         continue;
       }
       // Empty columns do not prove flat ground; leave them unknown so the
       // static label can be used as fallback by the executor.
-      if (thinGround(center))
+      if (evidence[index] & kGround)
         labels[index] = kFlat;
 
       // A gap between two occupied heights is only a tunnel candidate when
       // neighboring columns show the same structure. A single sparse wall hit
       // must not create a semantic region.
-      if (tunnelCandidate(center)) {
+      if (evidence[index] & kTunnelCandidate) {
         int support = 0;
         for (int dy = -1; dy <= 1; ++dy) {
           for (int dx = -1; dx <= 1; ++dx) {
             const int nx = x + dx;
             const int ny = y + dy;
             if (nx >= 0 && ny >= 0 && nx < width_ && ny < height_ &&
-                tunnelCandidate(
-                    cells_[static_cast<size_t>(ny) * width_ + nx])) {
+                (evidence[static_cast<size_t>(ny) * width_ + nx] &
+                 kTunnelCandidate)) {
               ++support;
             }
           }
@@ -187,7 +207,7 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
           continue;
         }
       }
-      if (!thinGround(center)) {
+      if (!(evidence[index] & kGround)) {
         continue;
       }
 
@@ -199,11 +219,11 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
       constexpr int axes[4][2] = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
       for (size_t axis_id = 0; axis_id < 4; ++axis_id) {
         const auto &axis = axes[axis_id];
-        if (!wave_config.enable || !measuredWaveGround(center))
+        if (!wave_config.enable || !(evidence[index] & kWaveGround))
           break;
         // Cheap local reversal gate keeps flat ground and monotonic ramps out
         // of the longer three-profile check.
-        double low = center.precise_ground_z, high = low, previous = low;
+        double low = wave_heights[index], high = low, previous = low;
         int last_sign = 0, measured = 0;
         bool reversal = false, valid = true;
         for (int i = -2; i <= 2; ++i) {
@@ -212,15 +232,14 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
             valid = false;
             break;
           }
-          const auto &sample = cells_[static_cast<size_t>(ny) * width_ + nx];
-          if (sample.type == CellType::OCCUPIED ||
-              sample.height_discontinuity) {
+          const size_t sample_id = static_cast<size_t>(ny) * width_ + nx;
+          if (evidence[sample_id] & kBarrier) {
             valid = false;
             break;
           }
-          if (!measuredWaveGround(sample))
+          if (!(evidence[sample_id] & kWaveGround))
             continue;
-          const double z = sample.precise_ground_z;
+          const double z = wave_heights[sample_id];
           low = std::min(low, z);
           high = std::max(high, z);
           if (measured > 0) {
@@ -266,14 +285,13 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
               supported = false;
               break;
             }
-            const auto &sample = cells_[static_cast<size_t>(ny) * width_ + nx];
-            if (sample.type == CellType::OCCUPIED ||
-                sample.height_discontinuity) {
+            const size_t sample_id = static_cast<size_t>(ny) * width_ + nx;
+            if (evidence[sample_id] & kBarrier) {
               supported = false;
               break;
             }
-            if (measuredWaveGround(sample))
-              profile[i + 8] = sample.precise_ground_z;
+            if (evidence[sample_id] & kWaveGround)
+              profile[i + 8] = wave_heights[sample_id];
           }
           if (supported) {
             bool wave = cached == 1;
@@ -323,8 +341,8 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
       double sum_x = 0.0, sum_y = 0.0, sum_z = 0.0;
       double sum_xx = 0.0, sum_xy = 0.0, sum_yy = 0.0;
       double sum_xz = 0.0, sum_yz = 0.0, sum_zz = 0.0;
-      plane_samples.clear();
-      float lowest = center.ground_reference_z;
+      int samples = 0;
+      float lowest = ground_heights[index];
       float highest = lowest;
       for (int dy = -kRadius; dy <= kRadius; ++dy) {
         for (int dx = -kRadius; dx <= kRadius; ++dx) {
@@ -332,12 +350,12 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
           const int ny = y + dy;
           if (nx < 0 || ny < 0 || nx >= width_ || ny >= height_)
             continue;
-          const auto &neighbor = cells_[static_cast<size_t>(ny) * width_ + nx];
-          if (!thinGround(neighbor))
+          const size_t sample_id = static_cast<size_t>(ny) * width_ + nx;
+          if (!(evidence[sample_id] & kGround))
             continue;
           const double px = dx * resolution_;
           const double py = dy * resolution_;
-          const double z = neighbor.ground_reference_z;
+          const double z = ground_heights[sample_id];
           sum_x += px;
           sum_y += py;
           sum_z += z;
@@ -347,12 +365,11 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
           sum_xz += px * z;
           sum_yz += py * z;
           sum_zz += z * z;
-          lowest = std::min(lowest, neighbor.ground_reference_z);
-          highest = std::max(highest, neighbor.ground_reference_z);
-          plane_samples.push_back({px, py, z});
+          lowest = std::min(lowest, ground_heights[sample_id]);
+          highest = std::max(highest, ground_heights[sample_id]);
+          plane_samples[samples++] = {px, py, z};
         }
       }
-      const int samples = static_cast<int>(plane_samples.size());
       if (samples < slope_config.min_samples ||
           highest - lowest <
               static_cast<float>(slope_config.min_height_change_m))
@@ -371,7 +388,8 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
         continue;
       const double squared_error = std::max(0.0, sum_zz - plane.dot(rhs));
       double max_residual = 0.0;
-      for (const auto &sample : plane_samples) {
+      for (int i = 0; i < samples; ++i) {
+        const auto &sample = plane_samples[i];
         max_residual =
             std::max(max_residual,
                      std::abs(sample.z - (plane.x() * sample.x +

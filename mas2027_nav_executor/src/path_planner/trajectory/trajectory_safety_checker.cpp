@@ -2,6 +2,7 @@
 
 #include "data_structure/base/trajectory.h"
 #include "mas2027_nav_executor/common/environment/clearance_gate.hpp"
+#include "mas2027_nav_executor/common/geometry/polyline_point_index.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -159,13 +160,36 @@ bool TrajectorySafetyChecker::checkTrajectory(
   // the same planned route belong to the same corridor. Without this context,
   // a trajectory before the first tight sample can be judged at the full
   // threshold even when it stays on the same narrow route.
+  mas2027_nav_executor::PolylinePointIndex reference_index;
   if (planned_narrow) {
+    reference_index.build(reference_samples.size(), [&](size_t i) {
+      return reference_samples[i].point.head<2>().eval();
+    });
     constexpr double kNarrowCorridorContext = 0.50;
-    for (auto & sample : reference_samples) {
-      for (const auto & narrow : reference_samples) {
-        if (narrow.clearance >= narrow_passage_clearance_ &&
-          narrow.clearance < check_dist &&
-          std::abs(sample.arc - narrow.arc) <= kNarrowCorridorContext) {
+    const auto is_narrow = [&](const ReferenceSample & sample) {
+      return sample.clearance >= narrow_passage_clearance_ && sample.clearance < check_dist;
+    };
+    const bool finite_arcs = std::all_of(reference_samples.begin(), reference_samples.end(),
+      [](const ReferenceSample & sample) { return std::isfinite(sample.arc); });
+    if (finite_arcs) {
+      // Arcs are nondecreasing even when query failures leave holes. Advance
+      // only past narrow samples provably behind this context window; use the
+      // original absolute-difference comparison at the floating-point boundary.
+      size_t candidate = 0;
+      for (auto & sample : reference_samples) {
+        while (candidate < reference_samples.size()) {
+          const auto & narrow = reference_samples[candidate];
+          if (!is_narrow(narrow) || (narrow.arc < sample.arc &&
+              std::abs(sample.arc - narrow.arc) > kNarrowCorridorContext)) ++candidate;
+          else break;
+        }
+        sample.near_narrow_corridor = candidate < reference_samples.size() &&
+          std::abs(sample.arc - reference_samples[candidate].arc) <= kNarrowCorridorContext;
+      }
+    } else {
+      // Overflowed arcs must retain the old NaN/inf comparison semantics.
+      for (auto & sample : reference_samples) for (const auto & narrow : reference_samples) {
+        if (is_narrow(narrow) && std::abs(sample.arc - narrow.arc) <= kNarrowCorridorContext) {
           sample.near_narrow_corridor = true;
           break;
         }
@@ -183,20 +207,16 @@ bool TrajectorySafetyChecker::checkTrajectory(
       check_dist, effective_near_field, start_clearance, start_clearance_ok, 0.02,
       effective_near_floor);
   constexpr double kCorridorLateralTolerance = 0.20;
+  size_t nearest_hint = 0;
   const auto requiredAt = [&](const Eigen::Vector3d & pos, double arc) {
     double required = gate.requiredAt(arc);
     if (!planned_narrow) {
       return required;
     }
-    double nearest_squared = std::numeric_limits<double>::infinity();
-    const ReferenceSample * nearest = nullptr;
-    for (const auto & sample : reference_samples) {
-      const double squared = (sample.point - pos).head<2>().squaredNorm();
-      if (squared < nearest_squared) {
-        nearest_squared = squared;
-        nearest = &sample;
-      }
-    }
+    const auto match = reference_index.nearest(pos.x(), pos.y(), nearest_hint);
+    nearest_hint = match.index;
+    const double nearest_squared = match.squared_distance;
+    const ReferenceSample * nearest = match.valid() ? &reference_samples[match.index] : nullptr;
     if (nearest != nullptr && nearest->near_narrow_corridor &&
         nearest_squared <= kCorridorLateralTolerance * kCorridorLateralTolerance) {
       required = std::min(required, narrow_passage_clearance_);

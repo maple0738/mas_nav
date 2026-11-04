@@ -13,7 +13,7 @@
       heading_error_gain_s: 2.0
       heading_deadband_deg: 0.5
       max_heading_rate_deg_s: 120.0
-      # On a slope, if the planner is between trajectories, keep follow_gimbal=1 at the last
+      # In aligned terrain (5/6/7), if the planner is between trajectories, keep follow_gimbal=1 at the last
       # integrated angle and send zero translation instead of returning the lower
       # board to free-spin mode. New trajectories continue from the held angle.
       hold_last_alignment: true
@@ -42,6 +42,7 @@
         commit_distance: 0.1
         release_distance: 0.5
       tunnel:
+        # 识别为隧道后，从准备窗开始沿 MINCO 轴线对齐；未就绪时保持零平移。
         mode: 6
         max_speed: 3.0
         max_acceleration: 4.0

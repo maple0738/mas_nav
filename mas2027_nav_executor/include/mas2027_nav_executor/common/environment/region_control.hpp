@@ -18,6 +18,12 @@
 
 namespace mas2027_nav_executor {
 
+// Heading requests and planner-gap holding use one semantic policy.
+inline bool requiresPathAlignment(std::optional<uint8_t> label)
+{
+  return label == 5U || label == 6U || label == 7U;
+}
+
 struct RegionRule
 {
   uint8_t label{};
@@ -123,8 +129,8 @@ public:
   double progress() const { return progress_; }
   std::optional<uint8_t> label() const { return label_; }
   RegionPhase phase() const { return phase_; }
-  // Slope (label 5) trajectory tangent minus LIO yaw, degrees [-180, 180].
-  // Other terrain labels retain their mode/profile without requesting heading.
+  // Labels 5/6/7 request path tangent minus LIO yaw, degrees [-180, 180].
+  // Ordinary geometry alone never requests heading alignment.
   std::optional<double> trajectoryHeadingErrorDegrees(double lio_yaw_rad) const;
 
 private:
