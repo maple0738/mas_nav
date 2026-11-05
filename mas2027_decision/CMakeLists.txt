@@ -36,7 +36,21 @@ ament_target_dependencies(${PROJECT_NAME}_node
   tf2_ros
 )
 
-install(TARGETS ${PROJECT_NAME}_node DESTINATION lib/${PROJECT_NAME})
+# 假决策测试节点：按固定脚本巡逻，用于验证 决策->导航 链路，不参与实战。
+add_executable(${PROJECT_NAME}_test_node src/test_decision_node.cpp)
+target_link_libraries(${PROJECT_NAME}_test_node ${PROJECT_NAME}_core)
+ament_target_dependencies(${PROJECT_NAME}_test_node
+  geometry_msgs
+  nav_msgs
+  rclcpp
+  std_msgs
+  tf2
+  tf2_geometry_msgs
+  tf2_ros
+)
+
+install(TARGETS ${PROJECT_NAME}_node ${PROJECT_NAME}_test_node
+        DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS tools/teach_points.py DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 
@@ -44,6 +58,9 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_decision_core test/test_decision_core.cpp)
   target_link_libraries(test_decision_core ${PROJECT_NAME}_core)
+
+  ament_add_gtest(test_point_table test/test_point_table.cpp)
+  target_link_libraries(test_point_table ${PROJECT_NAME}_core)
 endif()
 
 ament_package()

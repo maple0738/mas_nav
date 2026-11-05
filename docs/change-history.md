@@ -2,6 +2,11 @@
 
 本文件记录由开发任务产生的代码、配置、脚本、资源和文档变更。新记录追加在最上方，不改写旧记录。
 
+## 2026-11-02 — `mas2027_decision` 新增假决策联调节点与测试点表
+
+- 行为：新增独立的假决策测试节点 `mas2027_decision_test_node`（`src/test_decision_node.cpp`），不接裁判数据，按固定脚本验证「决策发目标 → 导航执行 → 到达 → 下一个点」链路：启动后原地等待 `start_delay_s`（默认 5 s），依次前往 `patrol_points`（默认 `a1`/`a2`/`a3`），每点驻留 `dwell_s`（默认 5 s）后去下一个，走完循环回 `a1`；任意时刻 `debug_hp_ratio < heal_enter`（0.30）返回 `home`，恢复到 `heal_exit`（0.60）后回到当前巡逻点继续。到达判定用当前位姿与目标点的距离（`arrive_tolerance_m`，默认 0.4 m），因为 `nav_executor` 没有任务状态反馈；单点超过 `arrive_timeout_s`（默认 60 s）跳过并告警。目标发布沿用去重策略（`goal_dedupe_m` / `goal_republish_s`），并新增 `/debug/test_state` 话题输出当前阶段。新增 `config/test_points.yaml`（`home`/`a1`/`a2`/`a3` 占位坐标）、`config/test_decision.yaml`（测试参数）、`launch/decision_test.launch.py`（默认 `enabled:=true`，可覆盖 `start_delay_s`/`dwell_s`/`goal_frame` 等）；`CMakeLists.txt` 增加该可执行文件及其安装。`point_table.hpp/.cpp` 新增 `loadNamedPoints()`，读取扁平的任意命名点表；`tools/teach_points.py` 保存时打印"覆盖"或"新增"（原字典语义已是同名覆盖、新名追加），并在文档中写明。README 增加假决策联调入口，新增 `docs/test_playbook.md`（示教、启动顺序、预期时间轴、掉血/回血注入、常见问题）。另新增 `test/test_point_table.cpp`，覆盖任意命名点表读取、缺省 yaw 补 0 和非法条目整体失败且不修改输出。正式决策节点 `decision_node.cpp`、`decision_core.*` 和默认点表/参数未改动。
+- 验证：本机为 Windows、无 ROS 2 环境，未执行 `colcon build`，也未运行测试节点、新 launch 或新增 gtest 用例；`loadNamedPoints` 与测试节点的编译、时间轴、到达判定和参数覆盖均待目标机 `colcon build --packages-select mas2027_decision && colcon test --packages-select mas2027_decision` 后验证。新增的 Python 文件只做人工检查，未运行。IDE clangd 报错仍是缺少 ROS 头文件路径导致，构建后应消失。
+
 ## 2026-10-23 — 为 `mas2027_decision` 补充函数、参数与成员注释
 
 - 行为：给 `mas2027_decision` 的源码补注释，便于逐个文件阅读：`decision_core.hpp/.cpp` 每个函数说明用途、参数含义和返回值；`decision_node.cpp` 的构造流程、每个成员函数、全部 ROS 参数和成员变量加行内注释；`point_table.hpp/.cpp` 的字段与函数参数加注释；`start_anchor.hpp` 的每个方法补参数与单位；`decision_params.hpp` 的每个阈值补含义，并修正"比赛时间未知时按不在任何时间窗内处理"的错误描述——实际实现是回血窗口视为打开、末段冲锋不触发；测试用例前补场景说明。无逻辑改动，阈值默认值和行为保持不变。

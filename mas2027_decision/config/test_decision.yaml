@@ -1,0 +1,37 @@
+mas2027_decision_test:
+  ros__parameters:
+    # 测试 launch 会覆盖成 true；单独 ros2 run 时默认不动。
+    enabled: false
+    tick_period_s: 0.1
+
+    # 导航接口
+    odom_topic: /Odometry
+    odom_frame: odom
+    goal_frame: map          # 纯无图模式改成 odom
+    goal_topic: /goal_pose
+
+    # 测试点表（launch 会用 share 目录下的 test_points.yaml 覆盖该路径）
+    points_file: ""
+
+    # 脚本：home 点名字 + 巡逻顺序
+    home_name: home
+    patrol_points: [a1, a2, a3]
+
+    # 时序
+    start_delay_s: 5.0        # 启动后原地等待
+    dwell_s: 5.0              # 每个点驻留时间
+    arrive_tolerance_m: 0.4   # 距目标多少米算到达
+    arrive_timeout_s: 60.0    # 单点超时后跳过，0 表示不启用
+
+    # 回血回差
+    heal_enter: 0.30          # hp 低于它回 home
+    heal_exit: 0.60           # hp 高于它恢复巡逻
+
+    # 目标去重（避免每帧重新提交目标造成顿挫）
+    goal_dedupe_m: 0.30
+    goal_republish_s: 3.0
+
+    # 调试输入：运行时用 ros2 param set 改
+    #   ros2 param set /mas2027_decision_test debug_hp_ratio 0.2   # 触发回 home
+    #   ros2 param set /mas2027_decision_test debug_hp_ratio 0.7   # 恢复巡逻
+    debug_hp_ratio: 1.0

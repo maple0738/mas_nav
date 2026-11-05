@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <exception>
+#include <utility>
 #include <vector>
 
 namespace mas2027_decision {
@@ -81,6 +82,60 @@ bool loadPointTable(const std::string& path, PointTable* table, std::string* err
   }
 
   table->loaded = true;
+  return true;
+}
+
+bool loadNamedPoints(const std::string& path,
+                     std::map<std::string, Waypoint>* out,
+                     std::string* error) {
+  if (!out) {
+    return false;
+  }
+  if (path.empty()) {
+    if (error) {
+      *error = "points_file is empty";
+    }
+    return false;
+  }
+
+  YAML::Node root;
+  try {
+    root = YAML::LoadFile(path);
+  } catch (const std::exception& e) {
+    if (error) {
+      *error = std::string("failed to read points file: ") + e.what();
+    }
+    return false;
+  }
+
+  if (!root.IsMap()) {
+    if (error) {
+      *error = "points file must be a flat map of name: [x, y(, yaw)]";
+    }
+    return false;
+  }
+
+  std::map<std::string, Waypoint> result;
+  try {
+    for (const auto& entry : root) {
+      const std::string key = entry.first.as<std::string>();
+      Waypoint wp;
+      if (!parseWaypoint(entry.second, &wp)) {
+        if (error) {
+          *error = "invalid point: " + key + " (expect [x, y] or [x, y, yaw])";
+        }
+        return false;
+      }
+      result[key] = wp;
+    }
+  } catch (const YAML::Exception& e) {
+    if (error) {
+      *error = std::string("invalid points file: ") + e.what();
+    }
+    return false;
+  }
+
+  *out = std::move(result);
   return true;
 }
 

@@ -7,7 +7,7 @@
     python3 tools/teach_points.py --file mas2027_decision/config/points.yaml
 
 每输入一个点名（如 home），脚本会读取 TF 中 parent -> child 的位姿并写回 YAML。
-已有文件会被读入并保留未修改的键。
+已有文件会被读入并保留未修改的键；同名点覆盖原值，新名字追加到文件末尾。
 """
 import argparse
 import math
@@ -94,9 +94,11 @@ def main() -> int:
             except Exception as exc:  # noqa: BLE001 - 示教工具，直接显示原因
                 print(f"  取 TF 失败: {exc}")
                 continue
+            overwrite = name in points
             points[name] = pose
             save_points(args.file, points)
-            print(f"  {name}: x={pose[0]} y={pose[1]} yaw={pose[2]}  (已保存)")
+            action = "覆盖" if overwrite else "新增"
+            print(f"  {name}: x={pose[0]} y={pose[1]} yaw={pose[2]}  ({action}并保存)")
     except KeyboardInterrupt:
         pass
     finally:

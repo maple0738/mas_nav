@@ -1,0 +1,12 @@
+# 假决策测试用点表。格式与 points.yaml 相同：name: [x, y, yaw]。
+#
+# 这些坐标只是占位，实际测试请用示教工具改写：
+#   ros2 run mas2027_decision teach_points.py --file <本文件路径>
+# 同名点会覆盖原值，新名字会追加到文件末尾（yaml.safe_dump 会重写整个文件，
+# 文件里的注释会丢失，坐标不会丢）。
+#
+# home 是低血返回点；a1/a2/a3 是巡逻顺序（见 test_decision.yaml 的 patrol_points）。
+home: [0.0, 0.0, 0.0]
+a1: [1.0, 0.0, 0.0]
+a2: [2.0, 0.0, 0.0]
+a3: [3.0, 0.0, 0.0]

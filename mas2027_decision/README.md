@@ -18,11 +18,16 @@ mas2027_decision/
 ├── src/
 │   ├── decision_core.cpp
 │   ├── point_table.cpp
-│   └── decision_node.cpp    # ROS 节点：odom -> 决策 -> /goal_pose
+│   ├── decision_node.cpp    # ROS 节点：odom -> 决策 -> /goal_pose
+│   └── test_decision_node.cpp  # 假决策脚本节点（只用于联调）
 ├── config/
 │   ├── decision.yaml        # 阈值与话题
-│   └── points.yaml          # 示教点表
-├── launch/decision.launch.py
+│   ├── points.yaml          # 示教点表
+│   ├── test_decision.yaml   # 假决策测试参数
+│   └── test_points.yaml     # 假决策测试点表（home / a1 / a2 / a3）
+├── launch/
+│   ├── decision.launch.py
+│   └── decision_test.launch.py
 ├── test/test_decision_core.cpp
 ├── tools/teach_points.py    # 实车示教点表
 ├── docs/                    # 设计与调参说明
@@ -54,6 +59,37 @@ ros2 run mas2027_decision teach_points.py --file <points.yaml> --parent map
 ```
 
 把车摆到目标位置，输入点名（`home`、`heal`、`patrol_a` ...），回车即写入。
+同名点覆盖原值，新名字追加到文件末尾；未修改的键保留。
+
+## 假决策联调
+
+不接裁判数据，按固定脚本走一遍 `决策 -> /goal_pose -> 导航` 链路：
+
+```bash
+# 1. 先起导航（nav_executor / 定位 / TF）
+# 2. 再起测试决策
+ros2 launch mas2027_decision decision_test.launch.py
+```
+
+默认流程：原地等 5 s -> `a1` 停 5 s -> `a2` 停 5 s -> `a3` 停 5 s -> 回 `a1` 循环。
+点表来自 `config/test_points.yaml`，用示教工具改写：
+
+```bash
+ros2 run mas2027_decision teach_points.py \
+  --file <源码目录>/mas2027_decision/config/test_points.yaml --parent map
+```
+
+模拟掉血 / 回血：
+
+```bash
+ros2 param set /mas2027_decision_test debug_hp_ratio 0.2   # 回 home
+ros2 param set /mas2027_decision_test debug_hp_ratio 0.7   # 恢复巡逻
+ros2 topic echo /debug/test_state                          # 观察当前阶段
+```
+
+说明：测试节点用"当前位姿到目标点的距离"判断到达（默认 0.4 m），
+因为 `nav_executor` 没有任务状态话题；单点超时（默认 60 s）会跳过该点。
+详细步骤见 `docs/test_playbook.md`。
 
 ## 调试
 

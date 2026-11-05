@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <string>
 
 #include "mas2027_decision/types.hpp"
@@ -33,5 +34,14 @@ bool loadPointTable(const std::string& path, PointTable* table, std::string* err
 // table: 原始点表。
 // 返回: 镜像后的副本，loaded 标志原样保留。
 PointTable mirrorPointTable(const PointTable& table);
+
+// 读取任意命名的点（不限于固定字段），供测试脚本和临时点位使用。
+// path: YAML 路径，格式是扁平的 name: [x, y(, yaw)] 映射。
+// out: 输出参数，成功时填入全部解析到的点；失败时不修改。
+// error: 输出失败原因；不需要时传 nullptr。
+// 返回: 成功 true；文件读不到、不是映射、或任一值格式错误时 false。
+bool loadNamedPoints(const std::string& path,
+                     std::map<std::string, Waypoint>* out,
+                     std::string* error);
 
 }  // namespace mas2027_decision
