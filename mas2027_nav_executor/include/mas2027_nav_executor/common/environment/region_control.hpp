@@ -152,6 +152,8 @@ private:
   std::optional<uint8_t> label_;
   RegionPhase phase_{RegionPhase::NORMAL};
   std::shared_ptr<const RegionPlan> plan_;
+  // Plans are immutable after publication. Validate their arc ordering once.
+  bool arc_lengths_searchable_{false};
   std::optional<size_t> held_segment_;
   std::optional<size_t> alignment_segment_;
   std::optional<Eigen::Vector2d> last_position_odom_;

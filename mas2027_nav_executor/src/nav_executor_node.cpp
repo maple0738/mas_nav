@@ -417,6 +417,9 @@ public:
       terrain_label_sub_ = create_subscription<sensor_msgs::msg::Image>(
         label_map_topic, map_qos, [this](sensor_msgs::msg::Image::ConstSharedPtr msg) {
           terrain_grid_->updateLabels(*msg);
+          // Static topics may arrive in any order. Labels can be the last
+          // input needed to make the one-shot map snapshot publishable.
+          publish_planning_constraints();
           refresh_region_plan();
         });
       terrain_uphill_sub_ = create_subscription<sensor_msgs::msg::Image>(
@@ -454,7 +457,7 @@ public:
           RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
             "Region annotation unavailable; trajectory will be held");
         }
-        publish_trajectory_visualization(*msg);
+        publish_trajectory_visualization(msg);
       });
 
     // ── 机器人状态输入层：缓存 odometry；自转前馈和目标分别交给控制与规划入口。
@@ -503,7 +506,17 @@ public:
       std::bind(&NavExecutorNode::control_tick, this));
     global_plan_timer_ = create_wall_timer(
       std::chrono::duration<double>(1.0 / global_plan_publish_hz_),
-      std::bind(&NavExecutorNode::publish_global_plan, this));
+      [this]() {
+        publish_global_plan();
+        publish_planning_constraints(true);
+        interfaces::msg::MpcPositionCommand::SharedPtr trajectory;
+        {
+          std::lock_guard<std::mutex> lock(data_mutex_);
+          trajectory = trajectory_;
+        }
+        // Catch subscriptions opened after the last trajectory/map update.
+        if (trajectory) publish_trajectory_visualization(trajectory);
+      });
   }
 
   rclcpp_lifecycle::LifecycleNode::SharedPtr planner_node() const
@@ -518,13 +531,17 @@ public:
 
 private:
   // 地图可视化层：把 TerrainGrid 约束栅格和受限/禁止点转换成 OccupancyGrid 与 Marker。
-  void publish_planning_constraints()
+  void publish_planning_constraints(bool marker_only = false)
   {
     if (!terrain_grid_) return;
+    const bool want_marker = planning_constraints_marker_pub_->get_subscription_count() > 0;
+    const auto revision = terrain_grid_->revision();
+    if (marker_only && (!want_marker || constraints_marker_revision_ == revision)) return;
     auto constraints = terrain_grid_->planningConstraints();
     if (!constraints) return;
     constraints->header.stamp = now();
-    planning_constraints_pub_->publish(*constraints);
+    if (!marker_only) planning_constraints_pub_->publish(*constraints);
+    if (!want_marker) return;
 
     visualization_msgs::msg::Marker markers;
     markers.header = constraints->header;
@@ -555,12 +572,20 @@ private:
       markers.colors.push_back(color);
     }
     planning_constraints_marker_pub_->publish(markers);
+    constraints_marker_revision_ = revision;
   }
 
   // 局部轨迹可视化层：把 MINCO 命令点转换为 Path，并按速度生成着色轨迹 Marker。
-  void publish_trajectory_visualization(const interfaces::msg::MpcPositionCommand & trajectory)
+  void publish_trajectory_visualization(
+    const interfaces::msg::MpcPositionCommand::SharedPtr & message)
   {
+    const auto & trajectory = *message;
     if (trajectory.cmds.empty()) return;
+    const bool want_path = minco_path_pub_->get_subscription_count() > 0 &&
+      last_visualized_path_.lock() != message;
+    const bool want_marker = minco_trajectory_pub_->get_subscription_count() > 0 &&
+      last_visualized_marker_.lock() != message;
+    if (!want_path && !want_marker) return;
 
     nav_msgs::msg::Path path;
     path.header = trajectory.header;
@@ -573,22 +598,34 @@ private:
     marker.action = visualization_msgs::msg::Marker::ADD;
     marker.pose.orientation.w = 1.0;
     marker.scale.x = 0.07;
-    path.poses.reserve(trajectory.cmds.size());
-    marker.points.reserve(trajectory.cmds.size());
-    marker.colors.reserve(trajectory.cmds.size());
-    for (const auto & command : trajectory.cmds) {
-      geometry_msgs::msg::PoseStamped pose;
-      pose.header = path.header;
-      pose.pose.position = command.position;
-      pose.pose.orientation = tf2::toMsg(tf2::Quaternion(
-        0.0, 0.0, std::sin(command.yaw * 0.5), std::cos(command.yaw * 0.5)));
-      path.poses.push_back(pose);
-      marker.points.push_back(command.position);
-      marker.colors.push_back(
-        velocity_color(command.vel_norm, velocity_color_min_, velocity_color_max_));
+    if (want_path) path.poses.reserve(trajectory.cmds.size());
+    if (want_marker) {
+      marker.points.reserve(trajectory.cmds.size());
+      marker.colors.reserve(trajectory.cmds.size());
     }
-    minco_path_pub_->publish(path);
-    minco_trajectory_pub_->publish(marker);
+    for (const auto & command : trajectory.cmds) {
+      if (want_path) {
+        geometry_msgs::msg::PoseStamped pose;
+        pose.header = path.header;
+        pose.pose.position = command.position;
+        pose.pose.orientation = tf2::toMsg(tf2::Quaternion(
+          0.0, 0.0, std::sin(command.yaw * 0.5), std::cos(command.yaw * 0.5)));
+        path.poses.push_back(pose);
+      }
+      if (want_marker) {
+        marker.points.push_back(command.position);
+        marker.colors.push_back(
+          velocity_color(command.vel_norm, velocity_color_min_, velocity_color_max_));
+      }
+    }
+    if (want_path) {
+      minco_path_pub_->publish(path);
+      last_visualized_path_ = message;
+    }
+    if (want_marker) {
+      minco_trajectory_pub_->publish(marker);
+      last_visualized_marker_ = message;
+    }
   }
 
   // 全局路线可视化层：显示全局搜索器（SMAC 2D / Astar，odom 系）的折线。与 MINCO 轨迹分开显示：轨迹是
@@ -596,6 +633,9 @@ private:
   void publish_global_plan()
   {
     if (!path_planner_ || !global_plan_pub_ || !global_plan_marker_pub_) return;
+    const bool want_path = global_plan_pub_->get_subscription_count() > 0;
+    const bool want_marker = global_plan_marker_pub_->get_subscription_count() > 0;
+    if (!want_path && !want_marker) return;
 
     std::vector<geometry_msgs::msg::PoseStamped> plan;
     const bool has_plan = path_planner_->copyLatestGlobalPath(plan) && plan.size() >= 2U;
@@ -619,13 +659,20 @@ private:
       return;
     }
 
-    const auto & last = plan.back();
+    const auto last_position = plan.back().pose.position;
 
     nav_msgs::msg::Path path;
     path.header.frame_id = plan.front().header.frame_id.empty()
       ? odom_frame_ : plan.front().header.frame_id;
     path.header.stamp = now();
-    path.poses = plan;
+    if (want_path) {
+      // Publish before moving on to optional Marker construction.
+      path.poses = std::move(plan);
+      global_plan_pub_->publish(path);
+    }
+    const auto & poses = want_path ? path.poses : plan;
+    global_plan_published_ = true;
+    if (!want_marker) return;
 
     // 抬高 3 cm，避免与 z=0 的代价图/规划约束栅格打架闪面。
     const double z_offset = 0.03;
@@ -642,28 +689,22 @@ private:
     line.color.g = static_cast<float>(std::clamp(global_plan_color_g_, 0.0, 1.0));
     line.color.b = static_cast<float>(std::clamp(global_plan_color_b_, 0.0, 1.0));
     line.color.a = 1.0F;
-    line.points.reserve(plan.size());
-    for (const auto & pose : plan) {
-      line.points.push_back(pose.pose.position);
-    }
-
     // 终点球：让「全局搜索最后停在哪」也一目了然（到点容差内可能不是精确目标点）。
     visualization_msgs::msg::Marker goal_dot = line;
     goal_dot.id = 1;
     goal_dot.type = visualization_msgs::msg::Marker::SPHERE;
     goal_dot.points.clear();
-    goal_dot.pose.position = last.pose.position;
+    goal_dot.pose.position = last_position;
     goal_dot.pose.position.z += z_offset;
     goal_dot.scale.x = global_plan_line_width_ * 2.5;
     goal_dot.scale.y = global_plan_line_width_ * 2.5;
     goal_dot.scale.z = global_plan_line_width_ * 2.5;
 
-    global_plan_pub_->publish(path);
+    line.points.reserve(poses.size());
+    for (const auto & pose : poses) line.points.push_back(pose.pose.position);
     global_plan_marker_pub_->publish(line);
     global_plan_marker_pub_->publish(goal_dot);
-    // 每个 tick 都重发（不是只在变化时发）：RViz 常在本节点之后才打开，靠 transient_local
-    // 缓存定期重发才能看到完整折线，也避免 Marker 被后续消息挤出；5 Hz 的开销可忽略。
-    global_plan_published_ = true;
+    // 有订阅时按可视化频率重发；无人订阅时不复制路线或构造消息。
   }
 
   // 任务接入层：检查目标消息基本有效性，再交给 PathPlanner 检查地图、定位、TF 和在线地图。
@@ -1033,6 +1074,9 @@ private:
   rclcpp::Publisher<interfaces::msg::RegionStatus>::SharedPtr region_status_pub_;
   // 可视化输出接口层：局部/全局路径、优化轨迹和地图规划约束。
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr minco_path_pub_;
+  std::weak_ptr<const interfaces::msg::MpcPositionCommand> last_visualized_path_;
+  std::weak_ptr<const interfaces::msg::MpcPositionCommand> last_visualized_marker_;
+  std::optional<uint64_t> constraints_marker_revision_;
   // 全局搜索折线；MINCO 局部优化轨迹由 minco_path_pub_ 发布。
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr global_plan_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr global_plan_marker_pub_;

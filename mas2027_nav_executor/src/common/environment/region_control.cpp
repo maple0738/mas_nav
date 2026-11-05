@@ -68,12 +68,28 @@ std::optional<uint8_t> onlineLabelAt(
   return static_cast<uint8_t>(value);
 }
 
+size_t firstSegmentAfter(const RegionPlan & plan, double s, bool searchable)
+{
+  if (!searchable || std::isnan(s)) return 1;
+  return static_cast<size_t>(std::upper_bound(
+    plan.arc_lengths.begin() + 1, plan.arc_lengths.end(), s) - plan.arc_lengths.begin());
+}
+
 double projectProgress(const RegionPlan & plan, const Eigen::Vector2d & position,
-  double minimum_s, double maximum_s)
+  double minimum_s, double maximum_s, bool searchable)
 {
   double best_distance = std::numeric_limits<double>::infinity();
   double best_s = 0.0;
-  for (size_t i = 1; i < plan.positions_odom.size(); ++i) {
+  size_t first = 1, end = plan.positions_odom.size();
+  if (searchable && !std::isnan(minimum_s) && !std::isnan(maximum_s)) {
+    // Include segments touching either boundary, including repeated arc values.
+    const auto & arcs = plan.arc_lengths;
+    first = static_cast<size_t>(std::lower_bound(arcs.begin() + 1, arcs.end(), minimum_s) -
+      arcs.begin());
+    end = static_cast<size_t>(std::upper_bound(arcs.begin(), arcs.end() - 1, maximum_s) -
+      arcs.begin()) + 1;
+  }
+  for (size_t i = first; i < end; ++i) {
     if (plan.arc_lengths[i] < minimum_s || plan.arc_lengths[i - 1] > maximum_s) continue;
     const Eigen::Vector2d delta = plan.positions_odom[i] - plan.positions_odom[i - 1];
     const double length_squared = delta.squaredNorm();
@@ -260,6 +276,11 @@ RegionController::RegionController(uint8_t normal_mode, double normal_speed,
 void RegionController::setPlan(std::shared_ptr<const RegionPlan> plan)
 {
   if (plan_ == plan) return;
+  arc_lengths_searchable_ = plan && plan->arc_lengths.size() >= 2 &&
+    plan->arc_lengths.size() == plan->positions_odom.size() &&
+    std::all_of(plan->arc_lengths.begin(), plan->arc_lengths.end(),
+      [](double s) { return std::isfinite(s); }) &&
+    std::is_sorted(plan->arc_lengths.begin(), plan->arc_lengths.end());
   alignment_segment_.reset();
   retained_alignment_active_ = false;
   if (!plan) {
@@ -315,7 +336,8 @@ bool RegionController::frontEntryAllowed(const RegionSegment & segment,
     (continuing ? front_entry_lateral_hysteresis_ : 0.0);
   if (along < -0.05 || lateral > lateral_limit) return false;
   // Position alone is insufficient at a hairpin: finish the approach turn first.
-  for (size_t i = 1; i < plan_->positions_odom.size(); ++i) {
+  for (size_t i = firstSegmentAfter(*plan_, progress_ + 1e-6, arc_lengths_searchable_);
+    i < plan_->positions_odom.size(); ++i) {
     if (plan_->arc_lengths[i] <= progress_+1e-6) continue;
     const Eigen::Vector2d tangent = plan_->positions_odom[i]-plan_->positions_odom[i-1];
     if (tangent.norm() > 1e-9)
@@ -374,7 +396,7 @@ uint8_t RegionController::update(const Eigen::Vector2d & position_odom,
     (position_odom - *last_position_odom_).norm() : 0.25;
   const double maximum_s = progress_ + 2.0 * moved + 0.02;
   progress_ = std::max(progress_, projectProgress(*plan_, position_odom,
-    std::max(0.0, progress_ - 0.05), maximum_s));
+    std::max(0.0, progress_ - 0.05), maximum_s, arc_lengths_searchable_));
   last_position_odom_ = position_odom;
   if (undulating_released_progress_ && progress_ >= *undulating_released_progress_ + 0.5)
     undulating_released_progress_.reset();
@@ -496,7 +518,8 @@ std::optional<double> RegionController::trajectoryHeadingErrorDegrees(double lio
   // Follow the current MINCO path tangent, including changes inside a curved region.
   // At a vertex prefer the outgoing segment; at the end retain the last nonzero tangent.
   const double target_s = progress_;
-  for (size_t i = 1; i < plan_->positions_odom.size(); ++i) {
+  for (size_t i = firstSegmentAfter(*plan_, target_s + 1e-6, arc_lengths_searchable_);
+    i < plan_->positions_odom.size(); ++i) {
     if (plan_->arc_lengths[i] <= target_s + 1e-6) continue;
     const Eigen::Vector2d direction = plan_->positions_odom[i] - plan_->positions_odom[i - 1];
     if (!direction.allFinite() || direction.squaredNorm() <= 1e-12) continue;

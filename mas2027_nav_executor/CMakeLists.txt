@@ -114,6 +114,11 @@ install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_visualization_publication test/test_visualization_publication.py
+    TIMEOUT 60
+    ENV "NAV_EXECUTOR_BINARY=$<TARGET_FILE:${PROJECT_NAME}_node>"
+        "NAV_EXECUTOR_CONFIG_DIR=${CMAKE_CURRENT_SOURCE_DIR}/config")
   ament_add_gtest(test_polyline_point_index test/test_polyline_point_index.cpp)
   target_include_directories(test_polyline_point_index PRIVATE include)
   target_link_libraries(test_polyline_point_index Eigen3::Eigen)

@@ -144,7 +144,11 @@ PathPlanner::PathPlanner(std::shared_ptr<TerrainGrid> terrain, double odom_timeo
       [this, adapter, max_cells = global_config.max_cells]() {
         const auto source = adapter->snapshot();
         if (!source || !std::isfinite(source->stamp) ||
-          std::abs(node_->now().seconds() - source->stamp) > rog_map_timeout_s_) return;
+          std::abs(node_->now().seconds() - source->stamp) > rog_map_timeout_s_) {
+          // Visualization can catch up even when no fresh sensor update arrives.
+          publishTerrainVisualization();
+          return;
+        }
         const auto update_started = std::chrono::steady_clock::now();
         const auto result = online_global_map_->update(*source);
         const double update_ms = std::chrono::duration<double, std::milli>(
@@ -161,7 +165,10 @@ PathPlanner::PathPlanner(std::shared_ptr<TerrainGrid> terrain, double odom_timeo
             const auto terrain_grid = snapshot->terrainGrid();
             global_terrain_pub_->publish(terrain_grid);
             global_uphill_pub_->publish(snapshot->uphillImage());
-            global_terrain_markers_pub_->publish(terrainMarkers(terrain_grid));
+            if (global_terrain_markers_pub_->get_subscription_count() > 0) {
+              global_terrain_markers_pub_->publish(terrainMarkers(terrain_grid));
+              terrain_marker_revision_ = snapshot->revision();
+            }
           }
         } else if (result == OnlineGlobalMap::UpdateResult::CELL_LIMIT) {
           RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
@@ -170,6 +177,7 @@ PathPlanner::PathPlanner(std::shared_ptr<TerrainGrid> terrain, double odom_timeo
           RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
             "Online global map rejected invalid or unaligned ROGMap snapshot");
         }
+        publishTerrainVisualization();
       }, global_map_callback_group_);
     RCLCPP_INFO(node_->get_logger(), "Online global map enabled: %.3f m/cell, %.1f Hz, limit=%zu cells",
       global_config.resolution, rate, global_config.max_cells);
@@ -186,6 +194,15 @@ PathPlanner::~PathPlanner()
   task_timer_.reset();
   task_manager_.reset();
   if (planner_) planner_->cleanup();
+}
+
+void PathPlanner::publishTerrainVisualization()
+{
+  if (global_terrain_markers_pub_->get_subscription_count() == 0) return;
+  const auto snapshot = online_global_map_->snapshot();
+  if (!snapshot || terrain_marker_revision_ == snapshot->revision()) return;
+  global_terrain_markers_pub_->publish(terrainMarkers(snapshot->terrainGrid()));
+  terrain_marker_revision_ = snapshot->revision();
 }
 
 std::shared_ptr<rog_map::MapQueryInterface> PathPlanner::mapQuery() const

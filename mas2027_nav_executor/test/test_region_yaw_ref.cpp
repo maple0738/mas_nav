@@ -172,6 +172,83 @@ TEST(RegionYawRef, SkipsDuplicateEntryPointsAndClearsOnSemanticRefresh)
   EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
 }
 
+TEST(RegionYawRef, RepeatedArcBoundariesChooseOutgoingHeadingAndRetainTheFinalTangent)
+{
+  auto plan = std::make_shared<RegionPlan>();
+  plan->trajectory_id = 1;
+  plan->positions_odom = {{0, 0}, {1, 0}, {1, 0}, {1, 1}, {1, 1}};
+  plan->arc_lengths = {0, 1, 1, 2, 2};
+  plan->segments.push_back({6, 6, 1, 2, 0, 0, 0, 0, 2, 3});
+  RegionController controller(4, 3, 4, 2, 4);
+  controller.setPlan(plan);
+  controller.update({0, 0});
+  controller.update({0.5, 0});
+  EXPECT_NEAR(controller.progress(), 0.5, 1e-8);
+  ASSERT_TRUE(controller.trajectoryHeadingErrorDegrees(0));
+  EXPECT_NEAR(*controller.trajectoryHeadingErrorDegrees(0), 0.0, 1e-8);
+
+  // At the turn, both a completed segment and a zero-length segment end at
+  // s=1. The desired heading must come from the outgoing vertical segment.
+  controller.update({1, 0});
+  EXPECT_NEAR(controller.progress(), 1.0, 1e-8);
+  ASSERT_TRUE(controller.trajectoryHeadingErrorDegrees(0));
+  EXPECT_NEAR(*controller.trajectoryHeadingErrorDegrees(0), 90.0, 1e-8);
+  controller.update({1, 0.5});
+  controller.update({1, 1});
+  EXPECT_NEAR(controller.progress(), 2.0, 1e-8);
+  EXPECT_EQ(controller.phase(), RegionPhase::RELEASING);
+  ASSERT_TRUE(controller.trajectoryHeadingErrorDegrees(0));
+  EXPECT_NEAR(*controller.trajectoryHeadingErrorDegrees(0), 90.0, 1e-8);
+}
+
+TEST(RegionYawRef, APlanWithOnlyZeroLengthSegmentsDoesNotInventAHeading)
+{
+  auto plan = std::make_shared<RegionPlan>();
+  plan->trajectory_id = 1;
+  plan->positions_odom = {{0, 0}, {0, 0}, {0, 0}};
+  plan->arc_lengths = {0, 0, 0};
+  plan->segments.push_back({6, 6, 1, 2, 0, 0, 0, 0, 1, 2});
+  RegionController controller(4, 3, 4, 2, 4);
+  controller.setPlan(plan);
+  controller.update({0, 0});
+  EXPECT_DOUBLE_EQ(controller.progress(), 0.0);
+  EXPECT_TRUE(controller.alignmentActive());
+  EXPECT_FALSE(controller.trajectoryHeadingErrorDegrees(0));
+}
+
+TEST(RegionYawRef, SemanticRefreshRechecksArcOrderingBeforeChoosingHeading)
+{
+  auto plan = std::make_shared<RegionPlan>();
+  plan->trajectory_id = 1;
+  plan->positions_odom = {{0, 0}, {1, 0}, {1, 1}, {2, 1}, {3, 1}};
+  plan->arc_lengths = {0, 1, 2, 3, 4};
+  plan->segments.push_back({6, 6, 1, 2, 0, 0, 0, 0, 4, 5});
+  RegionController controller(4, 3, 4, 2, 4);
+  controller.setPlan(plan);
+  controller.update({0, 0});
+  controller.update({1, 0.8});
+  EXPECT_NEAR(controller.progress(), 1.8, 1e-8);
+
+  // A refreshed annotation of the same trajectory keeps progress. An
+  // unordered arc array must use the original linear fallback rather than
+  // skipping the current vertical segment during binary search.
+  auto unordered = std::make_shared<RegionPlan>(*plan);
+  unordered->arc_lengths = {0, 1, 2, 1.5, 3};
+  controller.setPlan(unordered);
+  controller.update({1, 0.8});
+  EXPECT_NEAR(controller.progress(), 1.8, 1e-8);
+  ASSERT_TRUE(controller.trajectoryHeadingErrorDegrees(0));
+  EXPECT_NEAR(*controller.trajectoryHeadingErrorDegrees(0), 90.0, 1e-8);
+
+  // Replacing it with a valid immutable plan restores the ordered lookup;
+  // an exact vertex still chooses the outgoing horizontal tangent.
+  controller.setPlan(std::make_shared<RegionPlan>(*plan));
+  controller.update({1, 1});
+  EXPECT_NEAR(controller.progress(), 2.0, 1e-8);
+  ASSERT_TRUE(controller.trajectoryHeadingErrorDegrees(0));
+  EXPECT_NEAR(*controller.trajectoryHeadingErrorDegrees(0), 0.0, 1e-8);
+}
+
 TEST(RegionYawRef, ReplanningAtThePreparationBoundaryKeepsTheLowerFollowBaseline)
 {
   RegionController controller(4, 3, 4, 2, 4);

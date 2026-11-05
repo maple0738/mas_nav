@@ -105,6 +105,8 @@ map_files:
 
 ## 查看状态
 
+Path 和 Marker 按话题订阅情况生成；无人查看时跳过可视化构造。RViz 后打开会自动补发当前数据，局部轨迹和静态约束 Marker 的补发检查频率由 `node.visualization.global_plan_publish_hz` 控制。规划使用的地图话题不受可视化订阅开关影响；静态代价、标签和方向图按任意顺序到达后，约束栅格均会在地图就绪时发布。
+
 ```bash
 ros2 param get /nav_executor node.map_source
 ros2 param get /nav_executor planner.rog_map.projection.terrain.undulating.min_peak_to_trough_m

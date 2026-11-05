@@ -1,6 +1,8 @@
 #pragma once
 
 #include <memory>
+#include <cstdint>
+#include <optional>
 #include <string>
 
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -43,6 +45,8 @@ public:
   bool copyLatestGlobalPath(std::vector<geometry_msgs::msg::PoseStamped> & out) const;
 
 private:
+  void publishTerrainVisualization();
+  std::optional<uint64_t> terrain_marker_revision_;
   rclcpp_lifecycle::LifecycleNode::SharedPtr node_;
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
