@@ -313,22 +313,6 @@ public:
     load("projection.denoise_occ_max", layer_denoise_occ_max);
     load("projection.body_exclusion_radius", body_exclusion_radius);
     body_exclusion_radius = std::max(0.0, body_exclusion_radius);
-    prior_map_enable = false;
-    prior_map_yaml_path.clear();
-    prior_map_pgm_path.clear();
-    prior_map_frame = "map";
-    load("projection.prior_map.enable", prior_map_enable);
-    load("projection.prior_map.yaml_path", prior_map_yaml_path);
-    load("projection.prior_map.pgm_path", prior_map_pgm_path);
-    load("projection.prior_map.frame_id", prior_map_frame);
-    if (prior_map_enable && prior_map_yaml_path.empty()) {
-      throw std::invalid_argument(
-        "projection.prior_map.yaml_path must not be empty when prior map fusion is enabled.");
-    }
-    if (prior_map_enable && prior_map_frame.empty()) {
-      throw std::invalid_argument(
-        "projection.prior_map.frame_id must not be empty when prior map fusion is enabled.");
-    }
     if (layer_fill_occ_min < 1 || layer_fill_occ_min > 8 ||
         layer_denoise_occ_max < 0 || layer_denoise_occ_max > 7 ||
         layer_denoise_occ_max >= layer_fill_occ_min) {
@@ -588,10 +572,6 @@ public:
   // Corner radius of the chassis square used to filter own-body returns in
   // the registered cloud before raycasting; accumulated occupancy is retained.
   double body_exclusion_radius{0.302};
-  bool prior_map_enable{false};
-  string prior_map_yaml_path{};
-  string prior_map_pgm_path{};
-  string prior_map_frame{"map"};
 
   bool field_en{true};
   double field_inflation_radius{0.33};

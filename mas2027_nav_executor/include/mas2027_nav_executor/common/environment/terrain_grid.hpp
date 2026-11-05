@@ -18,6 +18,7 @@ namespace mas2027_nav_executor {
 class TerrainGrid final
 {
 public:
+  // Repeated static content preserves the snapshot and revision, regardless of timestamps.
   void updateCost(const nav_msgs::msg::OccupancyGrid & grid);
   void updateLabels(const sensor_msgs::msg::Image & image);
   void updateDirections(const sensor_msgs::msg::Image & image);

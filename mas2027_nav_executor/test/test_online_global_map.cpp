@@ -458,6 +458,58 @@ TEST(OnlineGlobalMap, ConfirmedWaveStripLatchesFixedLengthCorridorForSparseFrame
   ASSERT_EQ(map.update(later), Result::UPDATED);
   EXPECT_TRUE(map.snapshot()->nearWave(2.5, 2.0, 0.0));
   EXPECT_FALSE(map.snapshot()->nearWave(8.0, 2.0, 0.0));
+
+  later.sequence = 3; later.stamp = 31.0;
+  ASSERT_EQ(map.update(later), Result::UPDATED);
+  EXPECT_TRUE(map.snapshot()->nearWave(2.5, 2.0, 0.0));
+  later.sequence = 4; later.stamp = 32.0;
+  ASSERT_EQ(map.update(later), Result::UPDATED);
+  EXPECT_FALSE(map.snapshot()->nearWave(2.5, 2.0, 0.0));
+}
+
+TEST(OnlineGlobalMap, RejectedSourceCannotMoveOrExpireTheWaveCorridor)
+{
+  constexpr int size = 81;
+  constexpr double res = .05;
+  for (const bool replayed_sequence : {false, true}) {
+    OnlineGlobalMap map(immediateConfig(), "odom");
+    map.setWaveTravelDirection({1.0, 0.0});
+    auto first = source(10, 0, 0, 2, size, size, res);
+    first.terrain_labels.assign(size * size, 0U);
+    first.uphill_x.assign(size * size, 0.0F);
+    first.uphill_y.assign(size * size, 0.0F);
+    for (int y = 0; y < size; ++y) for (int x = 20; x <= 22; ++x)
+      first.terrain_labels[static_cast<size_t>(y) * size + x] = 7U;
+    ASSERT_EQ(map.update(first), Result::UPDATED);
+    const auto original = map.snapshot();
+    ASSERT_TRUE(original->nearWave(0.5, 2.0, 0.0));
+
+    auto rejected = first;
+    rejected.origin_x = 10.0;
+    rejected.sequence = replayed_sequence ? 10 : 11;
+    rejected.stamp = replayed_sequence ? 11.0 : 9.0;
+    EXPECT_EQ(map.update(rejected), Result::NO_NEW_OBSERVATION);
+    EXPECT_EQ(map.snapshot(), original);
+
+    // A subsequent accepted frame must inherit the original corridor, not
+    // the translated strip from a source rejected by sequence or timestamp.
+    auto later = source(12, 0, 0, 2, size, size, res);
+    later.terrain_labels.assign(size * size, 0U);
+    later.uphill_x.assign(size * size, 0.0F);
+    later.uphill_y.assign(size * size, 0.0F);
+    ASSERT_EQ(map.update(later), Result::UPDATED);
+    EXPECT_TRUE(map.snapshot()->nearWave(0.5, 2.0, 0.0));
+    EXPECT_FALSE(map.snapshot()->nearWave(12.5, 2.0, 0.0));
+
+    // A stale sequence with a far-future timestamp cannot expire it either.
+    rejected.terrain_labels.assign(size * size, 0U);
+    rejected.sequence = 11; rejected.stamp = 100.0;
+    EXPECT_EQ(map.update(rejected), Result::NO_NEW_OBSERVATION);
+    later.sequence = 13;
+    later.stamp = 13.0;
+    ASSERT_EQ(map.update(later), Result::UPDATED);
+    EXPECT_TRUE(map.snapshot()->nearWave(0.5, 2.0, 0.0));
+  }
 }
 
 TEST(OnlineGlobalMap, MirroredPlatformsUseOnlyTheirContinuousCornerRampInBothDirections)

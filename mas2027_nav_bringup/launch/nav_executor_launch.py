@@ -56,8 +56,6 @@ def _launch_setup(context):
         "planner.rog_map.performance.detailed_csv_path": os.path.join(manifest["log_dir"], "rog_map_perf_detailed.csv"),
         **control_overrides,
     }
-    if not online:
-        startup_params["planner.rog_map.projection.prior_map.yaml_path"] = map_files["occupancy_yaml"]
     robot_state_publisher = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(launch_dir, "robot_state_publisher_launch.py")
@@ -113,7 +111,6 @@ def _launch_setup(context):
     online_params = {
         "planner.exploration.unknown_as_occupied": True,
         "planner.rog_map.projection.unknown_as_occupied": True,
-        "planner.rog_map.projection.prior_map.enable": False,
         "planner.allow_unknown": False,
     } if online else {}
     # Speed and acceleration limits come from the same YAML files in both modes.

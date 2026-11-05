@@ -3,14 +3,13 @@
 #include <algorithm>
 #include <cstring>
 #include <cmath>
-#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <utility>
 
 #include <opencv2/imgproc.hpp>
-#include <Eigen/LU>
 #include <Eigen/Eigenvalues>
+#include "rog_map/ground_evidence.hpp"
 #include "rclcpp/time.hpp"
 #include "rog_map/query_adapter.hpp"
 #include "mas2027_nav_executor/common/environment/terrain_semantics.hpp"
@@ -48,73 +47,6 @@ std::shared_ptr<const std::vector<double>> buildField(const nav_msgs::msg::Occup
     (*distances)[i] = std::clamp(distance, kMinDistance, kMaxDistance);
   }
   return distances;
-}
-
-// A quantized 50 mm column can sit one voxel below its true surface, so two
-// neighboring columns may differ by more than the step threshold even on a
-// continuous grade. Around a direct height edge, test the independently
-// measured precise ground on BOTH sides with a local plane. Repeated waves
-// fit a plane within a few centimetres; a real step or one-sided return does
-// not. The edge cell itself is excluded: its height is exactly what is under
-// suspicion. This never uses ray-only support or the semantic terrain label.
-bool smoothMeasuredGround(const rog_map::MapSnapshot & source, int sx, int sy,
-  const std::function<bool(int, int)> & fresh_ground)
-{
-  if (source.ground_heights.empty()) return false;
-  constexpr int radius = 4;  // 0.2 m at the 50 mm input resolution.
-  constexpr double max_gap = 0.030;
-  constexpr double max_range = 0.090;
-  constexpr double max_slope = 0.70;
-  Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
-  Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
-  std::vector<double> heights;
-  std::vector<double> bearings;
-  double low = std::numeric_limits<double>::infinity();
-  double high = -low;
-  int count = 0;
-  for (int dy = -radius; dy <= radius; ++dy) {
-    for (int dx = -radius; dx <= radius; ++dx) {
-      const int x = sx + dx, y = sy + dy;
-      if (x < 0 || y < 0 || x >= source.width || y >= source.height) continue;
-      const size_t i = static_cast<size_t>(y) * source.width + x;
-      const uint8_t raw = source.raw_types.empty() ? source.types[i] : source.raw_types[i];
-      // Enclosure may use rounded free/ground columns, but never a real
-      // obstacle column or a ray-only unknown cell.
-      if (raw != 3U && std::isfinite(source.ground_heights[i]) && (dx || dy))
-        bearings.push_back(std::atan2(dy, dx));
-      if (!fresh_ground(x, y)) continue;
-      if (!source.height_discontinuities.empty() && source.height_discontinuities[i] != 0U) continue;
-      if (source.ground_precise.empty() || source.ground_precise[i] != 1U) continue;
-      const double z = source.ground_heights[i];
-      if (!std::isfinite(z)) continue;
-      const Eigen::Vector3d row(dx * source.resolution, dy * source.resolution, 1.0);
-      normal.noalias() += row * row.transpose();
-      rhs.noalias() += row * z;
-      heights.push_back(z);
-      low = std::min(low, z); high = std::max(high, z);
-      ++count;
-    }
-  }
-  if (count < 8 || bearings.size() < 8) return false;
-  // Reject a one-sided scan: support must surround the cell, not just form a
-  // line or half-plane whose two levels could masquerade as a grade.
-  std::sort(bearings.begin(), bearings.end());
-  constexpr double pi = 3.14159265358979323846;
-  double angular_gap = bearings.front() + 2 * pi - bearings.back();
-  for (size_t i = 1; i < bearings.size(); ++i)
-    angular_gap = std::max(angular_gap, bearings[i] - bearings[i - 1]);
-  if (angular_gap >= pi - 1e-6) return false;
-  // A continuous grade spans its heights densely. A real step leaves a wide
-  // empty interval between the two levels; excluding the suspect edge column
-  // prevents its stale rounded value from filling that interval.
-  std::sort(heights.begin(), heights.end());
-  double largest_gap = 0.0;
-  for (size_t i = 1; i < heights.size(); ++i)
-    largest_gap = std::max(largest_gap, heights[i] - heights[i - 1]);
-  if (largest_gap > max_gap || high - low > max_range) return false;
-  if (std::abs(normal.determinant()) < 1e-9) return false;
-  const Eigen::Vector3d plane = normal.fullPivLu().solve(rhs);
-  return plane.allFinite() && plane.head<2>().norm() <= max_slope;
 }
 
 }  // namespace
@@ -166,6 +98,16 @@ nav_msgs::msg::OccupancyGrid OnlineGlobalMapSnapshot::heightGrid() const
   return result;
 }
 
+bool WaveCorridor::contains(double x, double y) const
+{
+  if (!std::isfinite(x) || !std::isfinite(y) || length <= 0.0 || half_width <= 0.0)
+    return false;
+  const Eigen::Vector2d delta(x - start.x(), y - start.y());
+  const double along = delta.dot(direction);
+  const double lateral = std::abs(delta.x() * direction.y() - delta.y() * direction.x());
+  return along >= -0.2 && along <= length && lateral <= half_width;
+}
+
 bool OnlineGlobalMapSnapshot::nearWave(double x, double y, double radius) const
 {
   if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(radius) || radius < 0.0)
@@ -173,14 +115,7 @@ bool OnlineGlobalMapSnapshot::nearWave(double x, double y, double radius) const
   // A confirmed wave fixes a corridor for the rest of its known length. This
   // is the map-side counterpart of the region controller's alignment latch:
   // later sparse or missing labels must not re-open height barriers.
-  if (wave_latch_ && wave_latch_length_ > 0.0 && wave_latch_half_width_ > 0.0) {
-    const Eigen::Vector2d delta(x - wave_latch_start_.x(), y - wave_latch_start_.y());
-    const double along = delta.dot(wave_latch_dir_);
-    const double lateral = std::abs(delta.x() * wave_latch_dir_.y() -
-      delta.y() * wave_latch_dir_.x());
-    if (along >= -0.2 && along <= wave_latch_length_ && lateral <= wave_latch_half_width_)
-      return true;
-  }
+  if (wave_corridor_ && wave_corridor_->contains(x, y)) return true;
   if (terrain_labels_.empty()) return false;
   unsigned int mx = 0, my = 0;
   if (!worldToMap(x, y, mx, my)) return false;
@@ -386,6 +321,12 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
   if (ow <= 0 || oh <= 0 || static_cast<uint64_t>(ow) * oh > config_.max_cells) {
     return UpdateResult::INVALID_INPUT;
   }
+  // Reject replayed observations before they can move or expire the latched
+  // corridor. Serialize source analysis with the rest of the history update.
+  std::lock_guard<std::mutex> update_lock(update_mutex_);
+  if (source.sequence <= last_source_sequence_ || source.stamp <= last_source_stamp_) {
+    return UpdateResult::NO_NEW_OBSERVATION;
+  }
   struct Observation {
     unsigned int free_count{0};
     bool occupied{false};
@@ -408,90 +349,15 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
   };
   std::vector<Observation> observations(static_cast<size_t>(ow) * oh);
   const auto ground_history = snapshot();
-  const auto fresh_ground = [&source](int x, int y) {
-    if (source.ground_heights.empty() || x < 0 || y < 0 ||
-      x >= source.width || y >= source.height) return false;
-    const size_t i = static_cast<size_t>(y) * source.width + x;
-    const uint8_t raw = source.raw_types.empty() ? source.types[i] : source.raw_types[i];
-    const bool measured_support = raw == 2U ||
-      (raw == 1U && !source.ground_precise.empty() && source.ground_precise[i] == 1U);
-    return measured_support && source.types[i] != 3U && source.values[i] < 253U &&
-      std::isfinite(source.ground_heights[i]) &&
-      ((!source.ground_precise.empty() && source.ground_precise[i] == 1U) ||
-       source.height_deltas.empty() || (std::isfinite(source.height_deltas[i]) &&
-        source.height_deltas[i] <= source.max_step_height));
-  };
-  const auto continuous_ground = [&source, &fresh_ground, &ground_history](int x, int y) {
-    if (fresh_ground(x, y)) {
-      const double z = source.ground_heights[static_cast<size_t>(y) * source.width + x];
-      bool dense = true;
-      for (int dy = -1; dy <= 1; ++dy) for (int dx = -1; dx <= 1; ++dx) {
-        dense = dense && fresh_ground(x + dx, y + dy);
-        if (dense) dense = std::abs(source.ground_heights[
-          static_cast<size_t>(y + dy) * source.width + x + dx] - z) <= source.max_step_height + 1e-6;
-      }
-      if (dense) return true;
-    }
-    if (!ground_history || source.ground_heights.empty()) return false;
-    unsigned int hx, hy;
-    if (!ground_history->worldToMap(source.origin_x + (x + 0.5) * source.resolution,
-        source.origin_y + (y + 0.5) * source.resolution, hx, hy) ||
-      !ground_history->heightDiscontinuityMask()[static_cast<size_t>(hy) * ground_history->sizeX() + hx])
-      return false;
-    // A bounded, measured non-planar patch can disprove a quantization edge.
-    // Require a verified center and enclosing verified returns; semantic label
-    // 7 alone never clears a barrier, and one-sided/unknown support cannot do so.
-    const size_t center=static_cast<size_t>(y)*source.width+x;
-    if (!source.ground_precise.empty() && source.ground_precise[center]==1U && fresh_ground(x,y)) {
-      double low=source.ground_heights[center],high=low;
-      int count=0;bool blocked=false;std::vector<double> bearings;
-      for(int dy=-3;dy<=3;++dy) for(int dx=-3;dx<=3;++dx) {
-        const int nx=x+dx,ny=y+dy;
-        if(nx<0||ny<0||nx>=source.width||ny>=source.height) continue;
-        const size_t i=static_cast<size_t>(ny)*source.width+nx;
-        if(source.values[i]>=253U && source.types[i]==3U) blocked=true;
-        if(source.ground_precise[i]!=1U || !fresh_ground(nx,ny)) continue;
-        low=std::min(low,static_cast<double>(source.ground_heights[i]));
-        high=std::max(high,static_cast<double>(source.ground_heights[i]));
-        ++count;if(dx||dy) bearings.push_back(std::atan2(dy,dx));
-      }
-      if(!blocked && count>=6 && bearings.size()>=3 && high-low<=source.max_step_height+1e-6) {
-        std::sort(bearings.begin(),bearings.end());
-        constexpr double pi=3.14159265358979323846;
-        double gap=bearings.front()+2*pi-bearings.back();
-        for(size_t i=1;i<bearings.size();++i) gap=std::max(gap,bearings[i]-bearings[i-1]);
-        if(gap<pi-1e-6) return true;
-      }
-    }
-    // Lidar rings and the body blind spot need not produce a dense 3x3
-    // return. Correct a remembered gap only with an enclosing, measured local
-    // plane. One-sided support or the two levels of a step cannot clear it.
-    const int radius = static_cast<int>(std::ceil(0.5 / source.resolution));
-    std::vector<std::pair<Eigen::Vector3d, double>> samples;
-    std::vector<double> angles;
-    Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
-    Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
-    for (int dy = -radius; dy <= radius; ++dy) for (int dx = -radius; dx <= radius; ++dx) {
-      if (!fresh_ground(x + dx, y + dy)) continue;
-      const Eigen::Vector3d row(dx * source.resolution, dy * source.resolution, 1.0);
-      const double z = source.ground_heights[
-        static_cast<size_t>(y + dy) * source.width + x + dx];
-      normal.noalias() += row * row.transpose(); rhs += row * z;
-      samples.emplace_back(row, z);
-      if (dx || dy) angles.push_back(std::atan2(dy, dx));
-    }
-    if (samples.size() < 6 || angles.size() < 3 || std::abs(normal.determinant()) < 1e-9) return false;
-    std::sort(angles.begin(), angles.end());
-    constexpr double pi = 3.14159265358979323846;
-    double gap = angles.front() + 2 * pi - angles.back();
-    for (size_t i = 1; i < angles.size(); ++i) gap = std::max(gap, angles[i] - angles[i - 1]);
-    if (gap >= pi - 1e-6) return false;
-    const Eigen::Vector3d plane = normal.fullPivLu().solve(rhs);
-    if (!plane.allFinite() || plane.head<2>().norm() > 0.70) return false;
-    for (const auto & sample : samples)
-      if (std::abs(sample.second - plane.dot(sample.first)) > 0.5 * source.max_step_height)
-        return false;
-    return true;
+  const rog_map::GroundEvidenceView ground(source);
+  const auto continuous_ground = [&source, &ground, &ground_history](int x, int y) {
+    unsigned int hx = 0, hy = 0;
+    const bool remembered_edge = ground_history && ground_history->worldToMap(
+      source.origin_x + (x + 0.5) * source.resolution,
+      source.origin_y + (y + 0.5) * source.resolution, hx, hy) &&
+      ground_history->heightDiscontinuityMask()[
+        static_cast<size_t>(hy) * ground_history->sizeX() + hx] != 0U;
+    return ground.continuousSupport(x, y, remembered_edge);
   };
   for (int y = 0; y < source.height; ++y) {
     for (int x = 0; x < source.width; ++x) {
@@ -621,7 +487,7 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
           }
         }
       }
-      if (!wave_support && !smoothMeasuredGround(source, sx, sy, fresh_ground)) continue;
+      if (!wave_support && !ground.smoothSupport(sx, sy)) continue;
       o.clear_wave_barrier = wave_support;
       if (o.height_discontinuity) {
         o.height_discontinuity = false;
@@ -694,28 +560,21 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
           // than waiting for labels at every metre.
           constexpr double kBackwardExtension = 1.0;
           constexpr double kForwardExtension = 3.8;
-          wave_latch_active_ = true;
-          wave_latch_start_ = mean + (low - kBackwardExtension) * direction;
-          wave_latch_dir_ = direction;
-          wave_latch_length_ = (high - low) + kBackwardExtension + kForwardExtension;
-          wave_latch_half_width_ = std::min(0.75, std::max(0.55, half_width + 0.15));
+          wave_corridor_ = WaveCorridor{
+            mean + (low - kBackwardExtension) * direction, direction,
+            (high - low) + kBackwardExtension + kForwardExtension,
+            std::min(0.75, std::max(0.55, half_width + 0.15))};
           wave_latch_stamp_ = source.stamp;
         }
       }
-    } else if (wave_latch_active_ && source.stamp - wave_latch_stamp_ > 30.0) {
-      wave_latch_active_ = false;
+    } else if (wave_corridor_ && source.stamp - wave_latch_stamp_ > 30.0) {
+      wave_corridor_.reset();
     }
-  } else if (wave_latch_active_ && source.stamp - wave_latch_stamp_ > 30.0) {
-    wave_latch_active_ = false;
+  } else if (wave_corridor_ && source.stamp - wave_latch_stamp_ > 30.0) {
+    wave_corridor_.reset();
   }
   const auto in_wave_corridor = [this](double x, double y) {
-    if (!wave_latch_active_ || wave_latch_length_ <= 0.0 || wave_latch_half_width_ <= 0.0)
-      return false;
-    const Eigen::Vector2d delta(x - wave_latch_start_.x(), y - wave_latch_start_.y());
-    const double along = delta.dot(wave_latch_dir_);
-    const double lateral = std::abs(delta.x() * wave_latch_dir_.y() -
-      delta.y() * wave_latch_dir_.x());
-    return along >= -0.2 && along <= wave_latch_length_ && lateral <= wave_latch_half_width_;
+    return wave_corridor_ && wave_corridor_->contains(x, y);
   };
   int min_x = ex + 1, min_y = ey + 1, max_x = bx - 1, max_y = by - 1;
   for (int y = 0; y < oh; ++y) {
@@ -729,11 +588,7 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
       max_x = std::max(max_x, bx + x); max_y = std::max(max_y, by + y);
     }
   }
-  std::lock_guard<std::mutex> update_lock(update_mutex_);
   const auto previous = snapshot();
-  if (source.sequence <= last_source_sequence_ || source.stamp <= last_source_stamp_) {
-    return UpdateResult::NO_NEW_OBSERVATION;
-  }
   if (min_x > max_x) {
     last_source_sequence_ = source.sequence; last_source_stamp_ = source.stamp;
     return UpdateResult::NO_NEW_OBSERVATION;
@@ -882,11 +737,7 @@ OnlineGlobalMap::UpdateResult OnlineGlobalMap::update(const rog_map::MapSnapshot
   auto next = std::make_shared<OnlineGlobalMapSnapshot>();
   next->revision_ = previous ? previous->revision_ + 1 : 1;
   next->resolution_ = config_.resolution; next->stamp_ = source.stamp;
-  next->wave_latch_ = wave_latch_active_;
-  next->wave_latch_start_ = wave_latch_start_;
-  next->wave_latch_dir_ = wave_latch_dir_;
-  next->wave_latch_length_ = wave_latch_length_;
-  next->wave_latch_half_width_ = wave_latch_half_width_;
+  next->wave_corridor_ = wave_corridor_;
   auto & grid = next->grid_;
   grid.header.frame_id = frame_;
   grid.header.stamp = rclcpp::Time(static_cast<int64_t>(source.stamp * 1e9));

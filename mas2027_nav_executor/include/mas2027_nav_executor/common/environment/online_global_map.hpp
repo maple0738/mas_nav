@@ -30,6 +30,17 @@ struct OnlineGlobalMapConfig
   int terrain_clear_confirmations{10};
 };
 
+// World-fixed extent of an observed undulating strip. History and its pinned
+// snapshots share this geometry; only history owns its confirmation lifetime.
+struct WaveCorridor
+{
+  Eigen::Vector2d start{Eigen::Vector2d::Zero()};
+  Eigen::Vector2d direction{Eigen::Vector2d::UnitX()};
+  double length{0.0};
+  double half_width{0.0};
+  bool contains(double x, double y) const;
+};
+
 // Each instance is immutable. Pin one for an entire search so an expansion
 // cannot change the origin between worldToMap(), value() and mapToWorld().
 class OnlineGlobalMapSnapshot final : public rog_map::MapQueryInterface
@@ -84,11 +95,7 @@ private:
   std::vector<float> uphill_y_;
   std::vector<uint8_t> slope_side_mask_;
   std::vector<uint8_t> height_discontinuity_mask_;
-  bool wave_latch_{false};
-  Eigen::Vector2d wave_latch_start_{Eigen::Vector2d::Zero()};
-  Eigen::Vector2d wave_latch_dir_{Eigen::Vector2d::UnitX()};
-  double wave_latch_length_{0.0};
-  double wave_latch_half_width_{0.0};
+  std::optional<WaveCorridor> wave_corridor_;
   std::shared_ptr<const std::vector<double>> distances_;
   std::shared_ptr<const std::vector<double>> height_distances_;
   uint64_t revision_{0};
@@ -141,11 +148,7 @@ private:
   mutable std::mutex wave_direction_mutex_;
   Eigen::Vector2d wave_travel_direction_{Eigen::Vector2d::UnitX()};
   bool wave_travel_direction_valid_{false};
-  bool wave_latch_active_{false};
-  Eigen::Vector2d wave_latch_start_{Eigen::Vector2d::Zero()};
-  Eigen::Vector2d wave_latch_dir_{Eigen::Vector2d::UnitX()};
-  double wave_latch_length_{0.0};
-  double wave_latch_half_width_{0.0};
+  std::optional<WaveCorridor> wave_corridor_;
   double wave_latch_stamp_{0.0};
   uint64_t last_source_sequence_{0};
   double last_source_stamp_{0.0};

@@ -70,11 +70,11 @@ PathPlanner::PathPlanner(std::shared_ptr<TerrainGrid> terrain, double odom_timeo
 
   rog_map::Config config;
   config.loadFromRosNode(node_, "planner.rog_map");
-  if (!terrain_ && (!config.unknown_as_occupied || config.prior_map_enable)) {
+  if (!terrain_ && !config.unknown_as_occupied) {
     throw std::invalid_argument(
-      "online navigation requires projection.unknown_as_occupied=true and prior_map.enable=false");
+      "online navigation requires projection.unknown_as_occupied=true");
   }
-  rog_map_ = std::make_shared<rog_map::ROGMapROS>(node_, config, tf_buffer_);
+  rog_map_ = std::make_shared<rog_map::ROGMapROS>(node_, config);
   // ROGMap supplies live geometry; a non-null terrain adds prior global constraints.
   planner_ = std::make_shared<minco_planner::MincoPlanner>();
   planner_->setMap(rog_map_->queryInterface());

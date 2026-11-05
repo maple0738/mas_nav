@@ -96,7 +96,7 @@ effective_clearance = max(0, collision_dist - kEsdfJitterTolerance)
 ## ROGMap 与 RViz
 
 - ROGMap 订阅 `/cloud_registered` + `/Odometry`；RViz `ROGMAP` 分组默认显示紫色 `Occupied`（0.05 m）
-  与 `2D Distance Field`。先验图融合关闭，`Static Layer Value` 不代表地形图；投影高度、地面/墙体
+  与 `2D Distance Field`。ROGMap 只负责实时几何，静态先验统一由导航层融合；投影高度、地面/墙体
   阈值与 `planner.minco_optimizer.collision_dist` 需在静止实车上标定。已移除目标跟踪与未来预测（防振动误判）。
 - MPC 仍为全向模型（`linear.x/y`、`angular.z`，内部角速度限制 ±2 rad/s、角加速度限制 ±4 rad/s²，需按底盘标定）；最终 `w` 由下面的角速度配置覆盖。
   区域控制沿最终轨迹标注坡道、隧道和起伏路，以 `/nav_executor/chassis_cmd` 同步发布速度与

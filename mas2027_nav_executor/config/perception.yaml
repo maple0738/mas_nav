@@ -47,16 +47,7 @@
         projection:
           enable: true
           scan_z_relative_to_robot: true
-          # ROGMap 静态先验融合（当前关闭）：静态地形仍由 map_server 供给全局搜索和地形轨迹门，
-          # ROGMap 保持旧的实时局部障碍职责。
-          prior_map:
-            # 本车 map↔odom 下曾有错位记录，开启后会把净空压到安全阈值以下并叠加成永久拒绝；
-            # 重新开启前必须先专项验证图对齐。
-            enable: false
-            yaml_path: ""  # prior 模式由启动器绑定到 navigation_map.yaml 选中的地图
-            # 留空时使用 YAML 的 image 字段，并相对 YAML 所在目录解析。
-            pgm_path: ""
-            frame_id: map
+          # 静态先验统一由 map_server → TerrainGrid → FusedMapQuery 提供。
           scan_z_min_abs: -1.2
           scan_z_max_abs: 2.75
           unknown_as_occupied: false

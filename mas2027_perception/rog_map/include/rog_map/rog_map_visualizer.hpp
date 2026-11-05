@@ -23,7 +23,7 @@ public:
       esdf_neg_pub, esdf_occ_pub, occ_inf_pub, unknown_inf_pub, frontier_pub, esdf_pub,
       layer_height_delta_pub, field_pub, decay_cells_pub;
     rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr layer_value_pub,
-      layer_value_dynamic_pub, layer_value_static_pub, layer_type_pub, layer_confidence_pub,
+      layer_type_pub, layer_confidence_pub,
       terrain_label_pub;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr mkr_arr_pub,
       terrain_markers_pub;

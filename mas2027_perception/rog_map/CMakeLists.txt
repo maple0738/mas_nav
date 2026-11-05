@@ -39,9 +39,6 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
-find_package(tf2 REQUIRED)
-find_package(tf2_ros REQUIRED)
-find_package(yaml_cpp_vendor REQUIRED)
 
 set(library_name ${PROJECT_NAME})
 
@@ -80,14 +77,11 @@ ament_target_dependencies(${library_name}
         nav_msgs
         visualization_msgs
         pcl_conversions
-        tf2
-        tf2_ros
 )
 
 target_link_libraries(${library_name}
         Eigen3::Eigen
         ${PCL_LIBRARIES}
-        yaml-cpp
 )
 
 if(OpenMP_CXX_FOUND)
@@ -107,7 +101,6 @@ target_link_libraries(rog_map_node
 
 ament_target_dependencies(rog_map_node
         rclcpp
-        tf2_ros
 )
 
 install(TARGETS rog_map_node
@@ -140,19 +133,19 @@ ament_export_dependencies(
         nav_msgs
         visualization_msgs
         pcl_conversions
-        tf2
-        tf2_ros
-        yaml_cpp_vendor
 )
 
 if(BUILD_TESTING)
         find_package(ament_cmake_gtest REQUIRED)
+        find_package(yaml_cpp_vendor REQUIRED)
         ament_add_gtest(test_projection_terrain test/test_projection_terrain.cpp)
         target_link_libraries(test_projection_terrain ${library_name})
         ament_add_gtest(test_query_adapter_cell_centers test/test_query_adapter_cell_centers.cpp)
         target_link_libraries(test_query_adapter_cell_centers ${library_name})
+        ament_add_gtest(test_ground_evidence test/test_ground_evidence.cpp)
+        target_link_libraries(test_ground_evidence ${library_name})
         ament_add_gtest(test_terrain_config test/test_terrain_config.cpp)
-        target_link_libraries(test_terrain_config ${library_name})
+        target_link_libraries(test_terrain_config ${library_name} yaml-cpp)
         target_compile_definitions(test_terrain_config PRIVATE
                 TERRAIN_CONFIG_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../mas2027_nav_executor/config/terrain_recognition.yaml"
                 PERCEPTION_CONFIG_FILE="${CMAKE_CURRENT_SOURCE_DIR}/../../mas2027_nav_executor/config/perception.yaml")

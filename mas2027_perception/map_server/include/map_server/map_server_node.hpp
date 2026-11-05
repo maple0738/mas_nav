@@ -31,7 +31,6 @@ private:
     rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr cost_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr terrain_label_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr uphill_pub_;
-    rclcpp::TimerBase::SharedPtr timer_;
 };
 
 }  // namespace map_server

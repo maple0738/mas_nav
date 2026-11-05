@@ -119,7 +119,6 @@ struct RuntimeStats
   /// refreshLayers 的细分：配置/滑窗同步、脏列合并排序、掩码重建、逐格统计。
   double layer_config_sync_time{0.0};
   double layer_dirty_merge_time{0.0};
-  double fused_projection_time{0.0};
   double full_layer_refresh_count{0.0};
   double dirty_layer_update_count{0.0};
   double field_enabled{0.0};

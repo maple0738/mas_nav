@@ -57,9 +57,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
-#include <tf2/exceptions.h>
-#include <tf2/time.h>
-#include <tf2_ros/buffer.h>
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include <rog_map/rog_map.h>
@@ -95,9 +92,6 @@ class ROGMapROS : public ROGMap
   rclcpp::node_interfaces::NodeClockInterface::SharedPtr node_clock_;
   rclcpp::node_interfaces::NodeLoggingInterface::SharedPtr node_logging_;
   rclcpp::node_interfaces::NodeParametersInterface::SharedPtr node_parameters_;
-  /// 与宿主共享的 TF buffer。仅当 prior_map_frame != frame_id（先验图与局部地图不同坐标系）
-  /// 时才真正被 getPriorMapTransform() 使用；宿主没传时允许为空。
-  std::shared_ptr<tf2_ros::Buffer> tf_;
   /// 可视化发布器集合与限频定时器；visualization.enable 为 false 时保持为空。
   std::unique_ptr<ROGMapVisualizer> visualizer_driver_;
 
@@ -109,58 +103,6 @@ class ROGMapROS : public ROGMap
   void getSystemWalltimeNow(rclcpp::Time & _in) { _in = now(); };
 
   rclcpp::Time now() const { return node_clock_->get_clock()->now(); }
-
-  /// 覆写基类钩子：给出「ROGMap 局部地图坐标系 -> 先验地图坐标系」的二维刚体变换，
-  /// 供 rebuildFusedProjection() 把 PGM 先验图贴到当前滑动窗口上。
-  /// 返回 false 表示本帧拿不到有效变换，此时融合会退化为「只用在线感知结果」。
-  bool getPriorMapTransform(PriorMapTransform2D & transform) override
-  {
-    // 先验图与局部地图同坐标系时无需 TF，直接用单位变换。
-    if (cfg_.prior_map_frame == cfg_.frame_id) {
-      transform = PriorMapTransform2D{};
-      return true;
-    }
-    // 不同坐标系则必须依赖宿主注入的 TF buffer；缺失时按 2 s 节流告警，避免刷屏。
-    if (!tf_) {
-      RCLCPP_WARN_THROTTLE(node_logging_->get_logger(),
-        *node_clock_->get_clock(),
-        2000,
-        "[ROGMap] prior map TF is unavailable because the shared TF buffer is null");
-      return false;
-    }
-    try {
-      // lookupTransform(target, source, ...) returns T_target_source.
-      const auto tf_msg = tf_->lookupTransform(cfg_.prior_map_frame, cfg_.frame_id, tf2::TimePointZero);
-      transform.tx = tf_msg.transform.translation.x;
-      transform.ty = tf_msg.transform.translation.y;
-      // 只取 yaw：先验栅格是二维的，roll/pitch 无法表达，这里从四元数投影出平面旋转。
-      const auto & q = tf_msg.transform.rotation;
-      transform.yaw = std::atan2(
-        2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
-      // 显式做有限性校验：TF 异常值一旦进入融合循环会污染整张先验投影。
-      if (std::isfinite(transform.tx) && std::isfinite(transform.ty) &&
-          std::isfinite(transform.yaw)) {
-        return true;
-      }
-      RCLCPP_WARN_THROTTLE(node_logging_->get_logger(),
-        *node_clock_->get_clock(),
-        2000,
-        "[ROGMap] prior map TF from '%s' to '%s' contains a non-finite 2D transform",
-        cfg_.frame_id.c_str(),
-        cfg_.prior_map_frame.c_str());
-      return false;
-    } catch (const tf2::TransformException & error) {
-      // TF 未就绪属于启动期常见情形，按 2 s 节流告警而不是报错中断。
-      RCLCPP_WARN_THROTTLE(node_logging_->get_logger(),
-        *node_clock_->get_clock(),
-        2000,
-        "[ROGMap] cannot transform projection from '%s' to prior map frame '%s': %s",
-        cfg_.frame_id.c_str(),
-        cfg_.prior_map_frame.c_str(),
-        error.what());
-      return false;
-    }
-  }
 
   /// 从宿主节点借用各类 node interface。模板化是为了同时接受
   /// rclcpp::Node::SharedPtr 与 rclcpp_lifecycle::LifecycleNode::SharedPtr。
@@ -250,8 +192,8 @@ class ROGMapROS : public ROGMap
     /// 点云类输出：占据、原始占据、未知、膨胀占据/未知、前沿、ESDF、高度差、距离场、衰减单元。
     sensor_msgs::msg::PointCloud2 occ, raw_occ, unknown, occ_inf, unknown_inf, frontier, esdf,
       height_delta, field, decay;
-    /// 栅格类输出：融合 value、动态 value、静态先验、四分类类型图、分类置信度。
-    nav_msgs::msg::OccupancyGrid layer_value, layer_dynamic, layer_static, layer_type,
+    /// 栅格类输出：实时障碍投影、四分类类型图、分类置信度与地形标签。
+    nav_msgs::msg::OccupancyGrid layer_value, layer_type,
       layer_confidence, terrain_label;
     visualization_msgs::msg::MarkerArray markers, terrain_markers;
     // 以下 has_* 表示「本帧确实填充了对应字段」。发布端据此跳过未填充的字段，
@@ -267,8 +209,6 @@ class ROGMapROS : public ROGMap
     bool has_field{false};
     bool has_decay{false};
     bool has_layer_value{false};
-    bool has_layer_dynamic{false};
-    bool has_layer_static{false};
     bool has_layer_type{false};
     bool has_layer_confidence{false};
     bool has_terrain_label{false};
@@ -540,22 +480,10 @@ class ROGMapROS : public ROGMap
 
     // ---- 二维投影层相关的栅格/点云（低成本，每轮都构建）----
     if (layer_ && !layer_->empty()) {
-      // 融合层：在线感知与静态先验合并后的二值占据图（由 fused_projection_mask_ 转成 0/100）。
+      // 实时二维障碍 mask；静态先验由导航层的 FusedMapQuery 统一融合。
       if (vm_.layer_value_pub && vm_.layer_value_pub->get_subscription_count() >= 1) {
-        fillLayerMaskGrid(fused_projection_mask_, frame->layer_value);
+        fillLayerMaskGrid(layer_->mask(), frame->layer_value);
         frame->has_layer_value = true;
-      }
-      // 仅在线动态层：直接取 projection layer 自身的 mask。
-      if (vm_.layer_value_dynamic_pub &&
-          vm_.layer_value_dynamic_pub->get_subscription_count() >= 1) {
-        fillLayerMaskGrid(layer_->mask(), frame->layer_dynamic);
-        frame->has_layer_dynamic = true;
-      }
-      // 仅静态先验层：先验图未启用时该 mask 全为自由，仅供诊断（默认在 RViz 中关闭）。
-      if (vm_.layer_value_static_pub &&
-          vm_.layer_value_static_pub->get_subscription_count() >= 1) {
-        fillLayerMaskGrid(prior_projection_mask_, frame->layer_static);
-        frame->has_layer_static = true;
       }
       // 四分类类型图：UNKNOWN=kUnknownTypeValue(→发布为 -1)、FREE=33、PASSABLE=66、OCCUPIED=100，
       // 这样 RViz 用 costmap 配色即可把四类分成四档显示。
@@ -812,12 +740,6 @@ class ROGMapROS : public ROGMap
     if (frame->has_layer_value && vm_.layer_value_pub) {
       vm_.layer_value_pub->publish(frame->layer_value);
     }
-    if (frame->has_layer_dynamic && vm_.layer_value_dynamic_pub) {
-      vm_.layer_value_dynamic_pub->publish(frame->layer_dynamic);
-    }
-    if (frame->has_layer_static && vm_.layer_value_static_pub) {
-      vm_.layer_value_static_pub->publish(frame->layer_static);
-    }
     if (frame->has_layer_type && vm_.layer_type_pub) {
       vm_.layer_type_pub->publish(frame->layer_type);
     }
@@ -857,10 +779,6 @@ class ROGMapROS : public ROGMap
     return (vm_.unknown_pub && vm_.unknown_pub->get_subscription_count() >= 1) ||
            (vm_.unknown_inf_pub && vm_.unknown_inf_pub->get_subscription_count() >= 1) ||
            (vm_.layer_value_pub && vm_.layer_value_pub->get_subscription_count() >= 1) ||
-           (vm_.layer_value_dynamic_pub &&
-            vm_.layer_value_dynamic_pub->get_subscription_count() >= 1) ||
-           (vm_.layer_value_static_pub &&
-            vm_.layer_value_static_pub->get_subscription_count() >= 1) ||
            (vm_.layer_type_pub && vm_.layer_type_pub->get_subscription_count() >= 1) ||
            (vm_.terrain_label_pub && vm_.terrain_label_pub->get_subscription_count() >= 1) ||
            (vm_.terrain_markers_pub && vm_.terrain_markers_pub->get_subscription_count() >= 1) ||
@@ -958,7 +876,7 @@ class ROGMapROS : public ROGMap
   }
 
   /// 把 0/1 的二维 mask 转成 OccupancyGrid：mask==0（障碍）映射为 100，其余为 0。
-  /// 即 /rog_map/layer_value 与 /rog_map/layer_value_dynamic 实际发布的是【二值占据图】，
+  /// 即 /rog_map/layer_value 实际发布的是【二值占据图】，
   /// 名字里的 value 是历史沿用；真正的代价分布要看 /rog_map/layer_type。
   void fillLayerMaskGrid(const std::vector<uint8_t> & mask, nav_msgs::msg::OccupancyGrid & grid)
   {
@@ -1066,7 +984,7 @@ class ROGMapROS : public ROGMap
   }
 
   /// 构造期初始化总入口，由两个构造函数共同调用。执行顺序即依赖顺序：
-  /// 加载先验图 -> ROGMap::init() 建核心数据结构 -> 建可视化 -> 建订阅与更新线程。
+  /// ROGMap::init() 建核心数据结构 -> 建可视化 -> 建订阅与更新线程。
   void initializeRos()
   {
     // TODO: The current implementation uses a lenient QoS configuration for message transmission.
@@ -1074,16 +992,6 @@ class ROGMapROS : public ROGMap
     // 对建图而言"最新一帧"远比"不丢帧"重要，因此不要求可靠传输。
     const rclcpp::QoS qos(rclcpp::QoS(1).best_effort().keep_last(1).durability_volatile());
 
-    // 先验栅格（PGM+YAML）必须在 init() 之前加载：init() 内部会读取 prior_map_ 决定是否建融合层。
-    if (cfg_.prior_map_enable) {
-      prior_map_ = loadPriorMap(cfg_.prior_map_yaml_path, cfg_.prior_map_pgm_path);
-      RCLCPP_INFO(node_logging_->get_logger(),
-        "[ROGMap] loaded prior map %dx%d at %.3f m/cell in frame '%s'",
-        prior_map_.width,
-        prior_map_.height,
-        prior_map_.resolution,
-        cfg_.prior_map_frame.c_str());
-    }
     init();
     /// Initialize visualization module
     /// 发布器由 ROGMapVisualizer 统一创建（含各自的 QoS 与 5 Hz 定时器），
@@ -1111,8 +1019,6 @@ class ROGMapROS : public ROGMap
       vm_.field_pub = pubs.field_pub;
       vm_.decay_cells_pub = pubs.decay_cells_pub;
       vm_.layer_value_pub = pubs.layer_value_pub;
-      vm_.layer_value_dynamic_pub = pubs.layer_value_dynamic_pub;
-      vm_.layer_value_static_pub = pubs.layer_value_static_pub;
       vm_.layer_type_pub = pubs.layer_type_pub;
       vm_.terrain_label_pub = pubs.terrain_label_pub;
       vm_.layer_confidence_pub = pubs.layer_confidence_pub;
@@ -1169,11 +1075,9 @@ public:
   }
 
   /// 生命周期节点版本：适用于把地图挂到 nav2 风格的 LifecycleNode 上。
-  /// tf 仅在先验图与局部地图不同坐标系时才需要传入。
   ROGMapROS(const rclcpp_lifecycle::LifecycleNode::SharedPtr nh,
-    const rog_map::Config & cfg,
-    const std::shared_ptr<tf2_ros::Buffer> & tf = nullptr)
-  : lifecycle_nh_(nh), tf_(tf)
+    const rog_map::Config & cfg)
+  : lifecycle_nh_(nh)
   {
     bindNode(lifecycle_nh_);
     cfg_ = cfg;
@@ -1182,9 +1086,8 @@ public:
 
   /// 普通节点版本：当前 mas2027_nav_executor 走的是这一条（PathPlanner 进程内持有）。
   ROGMapROS(const rclcpp::Node::SharedPtr nh,
-    const rog_map::Config & cfg,
-    const std::shared_ptr<tf2_ros::Buffer> & tf = nullptr)
-  : nh_(nh), tf_(tf)
+    const rog_map::Config & cfg)
+  : nh_(nh)
   {
     bindNode(nh_);
     cfg_ = cfg;

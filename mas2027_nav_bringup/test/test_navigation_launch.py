@@ -69,7 +69,8 @@ class NavigationLaunchTest(unittest.TestCase):
         executor = next(node for node in nodes if node['package'] == 'mas2027_nav_executor')
         overrides = {key: value for item in executor['parameters'] if isinstance(item, dict) for key, value in item.items()}
         self.assertEqual(overrides['node.map_source'], 'prior')
-        self.assertEqual(overrides['planner.rog_map.projection.prior_map.yaml_path'], server['map_yaml_path'])
+        self.assertFalse(any(key.startswith('planner.rog_map.projection.prior_map') for key in overrides))
+        self.assertTrue(Path(server['map_yaml_path']).is_file())
         self.assertTrue(Path(server['terrain_map_path']).is_file())
 
 

@@ -35,10 +35,6 @@ void ROGMapVisualizer::configure(const rclcpp::node_interfaces::NodeBaseInterfac
   }
   pubs_.layer_value_pub =
     createPublisher<nav_msgs::msg::OccupancyGrid>(parameters, topics, "/rog_map/layer_value", qos);
-  pubs_.layer_value_dynamic_pub = createPublisher<nav_msgs::msg::OccupancyGrid>(
-    parameters, topics, "/rog_map/layer_value_dynamic", qos);
-  pubs_.layer_value_static_pub = createPublisher<nav_msgs::msg::OccupancyGrid>(
-    parameters, topics, "/rog_map/layer_value_static", qos);
   pubs_.layer_type_pub =
     createPublisher<nav_msgs::msg::OccupancyGrid>(parameters, topics, "/rog_map/layer_type", qos);
   pubs_.layer_confidence_pub =

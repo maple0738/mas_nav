@@ -1,7 +1,6 @@
 #include <map_server/map_server_node.hpp>
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <sstream>
@@ -115,7 +114,9 @@ MapServerNode::MapServerNode(const rclcpp::NodeOptions& options) : Node("map_ser
     cost_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>("cost_map", map_qos);
     terrain_label_pub_ = create_publisher<sensor_msgs::msg::Image>("terrain_label_map", map_qos);
     uphill_pub_ = create_publisher<sensor_msgs::msg::Image>("terrain_uphill_map", map_qos);
-    timer_ = create_wall_timer(std::chrono::milliseconds(500), [this] { publish_maps(); });
+    // Transient-local durability retains the static maps for late subscribers.
+    // Their content changes only when a new map is loaded at startup.
+    publish_maps();
     RCLCPP_INFO(get_logger(),
         "loaded %dx%d static terrain map at %.3f m/px, origin=(%.6f, %.6f) from %s",
         maps_.width, maps_.height, maps_.resolution,

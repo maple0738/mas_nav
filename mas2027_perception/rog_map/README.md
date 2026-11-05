@@ -65,9 +65,7 @@ flowchart LR
 | `/rog_map/inflated` | 膨胀障碍 |
 | `/rog_map/frontier` | 前沿区域 |
 | `/rog_map/esdf` | ESDF 可视化 |
-| `/rog_map/layer_value` | 动态与 PGM 静态先验融合后的二维障碍投影（**二值 mask**：100 = 障碍） |
-| `/rog_map/layer_value_dynamic` | 仅在线三维感知生成的动态二维障碍投影 |
-| `/rog_map/layer_value_static` | 仅 PGM 静态先验在当前 ROGMap 网格上的二维障碍投影 |
+| `/rog_map/layer_value` | 实时二维障碍投影（**二值 mask**：100 = 障碍）；静态先验统一由导航层融合 |
 | `/rog_map/layer_type` | 四类投影结果，按 OccupancyGrid 数值编码：`-1`=UNKNOWN、`33`=FREE、`66`=PASSABLE、`100`=OCCUPIED；RViz Map 使用 `costmap` 配色显示四档 |
 | `/rog_map/terrain_label` | 在线地形候选图（OccupancyGrid）：`-1`=未知/未观测地面、`0`=观测到的普通薄地面、`5`=坡道候选、`6`=隧道候选。仅在有订阅者时计算 |
 | `/rog_map/terrain_markers` | 在线候选区域的彩色 MarkerArray：橙色方块=坡道，青色方块=隧道；直接覆盖在 RViz 地图上，失去更新后短时间自动消失 |
@@ -185,10 +183,6 @@ RViz 的 `ROGMAP` 分组默认开启 `Online Terrain (orange=slope, cyan=tunnel)
 | `projection.mask_filter_en` | `true` | `true` | 二维 8 邻域补洞 + 孤立障碍去噪 |
 | `projection.fill_occ_min` | `8` | `5` | 周围 ≥N 个占据邻居的自由格填成障碍。**合法区间 [1,8]，≥9 直接抛异常、节点起不来** |
 | `projection.denoise_occ_max` | `0` | `0` | 占据邻居 ≤N 的孤立障碍判 UNKNOWN。**校验 `< fill_occ_min`** |
-| `projection.prior_map.enable` | `false` | `false` | 静态先验融合（`/rog_map/layer_value_static`）。开启时 `yaml_path` 必填且 `frame_id` 不得为空 |
-| `projection.prior_map.yaml_path` | `…/map/lab3.yaml` | 空 | Nav2 风格地图 YAML |
-| `projection.prior_map.pgm_path` | 空 | 空 | 留空时用 YAML 的 `image` 字段，并相对 YAML 所在目录解析 |
-| `projection.prior_map.frame_id` | `map` | `map` | 先验图坐标系 |
 
 **分类只看一个数**：柱内占据体素的 z 跨度 `span = (最高占据层号 − 最低占据层号) × resolution`
 （`projection_layer.cpp:17-79`）：
@@ -351,7 +345,6 @@ RViz 调试建议依次打开原始点云、`occupied_raw`、`inflated`、`layer
 - `include/rog_map/rog_map_core/config.hpp`：**所有参数的名称、默认值与启动校验（唯一权威）**。
 - `src/rog_map/projection_layer.cpp`：二维投影分类（`classifyCell()`）与增量更新。
 - `src/rog_map/field_layer.cpp` / `esdf_map.cpp`：二维距离场与三维 ESDF。
-- `src/rog_map/prior_map.cpp`：PGM 静态先验融合。
 - `src/rog_map/query_adapter.cpp`：向规划器暴露的二维 ESDF / 代价查询。
 - `include/rog_map_ros/rog_map_ros2.hpp`：ROS 2 回调、QoS、timer、可视化快照与接口实现。
 - `src/rog_map_ros/rog_map_ros1.cpp`：当前构建使用的 ROS 2 接口编译入口（文件名为历史沿用）。

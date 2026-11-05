@@ -34,6 +34,10 @@ ros2 launch mas2027_nav_bringup nav_executor_launch.py \
 
 也可以临时传 `map_source:=online` 或 `map_source:=prior`，覆盖配置文件。不要在 `node_params.yaml` 再写一份模式；启动器会统一注入。无图模式强制未知区域不可通行，不能通过修改普通搜索参数放开。
 
+地图分为三个职责：ROGMap 生成实时局部障碍、地面几何证据和地形标签；在线累计图负责历史确认、纠错和记忆；先验静态图仅在 `prior` 模式提供全局约束。二维距离场是各自障碍层的派生缓存。局部边界检测与历史纠错使用不同证据条件，台阶阈值和碰撞门保持一致的配置口径。
+
+`prior` 模式的 `terrain_map_server` 在启动时加载并发布 `/cost_map`、`/terrain_label_map`、`/terrain_uphill_map`，采用持久化 QoS，后启动的导航订阅者也能收到。静态图不周期重发；接收端只在内容变化时更新版本和派生缓存。先验约束统一由 `TerrainGrid → TerrainMapQuery → FusedMapQuery` 接入，ROGMap 不再单独加载或融合二维先验图。`online` 模式不启动该服务。ROGMap 实时二维障碍统一查看 `/rog_map/layer_value`，不再发布重复的 `layer_value_dynamic/static`。
+
 ## 地图放哪里
 
 默认地图在 `mas2027_nav_bringup/pcd/` 和 `mas2027_nav_bringup/map/`，具体文件由 `navigation_map.yaml` 选择。也可将同一场地的一套地图放到外部目录，例如：
@@ -60,7 +64,7 @@ map_files:
 
 `map_root` 的相对路径以此配置文件所在目录为基准；`map_files` 的相对路径以 `map_root` 为基准；YAML 的 `image` 以该地图 YAML 所在目录为基准。以上均支持绝对路径和 `~`。四个文件应来自同一次建图、使用同一坐标系、原点和分辨率。有图启动前会检查文件存在性；不检查地图是否来自同一次导出。外部地图不会复制进 `install/`，运行机器上需保留该目录。
 
-默认 `map_root: ..` 指向 bringup 包根目录。构建时将清单选中的包内地图安装到 share 目录；无图构建允许地图缺失。先验定位的 PCD、地图服务和可选 ROGMap 先验融合路径均由这份清单绑定。
+默认 `map_root: ..` 指向 bringup 包根目录。构建时将清单选中的包内地图安装到 share 目录；无图构建允许地图缺失。先验定位的 PCD 和静态地形服务均由这份清单绑定。
 
 ## 修改哪个参数文件
 

@@ -12,11 +12,30 @@
 namespace mas2027_nav_executor {
 namespace {
 constexpr int kOccupiedCost = 95;
+
+bool sameCostContent(const nav_msgs::msg::OccupancyGrid & a,
+  const nav_msgs::msg::OccupancyGrid & b)
+{
+  // Publication/load timestamps do not change static geometry or occupancy.
+  return a.header.frame_id == b.header.frame_id &&
+         a.info.width == b.info.width && a.info.height == b.info.height &&
+         a.info.resolution == b.info.resolution && a.info.origin == b.info.origin &&
+         a.data == b.data;
+}
+
+bool sameImageContent(const sensor_msgs::msg::Image & a,
+  const sensor_msgs::msg::Image & b)
+{
+  return a.header.frame_id == b.header.frame_id &&
+         a.width == b.width && a.height == b.height && a.encoding == b.encoding &&
+         a.is_bigendian == b.is_bigendian && a.step == b.step && a.data == b.data;
+}
 }
 
 void TerrainGrid::updateCost(const nav_msgs::msg::OccupancyGrid & grid)
 {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (sameCostContent(cost_, grid)) return;
   cost_ = grid;
   refresh();
   revision_.fetch_add(1, std::memory_order_release);
@@ -25,6 +44,7 @@ void TerrainGrid::updateCost(const nav_msgs::msg::OccupancyGrid & grid)
 void TerrainGrid::updateLabels(const sensor_msgs::msg::Image & image)
 {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (sameImageContent(labels_, image)) return;
   labels_ = image;
   refresh();
   revision_.fetch_add(1, std::memory_order_release);
@@ -33,6 +53,7 @@ void TerrainGrid::updateLabels(const sensor_msgs::msg::Image & image)
 void TerrainGrid::updateDirections(const sensor_msgs::msg::Image & image)
 {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (sameImageContent(directions_, image)) return;
   directions_ = image;
   refresh();
   revision_.fetch_add(1, std::memory_order_release);
