@@ -521,6 +521,145 @@ TEST(ProjectionTerrain, HeadOnSignatureRejectsARampWithASpuriousGap)
   EXPECT_NE(labels[10 * kSize + 11], 7U);
 }
 
+TEST(ProjectionTerrain, HeadOnSignatureRejectsARampWhenItsFootIsLevel)
+{
+  // Starting at the bottom of a grade passes the level-approach check, and a
+  // scan shadow on the ramp looks like a hidden gap. The far "crest" keeps
+  // climbing instead of descending, so it must not be labeled as a wave.
+  const auto labels = labelsFor([](int x, int) {
+    if (x <= 3) return measuredGround(0.0);
+    if (x == 13) return rog_map::ColumnStats{};
+    return measuredGround(0.01 * (x - 3));
+  });
+  EXPECT_NE(labels[10 * kSize + 6], 7U);
+  EXPECT_NE(labels[10 * kSize + 12], 7U);
+  EXPECT_NE(labels[10 * kSize + 14], 7U);
+}
+
+TEST(ProjectionTerrain, HeadOnSignatureAcceptsALowFarSliceClimbingToTheCrest)
+{
+  // The line of sight grazes the near crest, so the first visible cell of the
+  // far slice is several centimetres below the first crest. It must be
+  // allowed to climb into the same-height band and end at the far crest top.
+  const auto labels = labelsFor([](int x, int) {
+    if (x <= 4) return measuredGround(0.0);
+    if (x <= 8) return measuredGround(0.0175 * (x - 4));
+    if (x <= 10) return rog_map::ColumnStats{};
+    if (x == 11) return measuredGround(0.02);
+    if (x == 12) return measuredGround(0.045);
+    if (x == 13) return measuredGround(0.07);
+    return rog_map::ColumnStats{};
+  });
+  EXPECT_EQ(labels[10 * kSize + 5], 7U);
+  EXPECT_EQ(labels[10 * kSize + 8], 7U);
+  EXPECT_EQ(labels[10 * kSize + 13], 7U);
+}
+
+TEST(ProjectionTerrain, HeadOnSignatureUsesValidatedSurfaceHeldOccupied)
+{
+  // obstacle_hold_time keeps a cell OCCUPIED after its raw surface becomes
+  // thin again. The validated surface height must still feed the head-on
+  // path; collision masks keep the hold.
+  rog_map::ProjectionLayer layer;
+  rog_map::ProjectionLayerConfig config;
+  config.hysteresis_en = false;
+  config.mask_filter_en = false;
+  config.obstacle_hold_time = 5.0;
+  const auto wave = [](int x, int) {
+    if (x <= 4) return measuredGround(0.0);
+    if (x <= 8) return measuredGround(0.0175 * (x - 4));
+    if (x <= 10) return rog_map::ColumnStats{};
+    if (x <= 13) return measuredGround(0.07);
+    return rog_map::ColumnStats{};
+  };
+  const auto thick = [](int x, int) {
+    if (x <= 4) return measuredGround(0.0);
+    if (x <= 10 && x >= 5) {
+      auto stats = ground(0.0175 * (x - 4));
+      stats.occupied_z_index_max = stats.occupied_z_index_min + 6;
+      stats.occupied_z_max_abs = stats.occupied_z_min_abs + 0.30;
+      stats.occupied_count = 7;
+      return stats;
+    }
+    if (x <= 10) return rog_map::ColumnStats{};
+    if (x <= 13) {
+      auto stats = ground(0.07);
+      stats.occupied_z_index_max = stats.occupied_z_index_min + 6;
+      stats.occupied_z_max_abs = stats.occupied_z_min_abs + 0.30;
+      stats.occupied_count = 7;
+      return stats;
+    }
+    return rog_map::ColumnStats{};
+  };
+  layer.updateFull(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 1.0,
+                   config, thick);
+  layer.updateFull(kSize, kSize, kResolution, Eigen::Vector2d::Zero(), 1.2,
+                   config, wave);
+  EXPECT_EQ(layer.cells()[10 * kSize + 5].type, rog_map::CellType::OCCUPIED);
+  EXPECT_EQ(layer.terrainLabels()[10 * kSize + 5], 7U);
+  EXPECT_EQ(layer.terrainLabels()[10 * kSize + 8], 7U);
+  EXPECT_EQ(layer.terrainLabels()[10 * kSize + 11], 7U);
+}
+
+TEST(ProjectionTerrain, HeadOnSignatureUsesLowOccupiedBandAsGround)
+{
+  // The inclined face of a short wave spans three 5 cm voxel layers, so the
+  // projection classifies those columns as low OCCUPIED and provides no
+  // validated surface height. The head-on signature must read the band centre.
+  const auto band = [](double h) {
+    auto stats = ground(h - 0.05);
+    stats.occupied_z_index_max = stats.occupied_z_index_min + 2;
+    stats.occupied_z_max_abs = h + 0.05;
+    stats.occupied_count = 3;
+    return stats;
+  };
+  const auto labels = labelsFor([&](int x, int) {
+    if (x <= 4) return measuredGround(0.0);
+    if (x <= 8) return band(0.0175 * (x - 4));
+    if (x <= 10) return rog_map::ColumnStats{};
+    if (x <= 13) return band(0.07);
+    return rog_map::ColumnStats{};
+  });
+  EXPECT_EQ(labels[10 * kSize + 5], 7U);
+  EXPECT_EQ(labels[10 * kSize + 8], 7U);
+  EXPECT_EQ(labels[10 * kSize + 11], 7U);
+}
+
+TEST(ProjectionTerrain, HeadOnSignatureBridgesAShadowOfTwoWavelengths)
+{
+  // From a low sensor the trough and a lower next crest can stay invisible,
+  // so the far patch may only reappear after about two wavelengths. The long
+  // shadow behind the road is a valid end for that patch as well.
+  const auto labels = labelsFor([](int x, int) {
+    if (x <= 4) return measuredGround(0.0);
+    if (x <= 8) return measuredGround(0.0175 * (x - 4));
+    if (x <= 16) return rog_map::ColumnStats{};
+    if (x <= 18) return measuredGround(0.07);
+    return rog_map::ColumnStats{};
+  });
+  EXPECT_EQ(labels[10 * kSize + 5], 7U);
+  EXPECT_EQ(labels[10 * kSize + 8], 7U);
+  EXPECT_EQ(labels[10 * kSize + 17], 7U);
+}
+
+TEST(ProjectionTerrain, HeadOnSignatureUsesLocalGradientWithoutSlopeLabel)
+{
+  // The face rises only 0.05 m over two cells, below the slope fit's 0.06 m
+  // height-change minimum, so no cell receives label 5. The head-on path must
+  // still find the uphill direction from the local 3x3 heights.
+  const auto labels = labelsFor([](int x, int) {
+    if (x <= 5) return measuredGround(0.0);
+    if (x == 6) return measuredGround(0.05);
+    if (x <= 8) return rog_map::ColumnStats{};
+    if (x <= 10) return measuredGround(0.05);
+    return rog_map::ColumnStats{};
+  });
+  EXPECT_EQ(labels[10 * kSize + 5], 7U);
+  EXPECT_EQ(labels[10 * kSize + 6], 7U);
+  EXPECT_EQ(labels[10 * kSize + 9], 7U);
+  EXPECT_EQ(labels[10 * kSize + 10], 7U);
+}
+
 TEST(ProjectionTerrain, NoisyContinuousInclineStillSlope)
 {
   const auto labels = labelsFor([](int x, int y) {

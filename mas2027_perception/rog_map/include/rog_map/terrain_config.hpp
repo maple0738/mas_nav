@@ -37,6 +37,10 @@ struct UndulatingRecognitionConfig {
   // It is only a semantic label; collision masks and step barriers are
   // unchanged. Distances are cells at the current map resolution.
   bool front_signature_enable{true};
+  // The 11x11 slope fit averages a short wave to near zero gradient, so the
+  // head-on path must not depend on a slope label. When a cell has no slope
+  // direction, take a local 3x3 uphill direction instead.
+  double front_min_local_gradient{0.12};
   int front_min_face_cells{2};
   int front_max_face_cells{8};
   double front_min_face_height_m{0.045};
@@ -46,11 +50,20 @@ struct UndulatingRecognitionConfig {
   int front_approach_cells{5};
   double front_approach_tolerance_m{0.03};
   int front_min_hidden_cells{1};
-  int front_max_hidden_cells{6};
-  int front_min_crest_cells{2};
+  // From a low sensor the shadow behind a crest can span about two
+  // wavelengths: the trough and a lower next crest stay invisible, and the
+  // far patch only reappears beyond them.
+  int front_max_hidden_cells{12};
+  // From a low sensor the far crest tops are often cut to a single map cell
+  // by the near crest; requiring two cells misses real wave sections.
+  int front_min_crest_cells{1};
   int front_max_crest_cells{6};
-  double front_crest_height_tolerance_m{0.04};
-  int front_min_lateral_support{3};
+  // Low occupied bands are quantised to 5 cm layers; their centre is used
+  // as the surface height, so keep one voxel of slack in the same-height band.
+  double front_crest_height_tolerance_m{0.05};
+  // Side strips are 5 cm apart; requiring all three to agree is fragile when
+  // the wave is crossed obliquely or one strip falls in a lidar shadow.
+  int front_min_lateral_support{2};
 };
 
 struct TunnelRecognitionConfig {
@@ -99,6 +112,7 @@ struct TerrainRecognitionConfig {
         u.front_min_face_cells < 1 ||
         u.front_max_face_cells < u.front_min_face_cells ||
         u.front_max_face_cells > 20 ||
+        !positive(u.front_min_local_gradient) ||
         !positive(u.front_min_face_height_m) ||
         u.front_min_face_height_m < u.min_delta_m ||
         u.front_min_face_height_m > u.max_peak_to_trough_m ||

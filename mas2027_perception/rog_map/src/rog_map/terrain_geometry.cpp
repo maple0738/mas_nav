@@ -95,9 +95,14 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
   // Neighbor windows need only heights and a few evidence bits. Extract them
   // once so repeated scans do not walk the much larger CellData records.
   constexpr uint8_t kGround = 1U, kWaveGround = 2U, kBarrier = 4U,
-                    kTunnelCandidate = 8U, kObserved = 16U;
+                    kTunnelCandidate = 8U, kObserved = 16U,
+                    kFrontGround = 32U;
   std::vector<uint8_t> evidence(count, 0U);
   std::vector<float> ground_heights(count);
+  // Height used by the head-on signature. Thin ground keeps its validated
+  // reference height; a low occupied band uses its centre because the
+  // projection layer has no validated surface height for that column.
+  std::vector<float> front_heights(count);
   std::vector<float> wave_heights(count);
   // A union of intersecting tiles encloses every 11x11 fit window. Its height
   // range is an upper bound on the exact range, so rejecting a range below
@@ -127,14 +132,32 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
         evidence[id] |= kTunnelCandidate;
       if (measuredWaveGround(cell))
         evidence[id] |= kWaveGround;
-      if (!thinGround(cell))
-        continue;
-      evidence[id] |= kGround;
-      auto &range =
-          height_ranges[static_cast<size_t>(y / kTileSize) * tile_width +
-                        x / kTileSize];
-      range.low = std::min(range.low, cell.ground_reference_z);
-      range.high = std::max(range.high, cell.ground_reference_z);
+      const bool thin_ground = thinGround(cell);
+      if (thin_ground) {
+        evidence[id] |= kGround;
+        auto &range =
+            height_ranges[static_cast<size_t>(y / kTileSize) * tile_width +
+                          x / kTileSize];
+        range.low = std::min(range.low, cell.ground_reference_z);
+        range.high = std::max(range.high, cell.ground_reference_z);
+      }
+      // A short wave on a 5 cm grid spans two or three voxel layers on its
+      // inclined face, so the projection layer can classify a real ground
+      // column as a low OCCUPIED column without a validated surface height.
+      // The head-on signature may read the centre of such a low occupied
+      // band as its surface height. Walls and real obstacles are taller than
+      // the tunnel threshold and remain barriers; masks, step barriers and
+      // the profile path keep requiring thin ground.
+      const bool low_band =
+          cell.type == CellType::OCCUPIED && !cell.height_discontinuity &&
+          static_cast<double>(cell.height_delta) <
+              tunnel_config.tunnel_height_delta_min &&
+          std::isfinite(cell.occupied_z_min_abs) &&
+          std::isfinite(cell.occupied_z_max_abs);
+      front_heights[id] =
+          low_band ? 0.5F * (cell.occupied_z_min_abs + cell.occupied_z_max_abs)
+                   : cell.ground_reference_z;
+      if (thin_ground || low_band) evidence[id] |= kFrontGround;
     }
   }
   // Reuse the bound for every center in a tile. The extra border is
@@ -443,8 +466,8 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
         if (id == last) continue;
         last = id;
         const size_t sample = static_cast<size_t>(id);
-        if (!(evidence[sample] & kGround)) break;
-        const double z = ground_heights[sample];
+        if (!(evidence[sample] & kFrontGround)) break;
+        const double z = front_heights[sample];
         if (face_cells == 0) bottom = z;
         face_top = std::max(face_top, z);
         cells.push_back(id);
@@ -461,8 +484,8 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
         if (!rayCell(sx, sy, ux, uy, -i, cx, cy)) return false;
         const size_t sample =
             static_cast<size_t>(cy) * width_ + static_cast<size_t>(cx);
-        if (!(evidence[sample] & kGround) ||
-            std::abs(ground_heights[sample] - bottom) >
+        if (!(evidence[sample] & kFrontGround) ||
+            std::abs(front_heights[sample] - bottom) >
                 wave_config.front_approach_tolerance_m)
           return false;
       }
@@ -478,7 +501,7 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
         if (id == last) continue;
         last = id;
         const size_t sample = static_cast<size_t>(id);
-        if (evidence[sample] & kGround) {
+        if (evidence[sample] & kFrontGround) {
           crest_found = true;
           break;
         }
@@ -488,11 +511,15 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
       if (!crest_found || gap < wave_config.front_min_hidden_cells ||
           gap > max_gap)
         return false;
-      // The next crest top is visible again at the first crest's height, and
-      // it is a short patch: a plateau that continues beyond the scan limit is
-      // a ramp/step top, not a wave.
+      // The next crest top is visible again at the first crest's height. Only
+      // a short slice is usually visible, and its first cell can start well
+      // below the first crest because the line of sight grazes the near crest
+      // a few centimetres lower. Let the patch climb into the same-height
+      // band, then require it to end by descending or by another shadow. A
+      // patch that climbs past the band is a ramp/step top, not a wave.
       int crest_cells = 0;
       bool crest_ended = false;
+      bool reached_crest = false;
       last = -1;
       for (int i = 0; i < max_crest; ++i, ++step) {
         int cx, cy;
@@ -501,29 +528,84 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
         if (id == last) continue;
         last = id;
         const size_t sample = static_cast<size_t>(id);
-        if (!(evidence[sample] & kGround)) {
+        if (!(evidence[sample] & kFrontGround)) {
           crest_ended = true;
           break;
         }
-        if (std::abs(ground_heights[sample] - face_top) > crest_tolerance) {
-          crest_ended = true;
-          break;
+        const double delta =
+            static_cast<double>(front_heights[sample]) - face_top;
+        if (delta > crest_tolerance) {
+          // Still climbing past the near crest height: this is a ramp/step
+          // top, even when a scan shadow produced the "gap".
+          return false;
         }
+        if (delta < -crest_tolerance) {
+          if (reached_crest) {
+            // The far face descends again: a real second crest.
+            crest_ended = true;
+            break;
+          }
+          // Rising slice below the band: keep scanning for the top.
+          cells.push_back(id);
+          continue;
+        }
+        reached_crest = true;
         cells.push_back(id);
         ++crest_cells;
       }
-      return crest_ended &&
+      return crest_ended && reached_crest &&
              crest_cells >= wave_config.front_min_crest_cells;
+    };
+    // A short wave (a rising face of roughly two cells) is averaged to nearly
+    // zero slope by the 11x11 plane fit, so most face cells never receive
+    // label 5 and a slope-only seed misses the whole wave. Derive a local
+    // uphill direction from the 3x3 ground heights instead; the approach,
+    // shadow and crest checks below still reject ramps and step tops.
+    const auto localUphill = [&](int x, int y, double & ux, double & uy) {
+      const auto at = [&](int xx, int yy, bool & known) {
+        if (xx < 0 || yy < 0 || xx >= width_ || yy >= height_) {
+          known = false;
+          return 0.0;
+        }
+        const size_t id = static_cast<size_t>(yy) * width_ + xx;
+        known = (evidence[id] & kFrontGround) != 0;
+        return known ? static_cast<double>(front_heights[id]) : 0.0;
+      };
+      bool xp_ok = false, xm_ok = false, yp_ok = false, ym_ok = false;
+      const double xp = at(x + 1, y, xp_ok);
+      const double xm = at(x - 1, y, xm_ok);
+      const double yp = at(x, y + 1, yp_ok);
+      const double ym = at(x, y - 1, ym_ok);
+      const double z0 = static_cast<double>(
+          front_heights[static_cast<size_t>(y) * width_ + x]);
+      ux = xp_ok && xm_ok ? (xp - xm) / (2.0 * resolution_)
+           : xp_ok        ? (xp - z0) / resolution_
+           : xm_ok        ? (z0 - xm) / resolution_
+                          : 0.0;
+      uy = yp_ok && ym_ok ? (yp - ym) / (2.0 * resolution_)
+           : yp_ok        ? (yp - z0) / resolution_
+           : ym_ok        ? (z0 - ym) / resolution_
+                          : 0.0;
     };
 
     for (int y = 0; y < height_; ++y) {
       for (int x = 0; x < width_; ++x) {
         const size_t index = static_cast<size_t>(y) * width_ + x;
-        if (labels[index] != kSlope) continue;
-        const double ux = geometry.uphill_x[index];
-        const double uy = geometry.uphill_y[index];
+        if (!(evidence[index] & kFrontGround)) continue;
+        const bool slope_seed = labels[index] == kSlope;
+        double ux = 0.0;
+        double uy = 0.0;
+        if (slope_seed) {
+          ux = geometry.uphill_x[index];
+          uy = geometry.uphill_y[index];
+        } else {
+          localUphill(x, y, ux, uy);
+        }
         const double norm = std::hypot(ux, uy);
         if (!(norm > 1e-6) || !std::isfinite(norm)) continue;
+        if (!slope_seed &&
+            norm < wave_config.front_min_local_gradient)
+          continue;
         const double ux_unit = ux / norm;
         const double uy_unit = uy / norm;
         double center_top = 0.0;

@@ -290,6 +290,7 @@ public:
     load("projection.terrain.undulating.min_neighbor_correlation", terrain.undulating.min_neighbor_correlation);
     load("projection.terrain.undulating.min_common_samples", terrain.undulating.min_common_samples);
     load("projection.terrain.undulating.front_signature_enable", terrain.undulating.front_signature_enable);
+    load("projection.terrain.undulating.front_min_local_gradient", terrain.undulating.front_min_local_gradient);
     load("projection.terrain.undulating.front_min_face_cells", terrain.undulating.front_min_face_cells);
     load("projection.terrain.undulating.front_max_face_cells", terrain.undulating.front_max_face_cells);
     load("projection.terrain.undulating.front_min_face_height_m", terrain.undulating.front_min_face_height_m);
