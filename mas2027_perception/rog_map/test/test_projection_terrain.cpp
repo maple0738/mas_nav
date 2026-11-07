@@ -84,7 +84,7 @@ TEST(ProjectionTerrain, RecognitionThresholdsAndEnableFlagsTakeEffect)
   EXPECT_EQ(labelsFor(wave, config)[10*kSize+10], 7U);
   config.undulating.min_peak_to_trough_m = .08;
   EXPECT_NE(labelsFor(wave, config)[10*kSize+10], 7U);
-  config.undulating.min_peak_to_trough_m = .035;
+  config.undulating.min_peak_to_trough_m = .045;
   config.undulating.enable = false;
   EXPECT_NE(labelsFor(wave, config)[10*kSize+10], 7U);
 }
@@ -449,6 +449,76 @@ TEST(ProjectionTerrain, ContinuousInclineIsSlope)
     return ground(1.0 + 0.2 * x * kResolution);
   });
   EXPECT_EQ(labels[10 * kSize + 10], 5U);
+}
+
+TEST(ProjectionTerrain, WaveOnASteepGradeIsNotUndulating)
+{
+  // A repeating wave on a 0.20 grade is still a slope. The trend gate keeps
+  // the undulating label from being derived from a grade.
+  const auto labels = labelsFor([](int x, int) {
+    return measuredGround(0.2 * x * kResolution +
+      .035 * std::sin(2 * M_PI * x * kResolution / .24));
+  });
+  EXPECT_NE(labels[10 * kSize + 10], 7U);
+  EXPECT_EQ(labels[10 * kSize + 10], 5U);
+}
+
+TEST(ProjectionTerrain, HeadOnOccludedWaveIsRecognizedFromTheFirstFace)
+{
+  // Low sensor sees the first rising face, the crest hides the trough, and
+  // the next crest top reappears at the same height. No profile reversal is
+  // measurable, so only the head-on signature can label this view.
+  const auto labels = labelsFor([](int x, int) {
+    if (x <= 4) return measuredGround(0.0);
+    if (x <= 8) return measuredGround(0.0175 * (x - 4));
+    if (x <= 10) return rog_map::ColumnStats{};
+    if (x <= 13) return measuredGround(0.07);
+    return rog_map::ColumnStats{};
+  });
+  EXPECT_EQ(labels[10 * kSize + 5], 7U);
+  EXPECT_EQ(labels[10 * kSize + 8], 7U);
+  EXPECT_EQ(labels[10 * kSize + 11], 7U);
+}
+
+TEST(ProjectionTerrain, HeadOnSignatureRequiresSameHeightBehindTheGap)
+{
+  const auto labels = labelsFor([](int x, int) {
+    if (x <= 4) return measuredGround(0.0);
+    if (x <= 8) return measuredGround(0.0175 * (x - 4));
+    if (x <= 10) return rog_map::ColumnStats{};
+    if (x <= 13) return measuredGround(0.17);
+    return rog_map::ColumnStats{};
+  });
+  EXPECT_NE(labels[10 * kSize + 5], 7U);
+  EXPECT_NE(labels[10 * kSize + 8], 7U);
+}
+
+TEST(ProjectionTerrain, HeadOnSignatureRejectsAPlateauThatNeverEnds)
+{
+  const auto labels = labelsFor([](int x, int) {
+    if (x <= 4) return measuredGround(0.0);
+    if (x <= 8) return measuredGround(0.0175 * (x - 4));
+    if (x <= 10) return rog_map::ColumnStats{};
+    return measuredGround(0.07);
+  });
+  EXPECT_NE(labels[10 * kSize + 5], 7U);
+  EXPECT_NE(labels[10 * kSize + 8], 7U);
+}
+
+TEST(ProjectionTerrain, HeadOnSignatureRejectsARampWithASpuriousGap)
+{
+  // The same face + hidden gap + far patch can appear when a long ramp is
+  // sampled sparsely. The approach behind the face keeps rising, so this is
+  // a ramp crest, not a wave.
+  const auto labels = labelsFor([](int x, int) {
+    if (x <= 8) return measuredGround(0.0175 * x);
+    if (x <= 10) return rog_map::ColumnStats{};
+    if (x <= 13) return measuredGround(0.14);
+    return rog_map::ColumnStats{};
+  });
+  EXPECT_NE(labels[10 * kSize + 5], 7U);
+  EXPECT_NE(labels[10 * kSize + 8], 7U);
+  EXPECT_NE(labels[10 * kSize + 11], 7U);
 }
 
 TEST(ProjectionTerrain, NoisyContinuousInclineStillSlope)

@@ -176,7 +176,7 @@ Visualization Manager:
           Color Scheme: map
           Draw Behind: true
           Enabled: false
-          Name: Online Terrain Labels (raw 5/6)
+          Name: Online Terrain Labels (raw 5/6/7)
           Topic:
             Depth: 1
             Durability Policy: Volatile
@@ -277,7 +277,7 @@ Visualization Manager:
           Value: true
         - Class: rviz_default_plugins/MarkerArray
           Enabled: true
-          Name: Online Terrain (orange=slope, cyan=tunnel)
+          Name: Online Terrain (orange=slope, cyan=tunnel, purple=undulating)
           Topic:
             Depth: 1
             Durability Policy: Volatile

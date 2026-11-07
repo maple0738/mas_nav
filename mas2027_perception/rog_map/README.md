@@ -67,17 +67,17 @@ flowchart LR
 | `/rog_map/esdf` | ESDF 可视化 |
 | `/rog_map/layer_value` | 实时二维障碍投影（**二值 mask**：100 = 障碍）；静态先验统一由导航层融合 |
 | `/rog_map/layer_type` | 四类投影结果，按 OccupancyGrid 数值编码：`-1`=UNKNOWN、`33`=FREE、`66`=PASSABLE、`100`=OCCUPIED；RViz Map 使用 `costmap` 配色显示四档 |
-| `/rog_map/terrain_label` | 在线地形候选图（OccupancyGrid）：`-1`=未知/未观测地面、`0`=观测到的普通薄地面、`5`=坡道候选、`6`=隧道候选。仅在有订阅者时计算 |
-| `/rog_map/terrain_markers` | 在线候选区域的彩色 MarkerArray：橙色方块=坡道，青色方块=隧道；直接覆盖在 RViz 地图上，失去更新后短时间自动消失 |
+| `/rog_map/terrain_label` | 在线地形候选图（OccupancyGrid）：`-1`=未知/未观测地面、`0`=观测到的普通薄地面、`5`=坡道候选、`6`=隧道候选、`7`=起伏路候选。仅在有订阅者时计算 |
+| `/rog_map/terrain_markers` | 在线候选区域的彩色 MarkerArray：橙色方块=坡道 `5`，青色方块=隧道 `6`，紫色方块=起伏路 `7`；直接覆盖在 RViz 地图上，失去更新后短时间自动消失 |
 | `/rog_map/layer_confidence` | 分类置信度 |
 | `/rog_map/layer_height_delta` | 柱内高度变化：每格一个点，**z = 该柱占据最高点，intensity = height_delta**，是判读分类分支最直接的一条 |
 | `/rog_map/field` | 势场/距离场诊断 |
 | `/rog_map/decay_cells` | 衰减单元诊断 |
 | `/rog_map/map_bound` | 当前滑动地图边界 |
 
-`/rog_map/terrain_label` 与旧 `/rog_map/layer_type` 的判据不同。坡道候选要求中心为薄地面，在 11×11 邻域内至少有 30 个薄地面格，拟合平面坡度在约 8°～35°，高度变化至少 0.06 m，拟合均方根误差不超过 0.04 m，且**任一样本到拟合平面的残差不超过 0.05 m**。最后一条用于拒绝桌面/箱顶等抬升薄面：它们能让最小二乘 RMS 仍低于 4 cm，却把平地拟合成假坡。隧道候选只从投影层已判为 `PASSABLE/HOLLOW_TUNNEL` 的柱生成：上下占据层跨度必须落在 `projection.tunnel_height_delta_min/max` 内，竖直占据率不超过 `projection.tunnel_occupancy_ratio_max`，两层之间至少一半体素明确观测为空闲，且 3×3 邻域至少 5 格满足该条件。投影层判为 `OCCUPIED` 的高柱不会再被标成隧道。隧道优先于坡道。阈值目前是诊断初值，需要用现场点云标定；特别是局部地图垂直窗口只有 2.5 m，超出窗口的顶板无法识别。该话题为候选语义，不等同于可通行净空。`nav_executor` 优先采用在线 `5/6` 生成区域 mode，在线没有特殊地形结果或过期时回退静态 `/terrain_label_map`。
+`/rog_map/terrain_label` 与旧 `/rog_map/layer_type` 的判据不同。坡道候选要求中心为薄地面，在 11×11 邻域内至少有 30 个薄地面格，拟合平面坡度在约 8°～35°，高度变化至少 0.06 m，拟合均方根误差不超过 0.04 m，且**任一样本到拟合平面的残差不超过 0.05 m**。最后一条用于拒绝桌面/箱顶等抬升薄面：它们能让最小二乘 RMS 仍低于 4 cm，却把平地拟合成假坡。隧道候选只从投影层已判为 `PASSABLE/HOLLOW_TUNNEL` 的柱生成：上下占据层跨度必须落在 `projection.tunnel_height_delta_min/max` 内，竖直占据率不超过 `projection.tunnel_occupancy_ratio_max`，两层之间至少一半体素明确观测为空闲，且 3×3 邻域至少 5 格满足该条件。投影层判为 `OCCUPIED` 的高柱不会再被标成隧道。优先级为隧道 > 起伏 > 坡道。阈值目前是诊断初值，需要用现场点云标定；特别是局部地图垂直窗口只有 2.5 m，超出窗口的顶板无法识别。该话题为候选语义，不等同于可通行净空。`nav_executor` 优先采用在线 `5/6/7` 生成区域 mode，在线没有特殊地形结果或过期时回退静态 `/terrain_label_map`。
 
-RViz 的 `ROGMAP` 分组默认开启 `Online Terrain (orange=slope, cyan=tunnel)`；它显示的是 `/rog_map/terrain_markers` 中**在线识别的候选格**，不会把人工标注区涂成在线识别。若需核对数值，可临时开启同组的 `Online Terrain Labels (raw 5/6)`。两个话题来自同一次 `terrainLabels()` 计算，色块只负责显示，不参与规划或底盘控制。
+RViz 的 `ROGMAP` 分组默认开启 `Online Terrain (orange=slope, cyan=tunnel, purple=undulating)`；它显示的是 `/rog_map/terrain_markers` 中**在线识别的候选格**，不会把人工标注区涂成在线识别。若需核对数值，可临时开启同组的 `Online Terrain Labels (raw 5/6/7)`。两个话题来自同一次 `terrainLabels()` 计算，色块只负责显示，不参与规划或底盘控制。
 
 ## ⚙️ 关键配置
 
@@ -155,7 +155,7 @@ RViz 的 `ROGMAP` 分组默认开启 `Online Terrain (orange=slope, cyan=tunnel)
 
 ### 二维投影（决定 `/rog_map/layer_value`）
 
-在线地形标签现在包含起伏 `7`：通过相邻三条实测地面高度曲线的重复峰谷识别短周期起伏，目标验证尺寸为 240 mm 波长、70 mm 峰谷差。标签不改变碰撞掩码；未知支撑、单台阶以及被台阶规则阻断的量化跳变不能由起伏分类解除。导航收到标签 7 后可进入既有模式 7 和路径轴线对齐流程。检测窗口、量化限制与验证范围见 [起伏识别与对齐说明](../../docs/undulating_alignment_20261103.md)。
+在线地形标签包含起伏 `7`：通过相邻三条实测地面高度曲线的重复峰谷识别短周期起伏，目标验证尺寸为 240 mm 波长、70 mm 峰谷差。剖面会先扣除整体坡度，剩余坡度必须不超过 `max_trend_gradient`（默认 0.12，低于坡面下限 0.14），峰谷差至少 0.045 m，三条约带相关系数至少 0.85，因此长坡和坡面上的小扰动不会被反推成起伏。正面接近时波谷会被第一个峰顶遮挡，剖面上没有反转；此时 `front_signature_enable` 改用“水平起点 + 上坡段 + 无回波遮挡段 + 同高峰顶”签名，沿坡面拟合出的上坡方向检查，并要求两侧条带同时成立；起点后方必须是水平地面，长坡后方仍在升高，因此不会被误判。该路径允许坡面使用地面参考高度，完整 17 点剖面仍要求精细高度。标签不改变碰撞掩码；未知支撑、单台阶以及被台阶规则阻断的量化跳变不能由起伏分类解除。导航收到标签 7 后可进入既有模式 7 和路径轴线对齐流程。参数集中在 `mas2027_nav_executor/config/terrain_recognition.yaml`，调参说明见 [docs/usage.md](../../docs/usage.md)。
 
 薄面并不直接代表车轮可到达：台阶顶面同样是薄面。投影保留滚动窗口内最后实际观测的薄地面世界高度；空中通过的自由射线、三维占据衰减不再抹掉地面或台阶证据，新的地面观测可以替换旧高度，滑出窗口后清除。相邻高度差超过 `max_step_height` 时仍阻断两侧；两侧之间隔着扫描空列时，在最多 20 格的四向/对角扫描中，分别拟合两端地面，只有两端外推都证实超过原阈值的高度断裂才阻断空列及两端，连续坡面不按总升高量当作台阶。检查不越过中间已有的地面观测或已确认占据。高度边界与掩码一同重算，避免长于旧脏列 halo 的依赖留下陈旧障碍。坡面语义拟合也使用这些实际高度证据，减少传感器转开后的错误退出。该约束不读取仿真场地模型或先验地图、不放宽净空或台阶阈值；从未观测的落差或超出拟合/空列范围的边缘仍不能由它凭空补全。
 

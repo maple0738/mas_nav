@@ -32,16 +32,44 @@
               enable: true
               # 短入口窗口可提前识别；关闭时只使用完整 17 点窗口。
               entry_window_enable: true
-              # 峰谷差，不是单边振幅。抬高下限可抑制较小地面扰动。
-              min_peak_to_trough_m: 0.035
+              # 峰谷差，不是单边振幅。现场起伏路约 0.07 m，这里留余量；
+              # 抬高下限可抑制坡面上的小起伏误报。
+              min_peak_to_trough_m: 0.045
               max_peak_to_trough_m: 0.12
-              # 相邻同类极值的距离。实测路面周期变化时同时调整上下界。
+              # 相邻同类极值的距离。现场目标约 0.24 m，上下限不要卡太死。
               min_wavelength_m: 0.18
               max_wavelength_m: 0.34
               # 相邻采样的反转噪声门；提高可减少细碎峰谷，也可能漏检。
               min_delta_m: 0.01
               # 去趋势前允许的整体坡度；仍用高差/水平距离表示。
-              max_trend_gradient: 0.25
+              # 必须小于坡面下限 0.14：起伏路只认接近水平的路段，
+              # 长坡即使有噪声也不应被反推成起伏。
+              max_trend_gradient: 0.12
               # 邻条带相关系数，越接近 1 越严格；共同实测点数范围 3..17。
-              min_neighbor_correlation: 0.80
+              min_neighbor_correlation: 0.85
               min_common_samples: 9
+              # 正面观测签名：低传感器只看到第一段上坡，波峰遮住波谷，下一
+              # 个峰顶又在同一高度出现。此时剖面上没有反转，普通 17 点判据
+              # 无法工作。该路径复用坡面拟合结果，slope.enable 关闭时不生效。
+              # 长度单位为格数（当前 50 mm/格）；只生成语义标签，
+              # 碰撞掩码和台阶门不受影响。
+              front_signature_enable: true
+              # 上坡段至少连续 2 格、总升高至少 0.045 m。
+              front_min_face_cells: 2
+              front_max_face_cells: 8  # 最多扫 0.40 m 的上坡
+              front_min_face_height_m: 0.045
+              # 起点后方必须是接近水平的地面：5 格内与坡底高差不超过
+              # 0.03 m。长坡从任意坡格起扫时后方仍在升高，因此不会被
+              # 误判成“坡顶挡住远侧波谷”。
+              front_approach_cells: 5
+              front_approach_tolerance_m: 0.03
+              # 峰顶后必须存在无地面回波的遮挡段，长度 1..6 格。
+              front_min_hidden_cells: 1
+              front_max_hidden_cells: 6
+              # 遮挡段之后至少 2 格地面与第一峰顶同高（容差 0.04 m），
+              # 且必须在 6 格内结束；持续同高平台按坡顶/台阶处理，不算起伏。
+              front_min_crest_cells: 2
+              front_max_crest_cells: 6
+              front_crest_height_tolerance_m: 0.04
+              # 上坡方向两侧各一条带必须同时成立，即 3/3 条带支持。
+              front_min_lateral_support: 3

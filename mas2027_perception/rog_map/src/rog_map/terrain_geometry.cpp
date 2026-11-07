@@ -403,6 +403,158 @@ TerrainGeometry ProjectionLayer::terrainGeometry() const {
       }
     }
   }
+
+  // Head-on entry signature. From the low sensor side, only the first rising
+  // face is measured: the crest hides the trough, and the next crest top
+  // reappears at the same height. There is no height reversal to feed the
+  // profile detector, so recognize the face + hidden run + same-height crest
+  // patch instead. This only changes the semantic label; masks and step
+  // barriers keep their existing authority.
+  if (wave_config.enable && wave_config.front_signature_enable) {
+    const int max_face = wave_config.front_max_face_cells;
+    const int max_gap = wave_config.front_max_hidden_cells;
+    const int max_crest = wave_config.front_max_crest_cells;
+    const double crest_tolerance =
+        wave_config.front_crest_height_tolerance_m;
+    std::vector<int> center_cells, side_cells, supported_cells;
+    center_cells.reserve(static_cast<size_t>(max_face + max_crest));
+    side_cells.reserve(static_cast<size_t>(max_face + max_crest));
+    supported_cells.reserve(
+        static_cast<size_t>(3 * (max_face + max_crest)));
+    const auto rayCell = [&](int sx, int sy, double ux, double uy, int step,
+                             int & cx, int & cy) {
+      cx = sx + static_cast<int>(std::lround(ux * step));
+      cy = sy + static_cast<int>(std::lround(uy * step));
+      return cx >= 0 && cy >= 0 && cx < width_ && cy < height_;
+    };
+    const auto signature = [&](int sx, int sy, double ux, double uy,
+                               double & face_top,
+                               std::vector<int> & cells) {
+      cells.clear();
+      int last = -1;
+      int face_cells = 0;
+      double bottom = 0.0;
+      face_top = -std::numeric_limits<double>::infinity();
+      int step = 0;
+      for (; step <= max_face; ++step) {
+        int cx, cy;
+        if (!rayCell(sx, sy, ux, uy, step, cx, cy)) return false;
+        const int id = cy * width_ + cx;
+        if (id == last) continue;
+        last = id;
+        const size_t sample = static_cast<size_t>(id);
+        if (!(evidence[sample] & kGround)) break;
+        const double z = ground_heights[sample];
+        if (face_cells == 0) bottom = z;
+        face_top = std::max(face_top, z);
+        cells.push_back(id);
+        ++face_cells;
+      }
+      if (face_cells < wave_config.front_min_face_cells ||
+          face_top - bottom < wave_config.front_min_face_height_m)
+        return false;
+      // A wave starts from near-level ground. On a long grade the cells
+      // behind the start keep rising with the same trend, so a hidden far
+      // side of a ramp crest must not pass as a wave.
+      for (int i = 1; i <= wave_config.front_approach_cells; ++i) {
+        int cx, cy;
+        if (!rayCell(sx, sy, ux, uy, -i, cx, cy)) return false;
+        const size_t sample =
+            static_cast<size_t>(cy) * width_ + static_cast<size_t>(cx);
+        if (!(evidence[sample] & kGround) ||
+            std::abs(ground_heights[sample] - bottom) >
+                wave_config.front_approach_tolerance_m)
+          return false;
+      }
+      // The trough behind the crest has no ground return because the crest
+      // blocks the line of sight. A wall or raised object is not a shadow.
+      int gap = 0;
+      bool crest_found = false;
+      last = -1;
+      for (; step <= max_face + max_gap; ++step) {
+        int cx, cy;
+        if (!rayCell(sx, sy, ux, uy, step, cx, cy)) return false;
+        const int id = cy * width_ + cx;
+        if (id == last) continue;
+        last = id;
+        const size_t sample = static_cast<size_t>(id);
+        if (evidence[sample] & kGround) {
+          crest_found = true;
+          break;
+        }
+        if (cells_[sample].type == CellType::OCCUPIED) return false;
+        ++gap;
+      }
+      if (!crest_found || gap < wave_config.front_min_hidden_cells ||
+          gap > max_gap)
+        return false;
+      // The next crest top is visible again at the first crest's height, and
+      // it is a short patch: a plateau that continues beyond the scan limit is
+      // a ramp/step top, not a wave.
+      int crest_cells = 0;
+      bool crest_ended = false;
+      last = -1;
+      for (int i = 0; i < max_crest; ++i, ++step) {
+        int cx, cy;
+        if (!rayCell(sx, sy, ux, uy, step, cx, cy)) break;
+        const int id = cy * width_ + cx;
+        if (id == last) continue;
+        last = id;
+        const size_t sample = static_cast<size_t>(id);
+        if (!(evidence[sample] & kGround)) {
+          crest_ended = true;
+          break;
+        }
+        if (std::abs(ground_heights[sample] - face_top) > crest_tolerance) {
+          crest_ended = true;
+          break;
+        }
+        cells.push_back(id);
+        ++crest_cells;
+      }
+      return crest_ended &&
+             crest_cells >= wave_config.front_min_crest_cells;
+    };
+
+    for (int y = 0; y < height_; ++y) {
+      for (int x = 0; x < width_; ++x) {
+        const size_t index = static_cast<size_t>(y) * width_ + x;
+        if (labels[index] != kSlope) continue;
+        const double ux = geometry.uphill_x[index];
+        const double uy = geometry.uphill_y[index];
+        const double norm = std::hypot(ux, uy);
+        if (!(norm > 1e-6) || !std::isfinite(norm)) continue;
+        const double ux_unit = ux / norm;
+        const double uy_unit = uy / norm;
+        double center_top = 0.0;
+        if (!signature(x, y, ux_unit, uy_unit, center_top, center_cells))
+          continue;
+        const int perp_x = static_cast<int>(std::lround(-uy_unit));
+        const int perp_y = static_cast<int>(std::lround(ux_unit));
+        int support = 1;
+        supported_cells.assign(center_cells.begin(), center_cells.end());
+        for (const int offset : {-1, 1}) {
+          const int sx = x + offset * perp_x;
+          const int sy = y + offset * perp_y;
+          if (sx < 0 || sy < 0 || sx >= width_ || sy >= height_) continue;
+          double side_top = 0.0;
+          if (!signature(sx, sy, ux_unit, uy_unit, side_top, side_cells))
+            continue;
+          if (std::abs(side_top - center_top) > crest_tolerance) continue;
+          ++support;
+          supported_cells.insert(supported_cells.end(), side_cells.begin(),
+                                 side_cells.end());
+        }
+        if (support < wave_config.front_min_lateral_support) continue;
+        for (const int id : supported_cells) {
+          const size_t sample = static_cast<size_t>(id);
+          const uint8_t label = labels[sample];
+          if (label == kUnknown || label == kFlat || label == kSlope)
+            labels[sample] = 7U;
+        }
+      }
+    }
+  }
   return geometry;
 }
 

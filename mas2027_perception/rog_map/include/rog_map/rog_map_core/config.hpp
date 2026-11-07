@@ -289,6 +289,18 @@ public:
     load("projection.terrain.undulating.max_trend_gradient", terrain.undulating.max_trend_gradient);
     load("projection.terrain.undulating.min_neighbor_correlation", terrain.undulating.min_neighbor_correlation);
     load("projection.terrain.undulating.min_common_samples", terrain.undulating.min_common_samples);
+    load("projection.terrain.undulating.front_signature_enable", terrain.undulating.front_signature_enable);
+    load("projection.terrain.undulating.front_min_face_cells", terrain.undulating.front_min_face_cells);
+    load("projection.terrain.undulating.front_max_face_cells", terrain.undulating.front_max_face_cells);
+    load("projection.terrain.undulating.front_min_face_height_m", terrain.undulating.front_min_face_height_m);
+    load("projection.terrain.undulating.front_approach_cells", terrain.undulating.front_approach_cells);
+    load("projection.terrain.undulating.front_approach_tolerance_m", terrain.undulating.front_approach_tolerance_m);
+    load("projection.terrain.undulating.front_min_hidden_cells", terrain.undulating.front_min_hidden_cells);
+    load("projection.terrain.undulating.front_max_hidden_cells", terrain.undulating.front_max_hidden_cells);
+    load("projection.terrain.undulating.front_min_crest_cells", terrain.undulating.front_min_crest_cells);
+    load("projection.terrain.undulating.front_max_crest_cells", terrain.undulating.front_max_crest_cells);
+    load("projection.terrain.undulating.front_crest_height_tolerance_m", terrain.undulating.front_crest_height_tolerance_m);
+    load("projection.terrain.undulating.front_min_lateral_support", terrain.undulating.front_min_lateral_support);
     load("projection.terrain.tunnel.enable", terrain.tunnel.enable);
     load("projection.terrain.tunnel.min_free_gap_ratio", terrain.tunnel.min_free_gap_ratio);
     load("projection.terrain.tunnel.min_neighbor_support", terrain.tunnel.min_neighbor_support);

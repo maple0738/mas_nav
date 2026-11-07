@@ -834,11 +834,12 @@ class ROGMapROS : public ROGMap
     }
   }
 
-  /// 在线特殊地形以两组彩色方块显示；每帧覆盖上一帧，空组显式删除旧标记。
+  /// 在线特殊地形以三组彩色方块显示（橙=坡面、青=隧道、紫=起伏）；
+  /// 每帧覆盖上一帧，空组显式删除旧标记。
   void fillTerrainMarkers(const std::vector<uint8_t> & labels,
     visualization_msgs::msg::MarkerArray & markers)
   {
-    markers.markers.resize(2);
+    markers.markers.resize(3);
     const auto stamp = now();
     const double resolution = layer_->resolution();
     for (size_t i = 0; i < markers.markers.size(); ++i) {
@@ -853,16 +854,17 @@ class ROGMapROS : public ROGMap
       marker.scale.x = resolution;
       marker.scale.y = resolution;
       marker.scale.z = 0.03;
-      marker.color.r = i == 0 ? 1.0F : 0.0F;
-      marker.color.g = i == 0 ? 0.55F : 0.85F;
-      marker.color.b = i == 0 ? 0.0F : 1.0F;
+      marker.color.r = i == 0 ? 1.0F : i == 1 ? 0.0F : 0.65F;
+      marker.color.g = i == 0 ? 0.55F : i == 1 ? 0.85F : 0.15F;
+      marker.color.b = i == 0 ? 0.0F : i == 1 ? 1.0F : 0.90F;
       marker.color.a = 0.8F;
       marker.lifetime = rclcpp::Duration::from_seconds(
         std::max(0.5, 2.5 / std::max(1.0, cfg_.visualization_rate)));
     }
     const int width = layer_->width();
     for (size_t index = 0; index < labels.size(); ++index) {
-      const size_t marker_index = labels[index] == 5U ? 0U : labels[index] == 6U ? 1U : 2U;
+      const size_t marker_index = labels[index] == 5U ? 0U :
+        labels[index] == 6U ? 1U : labels[index] == 7U ? 2U : 3U;
       if (marker_index >= markers.markers.size()) continue;
       geometry_msgs::msg::Point point;
       point.x = layer_->origin().x() + (static_cast<int>(index % width) + 0.5) * resolution;

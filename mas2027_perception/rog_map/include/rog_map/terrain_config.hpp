@@ -21,14 +21,36 @@ struct SlopeRecognitionConfig {
 struct UndulatingRecognitionConfig {
   bool enable{true};
   bool entry_window_enable{true};
-  double min_peak_to_trough_m{0.035};
+  double min_peak_to_trough_m{0.045};
   double max_peak_to_trough_m{0.12};
   double min_wavelength_m{0.18};
   double max_wavelength_m{0.34};
   double min_delta_m{0.01};
-  double max_trend_gradient{0.25};
-  double min_neighbor_correlation{0.80};
+  // A wave must sit on near-level ground. Keep this below the slope class
+  // minimum (0.14) so a long grade cannot be relabeled as undulating.
+  double max_trend_gradient{0.12};
+  double min_neighbor_correlation{0.85};
   int min_common_samples{9};
+  // Head-on view: the sensor only sees the first rising face, then the crest
+  // occludes the trough, and the next crest top is visible again at the same
+  // height. This path has no height reversal for the profile detector above.
+  // It is only a semantic label; collision masks and step barriers are
+  // unchanged. Distances are cells at the current map resolution.
+  bool front_signature_enable{true};
+  int front_min_face_cells{2};
+  int front_max_face_cells{8};
+  double front_min_face_height_m{0.045};
+  // The ground behind the first face must be level with the face bottom. A
+  // ramp keeps rising behind its start cell, so this rejects a ramp crest
+  // whose far side is hidden.
+  int front_approach_cells{5};
+  double front_approach_tolerance_m{0.03};
+  int front_min_hidden_cells{1};
+  int front_max_hidden_cells{6};
+  int front_min_crest_cells{2};
+  int front_max_crest_cells{6};
+  double front_crest_height_tolerance_m{0.04};
+  int front_min_lateral_support{3};
 };
 
 struct TunnelRecognitionConfig {
@@ -73,7 +95,23 @@ struct TerrainRecognitionConfig {
         !positive(u.max_trend_gradient) ||
         !positive(u.min_neighbor_correlation) ||
         u.min_neighbor_correlation > 1.0 || u.min_common_samples < 3 ||
-        u.min_common_samples > 17) {
+        u.min_common_samples > 17 ||
+        u.front_min_face_cells < 1 ||
+        u.front_max_face_cells < u.front_min_face_cells ||
+        u.front_max_face_cells > 20 ||
+        !positive(u.front_min_face_height_m) ||
+        u.front_min_face_height_m < u.min_delta_m ||
+        u.front_min_face_height_m > u.max_peak_to_trough_m ||
+        u.front_approach_cells < 1 || u.front_approach_cells > 20 ||
+        !positive(u.front_approach_tolerance_m) ||
+        u.front_min_hidden_cells < 1 ||
+        u.front_max_hidden_cells < u.front_min_hidden_cells ||
+        u.front_max_hidden_cells > 20 ||
+        u.front_min_crest_cells < 1 ||
+        u.front_max_crest_cells < u.front_min_crest_cells ||
+        u.front_max_crest_cells > 20 ||
+        !positive(u.front_crest_height_tolerance_m) ||
+        u.front_min_lateral_support < 1 || u.front_min_lateral_support > 3) {
       throw std::invalid_argument(
           "projection.terrain.undulating: invalid amplitude, wavelength, noise "
           "or support thresholds");
